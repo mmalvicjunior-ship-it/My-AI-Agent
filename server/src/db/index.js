@@ -13,6 +13,10 @@ export function openDb() {
   fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
   const db = new DatabaseSync(config.databasePath);
 
+  // Wait up to 5s for concurrent connections instead of failing with
+  // "database is locked" (parallel test processes / multi-instance safety).
+  db.exec('PRAGMA busy_timeout = 5000');
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS projects (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,

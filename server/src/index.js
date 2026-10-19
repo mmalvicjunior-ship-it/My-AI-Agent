@@ -4,6 +4,8 @@ import { config, safeSummary, redactSecrets } from './config.js';
 import { openDb } from './db/index.js';
 import { getProvider } from './ai/index.js';
 import { createChatRouter } from './routes/chat.js';
+import { createFilesRouter } from './routes/files.js';
+import { ensureDir, projectDir } from './workspace/files.js';
 
 /**
  * Builds the Express application.
@@ -41,8 +43,14 @@ export function createApp(options = {}) {
       return res.status(400).json({ ok: false, error: 'Project name is required.' });
     }
     const result = db.prepare('INSERT INTO projects (name) VALUES (?)').run(name);
-    res.status(201).json({ ok: true, project: { id: Number(result.lastInsertRowid), name } });
+    const id = Number(result.lastInsertRowid);
+    // Create the project's isolated workspace folder immediately.
+    ensureDir(projectDir(config.workspaceRoot, id));
+    res.status(201).json({ ok: true, project: { id, name } });
   });
+
+  // --- Project files (path-safe; confined to the project workspace) --------
+  app.use('/api/projects', createFilesRouter({ db }));
 
   // --- Chat (validated, routed through the pluggable AI adapter) ----------
   app.use('/api/chat', createChatRouter({ provider, providerName }));

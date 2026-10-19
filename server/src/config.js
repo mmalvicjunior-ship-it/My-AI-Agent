@@ -56,3 +56,9 @@ export function safeSummary() {
     workspaceRoot: config.workspaceRoot,
   };
 }
+
+// Remove the API key (if set) from any text before it is logged.
+export function redactSecrets(text) {
+  if (typeof text !== 'string' || !text || !config.aiApiKey) return text;
+  return text.split(config.aiApiKey).join('[redacted]');
+}

@@ -11,7 +11,8 @@
   "scripts": {
     "dev:server": "npm run dev -w server",
     "start:server": "npm run start -w server",
-    "smoke": "npm run smoke -w server"
+    "smoke": "npm run smoke -w server",
+    "test": "npm run test -w server"
   },
   "engines": {
     "node": ">=22"

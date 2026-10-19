@@ -1,15 +1,21 @@
 import express from 'express';
 import { fileURLToPath } from 'node:url';
-import { config, safeSummary } from './config.js';
+import { config, safeSummary, redactSecrets } from './config.js';
 import { openDb } from './db/index.js';
+import { getProvider } from './ai/index.js';
+import { createChatRouter } from './routes/chat.js';
 
 /**
  * Builds the Express application.
  * Routes will be split into separate files under src/routes/ as the app grows.
  */
-export function createApp() {
+export function createApp(options = {}) {
   const app = express();
   const db = openDb();
+
+  // AI provider: injected by tests, otherwise resolved from AI_PROVIDER in .env
+  const provider = 'provider' in options ? options.provider : getProvider(config.aiProvider);
+  const providerName = 'providerName' in options ? options.providerName : config.aiProvider;
 
   app.use(express.json({ limit: '1mb' }));
 
@@ -38,17 +44,23 @@ export function createApp() {
     res.status(201).json({ ok: true, project: { id: Number(result.lastInsertRowid), name } });
   });
 
-  // --- Chat (placeholder until the AI adapter lands in Phase 3) -----------
-  app.post('/api/chat', (req, res) => {
-    res.status(503).json({
-      ok: false,
-      error: 'AI adapter not yet configured. Set AI_PROVIDER in the project-root .env (see .env.example).',
-    });
-  });
+  // --- Chat (validated, routed through the pluggable AI adapter) ----------
+  app.use('/api/chat', createChatRouter({ provider, providerName }));
 
   // --- Safety net for unknown API routes ----------------------------------
   app.use('/api', (req, res) => {
     res.status(404).json({ ok: false, error: 'Not found.' });
+  });
+
+  // --- Clear JSON errors for malformed or oversized bodies ----------------
+  app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.parse.failed') {
+      return res.status(400).json({ ok: false, error: 'Request body must be valid JSON.' });
+    }
+    if (err && err.type === 'entity.too.large') {
+      return res.status(413).json({ ok: false, error: 'Request body is too large (limit: 1mb).' });
+    }
+    return next(err);
   });
 
   return { app, db };

@@ -5,27 +5,35 @@ import { fileURLToPath } from 'node:url';
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRoot = path.resolve(serverDir, '..');
 
-// Load .env from the project root if present (Node built-in, no dotenv needed).
+// Load the project-root .env if present (Node built-in; no dotenv dependency).
 const envPath = path.join(projectRoot, '.env');
 if (existsSync(envPath)) {
   process.loadEnvFile(envPath);
 }
 
-function resolvePath(value, fallback) {
+// Resolve a path that is relative to the server/ folder.
+function resolveServerPath(value, fallback) {
   const raw = value || fallback;
   return path.isAbsolute(raw) ? raw : path.resolve(serverDir, raw);
 }
 
-export const config = {
-  host: process.env.HOST || '127.0.0.1',
-  port: Number(process.env.PORT || 3001),
+function portFromEnv() {
+  const parsed = Number(process.env.PORT);
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : 3001;
+}
 
-  aiProvider: process.env.AI_PROVIDER || '',
+export const config = {
+  // Empty string = listen on all interfaces (lets a phone on the same Wi-Fi connect).
+  // Set HOST=127.0.0.1 in .env to restrict access to this computer only.
+  host: process.env.HOST || '',
+  port: portFromEnv(),
+
+  aiProvider: process.env.AI_PROVIDER || 'mock',
   aiApiKey: process.env.AI_API_KEY || '',
   aiModel: process.env.AI_MODEL || '',
 
-  databasePath: resolvePath(process.env.DATABASE_PATH, './data/myai-agent.sqlite'),
-  workspaceRoot: resolvePath(process.env.WORKSPACE_ROOT, './workspaces'),
+  databasePath: resolveServerPath(process.env.DATABASE_PATH, './data/app.db'),
+  workspaceRoot: resolveServerPath(process.env.WORKSPACE_ROOT, './workspaces'),
 
   projectRoot,
   serverDir,
@@ -39,9 +47,9 @@ function mask(secret) {
 // Config summary that is always safe to print - never includes secret values.
 export function safeSummary() {
   return {
-    host: config.host,
+    host: config.host || '(all interfaces)',
     port: config.port,
-    aiProvider: config.aiProvider || '(not set)',
+    aiProvider: config.aiProvider,
     aiApiKey: mask(config.aiApiKey),
     aiModel: config.aiModel || '(not set)',
     databasePath: config.databasePath,

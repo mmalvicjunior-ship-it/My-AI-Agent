@@ -1,5 +1,6 @@
 import express from 'express';
 import { fileURLToPath } from 'node:url';
+import { config, safeSummary } from './config.js';
 import { openDb } from './db/index.js';
 
 /**
@@ -18,7 +19,7 @@ export function createApp() {
       ok: true,
       service: 'myai-agent-server',
       version: '0.1.0',
-      aiProvider: process.env.AI_PROVIDER || 'mock',
+      aiProvider: config.aiProvider,
     });
   });
 
@@ -41,7 +42,7 @@ export function createApp() {
   app.post('/api/chat', (req, res) => {
     res.status(503).json({
       ok: false,
-      error: 'AI adapter not yet configured. Set AI_PROVIDER in server/.env (see .env.example).',
+      error: 'AI adapter not yet configured. Set AI_PROVIDER in the project-root .env (see .env.example).',
     });
   });
 
@@ -57,9 +58,15 @@ export function createApp() {
 // (allows tests to import createApp without binding a port).
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { app } = createApp();
-  const port = Number(process.env.PORT) || 3001;
-  app.listen(port, () => {
-    // Log only non-sensitive startup info.
-    console.log(`[server] listening on http://localhost:${port} (AI provider: ${process.env.AI_PROVIDER || 'mock'})`);
-  });
+  const onReady = () => {
+    const shownHost = config.host || 'localhost';
+    // Log only non-sensitive startup info (secrets stay masked via safeSummary).
+    console.log(`[server] listening on http://${shownHost}:${config.port} (AI provider: ${config.aiProvider})`);
+    console.log('[server] config:', safeSummary());
+  };
+  if (config.host) {
+    app.listen(config.port, config.host, onReady);
+  } else {
+    app.listen(config.port, onReady);
+  }
 }

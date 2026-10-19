@@ -2,18 +2,16 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dataDir = path.join(__dirname, '..', '..', 'data');
+import { config } from '../config.js';
 
 /**
  * Opens (and initializes, if needed) the local SQLite database.
- * The database file lives in server/data/ which is git-ignored.
+ * The path comes from config (DATABASE_PATH in the project-root .env,
+ * defaults to server/data/app.db) which lives in a git-ignored folder.
  */
 export function openDb() {
-  fs.mkdirSync(dataDir, { recursive: true });
-  const db = new DatabaseSync(path.join(dataDir, 'app.db'));
+  fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
+  const db = new DatabaseSync(config.databasePath);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS projects (

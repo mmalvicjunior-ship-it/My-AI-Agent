@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Secrets - never commit real environment files
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+web-build/
+
+# Runtime data (local SQLite databases)
+server/data/
+server/workspaces/
+
+# React Native / Expo
+.expo/
+expo-env.d.ts
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

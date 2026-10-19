@@ -1,0 +1,10 @@
+{
+  "name": "web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React web interface (Vite) - to be scaffolded in Phase 3",
+  "scripts": {
+    "dev": "echo 'Web app not yet scaffolded - coming in Phase 3'",
+    "build": "echo 'Web app not yet scaffolded - coming in Phase 3'"
+  }
+}

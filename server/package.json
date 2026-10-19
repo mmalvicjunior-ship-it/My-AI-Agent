@@ -1,0 +1,15 @@
+{
+  "name": "server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MyAI-Agent backend: Express API, AI adapter, sandboxed workspace",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "smoke": "node tests/smoke.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

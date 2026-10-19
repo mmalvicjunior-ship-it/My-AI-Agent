@@ -1,0 +1,19 @@
+{
+  "name": "myai-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MyAI-Agent - lightweight AI coding agent with web/mobile interfaces and an educational trading simulator",
+  "workspaces": [
+    "server",
+    "apps/*",
+    "shared"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w server",
+    "start:server": "npm run start -w server",
+    "smoke": "npm run smoke -w server"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

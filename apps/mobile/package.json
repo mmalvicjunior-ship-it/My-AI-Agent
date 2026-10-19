@@ -1,0 +1,10 @@
+{
+  "name": "mobile",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React Native + Expo mobile interface - to be scaffolded in Phase 3",
+  "scripts": {
+    "dev": "echo 'Mobile app not yet scaffolded - coming in Phase 3'",
+    "start": "echo 'Mobile app not yet scaffolded - coming in Phase 3'"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "MyAI Agent",
+  "short_name": "MyAI",
+  "description": "Your AI coding workspace",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#101114",
+  "theme_color": "#101114",
+  "icons": [
+    {
+      "src": "/myai-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

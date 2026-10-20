@@ -21,9 +21,14 @@ export function openDb() {
     CREATE TABLE IF NOT EXISTS projects (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       name       TEXT NOT NULL,
+      root_path  TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  const projectColumns = db.prepare('PRAGMA table_info(projects)').all();
+  if (!projectColumns.some((column) => column.name === 'root_path')) {
+    db.exec('ALTER TABLE projects ADD COLUMN root_path TEXT');
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS chat_messages (

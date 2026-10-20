@@ -31,6 +31,7 @@ export const config = {
   aiProvider: process.env.AI_PROVIDER || 'mock',
   aiApiKey: process.env.AI_API_KEY || '',
   aiModel: process.env.AI_MODEL || '',
+  debugChatPrompts: process.env.DEBUG_CHAT_PROMPTS === 'true',
 
   databasePath: resolveServerPath(process.env.DATABASE_PATH, './data/app.db'),
   workspaceRoot: resolveServerPath(process.env.WORKSPACE_ROOT, './workspaces'),

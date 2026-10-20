@@ -2,9 +2,21 @@
   "name": "web",
   "version": "0.1.0",
   "private": true,
-  "description": "React web interface (Vite) - to be scaffolded in Phase 3",
+  "type": "module",
+  "description": "React web interface for MyAI-Agent",
   "scripts": {
-    "dev": "echo 'Web app not yet scaffolded - coming in Phase 3'",
-    "build": "echo 'Web app not yet scaffolded - coming in Phase 3'"
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.6",
+    "highlight.js": "^11.11.1",
+    "marked": "^16.1.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "vite": "^7.1.3"
   }
 }

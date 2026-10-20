@@ -23,15 +23,43 @@
  *   2. import it here and register it: registry.set('<name>', <name>Provider)
  */
 import { mockProvider } from './mock.js';
+import { config } from '../config.js';
+import { createGeminiProvider } from './gemini.js';
+import { createHuggingFaceProvider } from './huggingface.js';
+import { createOpenAIProvider } from './openai.js';
+import { createOllamaProvider } from './ollama.js';
 
-const registry = new Map([['mock', mockProvider]]);
+const providerFactories = new Map([
+  ['openai', createOpenAIProvider],
+  ['gemini', createGeminiProvider],
+  ['huggingface', createHuggingFaceProvider],
+  ['ollama', createOllamaProvider],
+]);
 
-/** Returns the provider for a name, or null if it is not implemented. */
-export function getProvider(name) {
-  return registry.get(name) ?? null;
+/**
+ * Resolves the configured provider. Select "mock" explicitly for offline
+ * replies; a missing key for a real provider is reported as a configuration
+ * error rather than silently switching providers.
+ */
+export function getProvider(name, settings = config) {
+  if (name === 'mock') return mockProvider;
+
+  const createProvider = providerFactories.get(name);
+  if (!createProvider) return null;
+
+  const defaults = {
+    openai: 'gpt-4o-mini',
+    gemini: 'gemini-flash-latest',
+    huggingface: 'meta-llama/Meta-Llama-3-8B-Instruct',
+    ollama: 'llama3',
+  };
+  return createProvider({
+    apiKey: settings.aiApiKey,
+    model: settings.aiModel || defaults[name],
+  });
 }
 
 /** Lists the provider names that are currently implemented. */
 export function listProviders() {
-  return [...registry.keys()];
+  return ['mock', ...providerFactories.keys()];
 }

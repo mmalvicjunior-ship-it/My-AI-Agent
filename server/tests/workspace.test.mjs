@@ -10,7 +10,14 @@ import path from 'node:path';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
-import { MAX_READ_BYTES } from '../src/workspace/files.js';
+import {
+  createTextFile,
+  MAX_READ_BYTES,
+  readTextFile,
+  scanDirectory,
+  searchWorkspace,
+  WorkspaceError,
+} from '../src/workspace/files.js';
 
 const servers = [];
 const tempDirs = [];
@@ -49,6 +56,14 @@ async function startServer() {
       } catch { /* non-JSON */ }
       return { status: res.status, data };
     },
+    async getTree(id) {
+      const res = await fetch(`${base}/${id}/tree`);
+      return { status: res.status, data: await res.json() };
+    },
+    async search(id, query) {
+      const res = await fetch(`${base}/${id}/search?q=${encodeURIComponent(query)}`);
+      return { status: res.status, data: await res.json() };
+    },
   };
 }
 
@@ -77,6 +92,25 @@ test('creating a project creates its workspace folder', async () => {
   const api = await startServer();
   const id = await makeProject(api);
   assert.ok(fs.existsSync(path.join(config.workspaceRoot, String(id))));
+});
+
+test('imports an existing directory as a project and scans searchable source files', async () => {
+  const api = await startServer();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-existing-project-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'index.js'), 'export function answer() { return 42; }\n');
+  fs.writeFileSync(path.join(root, 'node_modules', 'ignored.js'), 'ignored');
+
+  const { status, data } = await api.post({ name: 'Imported project', path: root });
+  assert.equal(status, 201);
+  const tree = await api.getTree(data.project.id);
+  assert.equal(tree.status, 200);
+  assert.deepEqual(tree.data.files, ['src/index.js']);
+  const search = await api.search(data.project.id, 'answer');
+  assert.equal(search.status, 200);
+  assert.equal(search.data.results[0].path, 'src/index.js');
 });
 
 // ---------------------------------------------------------------------------
@@ -262,4 +296,34 @@ test('blocks reads through a symlink pointing outside the workspace', async (t) 
   const read = await api.readFile(id, 'escape/secret.txt');
   assert.equal(read.status, 403, 'reading through an escaping link must be 403');
   assert.ok(!JSON.stringify(read.data).includes('TOP SECRET'));
+});
+
+test('scanner excludes dependency, build, and credential files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-scan-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.mkdirSync(path.join(root, 'node_modules', 'pkg'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'app.js'), 'function greet() {}\n');
+  fs.writeFileSync(path.join(root, '.env'), 'SECRET=hidden');
+  fs.writeFileSync(path.join(root, 'node_modules', 'pkg', 'ignored.js'), 'ignored');
+  fs.writeFileSync(path.join(root, '.git', 'config'), 'ignored');
+  fs.writeFileSync(path.join(root, 'dist', 'built.js'), 'ignored');
+
+  const scan = scanDirectory(root);
+  assert.deepEqual(scan.files, ['src/app.js']);
+  assert.equal(searchWorkspace(root, 'greet').results[0].path, 'src/app.js');
+  assert.throws(() => readTextFile(root, '.env'), (error) => error instanceof WorkspaceError && error.status === 403);
+});
+
+test('new-file proposals are path-safe and never overwrite existing files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-create-'));
+  tempDirs.push(root);
+  const created = createTextFile(root, 'new.js', 'export const answer = 42;\n');
+  assert.equal(created.path, 'new.js');
+  assert.equal(fs.readFileSync(path.join(root, 'new.js'), 'utf8'), 'export const answer = 42;\n');
+  assert.throws(() => createTextFile(root, 'new.js', 'overwrite'), /already exists/);
+  assert.throws(() => createTextFile(root, '../outside.js', 'escape'), /escapes/);
+  assert.throws(() => createTextFile(root, '.env', 'SECRET=x'), /credential/);
 });

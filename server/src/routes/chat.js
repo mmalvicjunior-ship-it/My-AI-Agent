@@ -1,7 +1,7 @@
 import express from 'express';
-import { redactSecrets } from '../config.js';
+import { config, redactSecrets } from '../config.js';
 
-export const MAX_MESSAGE_CHARS = 4000;
+export const MAX_MESSAGE_CHARS = 20_000;
 export const MAX_MESSAGES = 50;
 const VALID_ROLES = new Set(['user', 'assistant', 'system']);
 
@@ -58,45 +58,72 @@ export function normalizeChatInput(body) {
 }
 
 /**
- * Chat router: validates input, calls the pluggable provider, and keeps
- * secrets out of every response and log line.
+ * Chat router: validates the complete conversation history, calls the
+ * pluggable provider, and keeps secrets out of every response and log line.
  */
-export function createChatRouter({ provider, providerName = 'unset' }) {
+export function createChatRouter({ provider, providerName = 'unset', tools = null }) {
   const router = express.Router();
 
   router.post('/', async (req, res) => {
     const normalized = normalizeChatInput(req.body);
     if (!normalized.ok) {
+      console.warn(`[chat] Request rejected: provider=${providerName} status=400`);
       return res.status(400).json({ ok: false, error: normalized.error });
     }
+
+    const latestUserMessage = [...normalized.messages]
+      .reverse()
+      .find((message) => message.role === 'user')?.content;
+    const safeMessageLog = latestUserMessage === undefined
+      ? '[no user message]'
+      : config.debugChatPrompts
+        ? redactSecrets(latestUserMessage)
+        : `[hidden; ${latestUserMessage.length} characters]`;
+    console.log('[chat] Received user message:', safeMessageLog);
+    console.log('[chat] Active provider:', provider?.name ?? config.aiProvider ?? providerName);
 
     if (!provider || typeof provider.chat !== 'function') {
       return res.status(503).json({
         ok: false,
-        error: `AI provider "${providerName}" is not available. Set AI_PROVIDER=mock in the project-root .env (see .env.example).`,
+        error: `AI provider "${providerName}" is not available. Choose mock, gemini, openai, huggingface, or ollama in the project-root .env (see .env.example).`,
       });
     }
 
     try {
-      const result = await provider.chat({ messages: normalized.messages });
+      // The client sends prior user/assistant turns in this array so providers
+      // can answer with conversation context instead of treating each prompt alone.
+      const projectId = req.body?.projectId === undefined ? null : Number(req.body.projectId);
+      if (projectId !== null && (!Number.isInteger(projectId) || projectId < 1)) {
+        return res.status(400).json({ ok: false, error: 'projectId must identify a valid workspace.' });
+      }
+      const result = await provider.chat({
+        messages: normalized.messages,
+        tools: projectId ? tools : null,
+        projectId,
+      });
       if (!result || typeof result.text !== 'string') {
         throw new Error('Provider returned a malformed result (missing text).');
       }
+      console.info(`[chat] Request succeeded: provider=${result.provider ?? provider.name ?? providerName} status=200`);
       return res.json({
         ok: true,
         provider: result.provider ?? provider.name ?? providerName,
         model: result.model ?? provider.model ?? null,
         reply: result.text,
+        toolActivity: result.toolActivity || [],
       });
     } catch (err) {
       // Log only a redacted one-liner; the client gets a generic message.
+      const status = err.statusCode || 502;
       console.error(
-        `[chat] provider "${provider.name ?? providerName}" failed:`,
+        `[chat] Request failed: provider=${provider.name ?? providerName} status=${status}:`,
         redactSecrets(`${err.name}: ${err.message}`),
       );
-      return res.status(502).json({
+      return res.status(status).json({
         ok: false,
-        error: 'AI provider request failed. Details were logged on the server (secrets redacted).',
+        error: typeof err.publicMessage === 'string'
+          ? err.publicMessage
+          : 'AI provider request failed. Details were logged on the server (secrets redacted).',
       });
     }
   });

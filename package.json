@@ -9,12 +9,19 @@
     "shared"
   ],
   "scripts": {
+    "dev": "concurrently -k -n API,WEB -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:clean": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-clean.ps1",
+    "server": "npm run dev:server",
     "dev:server": "npm run dev -w server",
+    "dev:web": "npm run dev -w web",
     "start:server": "npm run start -w server",
     "smoke": "npm run smoke -w server",
     "test": "npm run test -w server"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
   }
 }

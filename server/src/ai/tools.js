@@ -13,6 +13,7 @@ import {
   searchWorkspace,
   WorkspaceError,
 } from '../workspace/files.js';
+import { unifiedDiff } from '../workspace/diff.js';
 
 const MAX_COMMAND_OUTPUT = 16_000;
 const commandNames = new Set(['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check']);
@@ -109,6 +110,12 @@ function projectRootFor(db, projectId, workspaceRoot) {
   return root;
 }
 
+/** Persists one entry in the file_changes history table. */
+function recordChange(db, projectId, relativePath, action, source, diffText) {
+  db.prepare('INSERT INTO file_changes (project_id, path, action, source, diff) VALUES (?, ?, ?, ?, ?)')
+    .run(Number(projectId), relativePath, action, source, diffText || null);
+}
+
 function truncateOutput(value) {
   const text = String(value || '');
   return text.length > MAX_COMMAND_OUTPUT
@@ -188,16 +195,19 @@ export function createWorkspaceTools({ db }) {
             throw new WorkspaceError(413, 'Proposed file content exceeds the 1 MiB limit.');
           }
           const proposalId = randomUUID();
+          const diff = unifiedDiff('', args.content, { oldPath: args.path, newPath: args.path });
           const proposal = {
             projectId: args.projectId,
             path: args.path,
             content: args.content,
+            diff,
           };
           pendingProposals.set(proposalId, proposal);
           return {
             proposalId,
             path: args.path,
             status: 'awaiting_user_approval',
+            diff,
             note: 'File is staged only. Ask the user to review the diff and apply it.',
           };
         }
@@ -210,16 +220,19 @@ export function createWorkspaceTools({ db }) {
           }
           const original = readTextFile(root, args.path);
           const proposalId = randomUUID();
+          const diff = unifiedDiff(original.content, args.content, { oldPath: original.path, newPath: original.path });
           pendingProposals.set(proposalId, {
             projectId: args.projectId,
             path: original.path,
             content: args.content,
             originalContent: original.content,
+            diff,
           });
           return {
             proposalId,
             path: original.path,
             status: 'awaiting_user_approval',
+            diff,
             note: 'The update is staged only. Ask the user to review the diff and apply it.',
             originalContent: original.content,
           };
@@ -255,11 +268,46 @@ export function createWorkspaceTools({ db }) {
         throw new WorkspaceError(404, 'Pending file proposal not found.');
       }
       const root = projectRootFor(db, proposal.projectId, config.workspaceRoot);
-      const created = 'originalContent' in proposal
+      const isUpdate = 'originalContent' in proposal;
+      const applied = isUpdate
         ? replaceTextFile(root, proposal.path, proposal.originalContent, proposal.content)
         : createTextFile(root, proposal.path, proposal.content);
       pendingProposals.delete(proposalId);
-      return created;
+      const diff = isUpdate
+        ? unifiedDiff(proposal.originalContent, proposal.content, { oldPath: applied.path, newPath: applied.path })
+        : unifiedDiff('', proposal.content, { oldPath: applied.path, newPath: applied.path });
+      recordChange(db, proposal.projectId, applied.path, isUpdate ? 'update' : 'create', 'agent', diff);
+      return { ...applied, diff };
+    },
+    /** Pending proposals (file and command) for one project, with review diffs. */
+    listProposals(projectId) {
+      const id = Number(projectId);
+      const proposals = [];
+      for (const [proposalId, proposal] of pendingProposals) {
+        if (proposal.projectId !== id) continue;
+        if (proposal.command) {
+          proposals.push({
+            proposalId,
+            type: 'command',
+            command: proposal.command,
+            path: proposal.path ?? null,
+            status: 'awaiting_user_approval',
+          });
+          continue;
+        }
+        const isUpdate = 'originalContent' in proposal;
+        proposals.push({
+          proposalId,
+          type: 'file',
+          action: isUpdate ? 'update' : 'create',
+          path: proposal.path,
+          status: 'awaiting_user_approval',
+          diff: proposal.diff ?? (isUpdate
+            ? unifiedDiff(proposal.originalContent, proposal.content, { oldPath: proposal.path, newPath: proposal.path })
+            : unifiedDiff('', proposal.content, { oldPath: proposal.path, newPath: proposal.path })),
+        });
+      }
+      return { proposals };
     },
     runApprovedCommand(projectId, proposalId) {
       const proposal = pendingProposals.get(proposalId);

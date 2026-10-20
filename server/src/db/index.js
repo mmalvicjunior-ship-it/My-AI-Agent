@@ -39,5 +39,19 @@ export function openDb() {
     );
   `);
 
+  // History of every file write/delete (human edits and approved agent
+  // proposals) with the unified diff that was shown at the time.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS file_changes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      path       TEXT NOT NULL,
+      action     TEXT NOT NULL CHECK (action IN ('create', 'update', 'delete')),
+      source     TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'agent')),
+      diff       TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
   return db;
 }

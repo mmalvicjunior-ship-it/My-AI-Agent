@@ -8,6 +8,7 @@ import { openDb } from './db/index.js';
 import { getProvider } from './ai/index.js';
 import { createChatRouter } from './routes/chat.js';
 import { createFilesRouter } from './routes/files.js';
+import { createEditsRouter } from './routes/edits.js';
 import { createWorkspaceTools } from './ai/tools.js';
 import { ensureDir, projectDir } from './workspace/files.js';
 
@@ -95,6 +96,9 @@ export function createApp(options = {}) {
   // --- Project files (path-safe; confined to the project workspace) --------
   app.use('/api/projects', createFilesRouter({ db, tools: workspaceTools }));
 
+  // --- Human edits: preview/write/delete, change history, proposals --------
+  app.use('/api/projects', createEditsRouter({ db, tools: workspaceTools }));
+
   // --- Chat (validated, routed through the pluggable AI adapter) ----------
   app.use('/api/chat', createChatRouter({ provider, providerName, tools: workspaceTools }));
 
@@ -114,7 +118,7 @@ export function createApp(options = {}) {
     return next(err);
   });
 
-  return { app, db };
+  return { app, db, tools: workspaceTools };
 }
 
 // Start the server only when this file is executed directly

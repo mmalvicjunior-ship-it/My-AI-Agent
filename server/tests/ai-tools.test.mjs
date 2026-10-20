@@ -11,7 +11,10 @@ test('create_file stages a new file and only writes after approval', () => {
   const project = { id: 910001, name: 'tool-test', root_path: root };
   const db = {
     prepare() {
-      return { get: (id) => (id === project.id ? project : null) };
+      return {
+        get: (id) => (id === project.id ? project : null),
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+      };
     },
   };
   const tools = createWorkspaceTools({ db });
@@ -41,7 +44,10 @@ test('run_command rejects anything outside the safe command allowlist', async ()
   const project = { id: 910002, name: 'tool-test', root_path: root };
   const db = {
     prepare() {
-      return { get: (id) => (id === project.id ? project : null) };
+      return {
+        get: (id) => (id === project.id ? project : null),
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+      };
     },
   };
   const tools = createWorkspaceTools({ db });
@@ -61,7 +67,10 @@ test('run_command stages approved npm scripts without executing before approval'
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
   const db = {
     prepare() {
-      return { get: (id) => (id === project.id ? project : null) };
+      return {
+        get: (id) => (id === project.id ? project : null),
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+      };
     },
   };
   const tools = createWorkspaceTools({ db });
@@ -83,7 +92,10 @@ test('existing-file changes require approval and reject stale proposals', async 
   fs.writeFileSync(path.join(root, 'approved.js'), 'export const ready = false;\n');
   const db = {
     prepare() {
-      return { get: (id) => (id === project.id ? project : null) };
+      return {
+        get: (id) => (id === project.id ? project : null),
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+      };
     },
   };
   const tools = createWorkspaceTools({ db });

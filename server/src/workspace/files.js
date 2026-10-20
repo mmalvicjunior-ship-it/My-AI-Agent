@@ -164,6 +164,19 @@ export function createTextFile(rootDir, relativePath, content) {
   if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
     throw new WorkspaceError(413, `File content exceeds the ${MAX_READ_BYTES}-byte limit.`);
   }
+  const { destination, relative } = prepareWrite(rootDir, relativePath,
+    'The assistant cannot create credential or environment files.');
+  if (fs.existsSync(destination)) throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
+  fs.writeFileSync(destination, content, { encoding: 'utf8', flag: 'wx' });
+  return { path: relative, size: Buffer.byteLength(content, 'utf8') };
+}
+
+/**
+ * Pure validation for a relative write path: shape, escape, and credential
+ * checks with no filesystem side effects. Returns the normalized path.
+ * Shared by prepareWrite (writes) and the preview route (dry runs).
+ */
+export function validateWritePath(relativePath, sensitiveMessage) {
   if (typeof relativePath !== 'string' || relativePath.includes('\0')
     || path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
     throw new WorkspaceError(400, 'Use a valid relative file path inside the project.');
@@ -173,8 +186,19 @@ export function createTextFile(rootDir, relativePath, content) {
     throw new WorkspaceError(403, 'Path escapes the authorized workspace.');
   }
   if (isSensitiveFile(path.basename(normalized))) {
-    throw new WorkspaceError(403, 'The assistant cannot create credential or environment files.');
+    throw new WorkspaceError(403, sensitiveMessage);
   }
+  return normalized;
+}
+
+/**
+ * Validates a relative path for writing and creates missing parent folders.
+ * Returns { root, destination, relative } where `destination` is proven to be
+ * inside the workspace root. Shared by createTextFile/writeTextFile so both
+ * enforce identical traversal and credential-file guards.
+ */
+function prepareWrite(rootDir, relativePath, sensitiveMessage) {
+  const normalized = validateWritePath(relativePath, sensitiveMessage);
   const root = fs.realpathSync(rootDir);
   const segments = normalized.split(path.sep);
   const parentSegments = segments.slice(0, -1);
@@ -189,9 +213,73 @@ export function createTextFile(rootDir, relativePath, content) {
     parentPath = real;
   }
   const destination = path.join(parentPath, segments.at(-1));
-  if (fs.existsSync(destination)) throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
-  fs.writeFileSync(destination, content, { encoding: 'utf8', flag: 'wx' });
-  return { path: toPosix(path.relative(rootDir, destination)), size: Buffer.byteLength(content, 'utf8') };
+  return { root, destination, relative: toPosix(path.relative(rootDir, destination)) };
+}
+
+/**
+ * Creates or replaces a UTF-8 text file inside the workspace (human edit path).
+ * Returns { path, created, size, previous } — `previous` is the old text for
+ * existing files (null when the file is new), so callers can build a diff.
+ */
+export function writeTextFile(rootDir, relativePath, content) {
+  if (typeof content !== 'string') throw new WorkspaceError(400, 'File content must be text.');
+  if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
+    throw new WorkspaceError(413, `File content exceeds the ${MAX_READ_BYTES}-byte limit.`);
+  }
+  const { destination, relative } = prepareWrite(rootDir, relativePath,
+    'Credential or environment files cannot be edited through the workspace API.');
+
+  const exists = fs.existsSync(destination);
+  let previous = null;
+  if (exists) {
+    const stat = fs.statSync(destination);
+    if (stat.isDirectory()) throw new WorkspaceError(400, 'Path is a directory, not a file.');
+    if (stat.size > MAX_READ_BYTES) {
+      throw new WorkspaceError(413, `Existing file is too large to edit (limit ${MAX_READ_BYTES} bytes).`);
+    }
+    const buffer = fs.readFileSync(destination);
+    if (buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
+      throw new WorkspaceError(415, 'Binary files cannot be edited as text.');
+    }
+    previous = buffer.toString('utf8');
+  }
+  fs.writeFileSync(destination, content, 'utf8');
+  return { path: relative, created: !exists, size: Buffer.byteLength(content, 'utf8'), previous };
+}
+
+/**
+ * Deletes a file (or an empty directory) inside the workspace.
+ * Directories that still contain entries are refused, credential files are
+ * refused, and the project root itself can never be deleted.
+ * Returns { path, type, size?, previous } — `previous` is the old text when
+ * the deleted file was a readable text file (null otherwise).
+ */
+export function deletePath(rootDir, relativePath) {
+  const target = resolveInside(rootDir, relativePath);
+  if (target.relative === '.') {
+    throw new WorkspaceError(400, 'The project root cannot be deleted.');
+  }
+  if (isSensitiveFile(path.basename(target.absolute))) {
+    throw new WorkspaceError(403, 'Credential or environment files cannot be deleted through the workspace API.');
+  }
+  const stat = fs.statSync(target.absolute);
+  if (stat.isDirectory()) {
+    const entries = fs.readdirSync(target.absolute);
+    if (entries.length > 0) {
+      throw new WorkspaceError(400, 'Directory is not empty; delete its files first.');
+    }
+    fs.rmdirSync(target.absolute);
+    return { path: target.relative, type: 'directory', previous: null };
+  }
+  const buffer = fs.readFileSync(target.absolute);
+  const binary = buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0);
+  fs.unlinkSync(target.absolute);
+  return {
+    path: target.relative,
+    type: 'file',
+    size: stat.size,
+    previous: binary ? null : buffer.toString('utf8'),
+  };
 }
 
 export function replaceTextFile(rootDir, relativePath, expectedContent, content) {

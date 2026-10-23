@@ -98,6 +98,19 @@ export function createFilesRouter({ db, tools = null }) {
     }
   });
 
+  router.post('/:id/proposals/:proposalId/reject', (req, res) => {
+    const project = findProject(db, req.params.id);
+    if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
+    if (!tools?.rejectProposal) {
+      return res.status(503).json({ ok: false, error: 'Proposal rejection is unavailable.' });
+    }
+    try {
+      return res.json({ ok: true, ...tools.rejectProposal(project.id, req.params.proposalId) });
+    } catch (err) {
+      return sendError(res, err, 'reject proposal');
+    }
+  });
+
   router.post('/:id/commands/:proposalId/run', (req, res) => {
     const project = findProject(db, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });

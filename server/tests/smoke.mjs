@@ -1,5 +1,6 @@
 // Minimal smoke test: boots the server in-process, hits /api/health, exits.
-// Usage: npm run smoke
+// Run it with `npm run smoke`, which loads tests/setup-test-env.mjs first so the
+// boot uses a throwaway database instead of the real server/data/app.db.
 import { createApp } from '../src/index.js';
 
 const { app } = createApp();

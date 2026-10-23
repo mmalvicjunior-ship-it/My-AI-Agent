@@ -4,12 +4,20 @@ const DEFAULT_MODEL = 'gemini-flash-latest';
 const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const SYSTEM_INSTRUCTION = "You are a helpful coding assistant. Follow the user's instructions directly. When a project workspace is selected, inspect relevant files with tools before proposing changes, use create_file for new files and propose_file_change for edits to existing files. All file changes and commands require explicit user approval; use only the provided safe command tools. Never claim a tool succeeded unless its result confirms success.";
 
+/** External cancellation is not a provider timeout or network failure. */
+function cancelledRequestError() {
+  const error = new Error('The AI request was cancelled.');
+  error.name = 'AbortError';
+  error.statusCode = 499;
+  return error;
+}
+
 export function createGeminiProvider({ apiKey, model = DEFAULT_MODEL, fetchImpl = fetch }) {
   return {
     name: 'gemini',
     model,
 
-    async chat({ messages, tools, projectId }) {
+    async chat({ messages, tools, projectId, signal }) {
       if (!apiKey) {
         const error = new Error('Gemini is selected, but AI_API_KEY is not configured.');
         error.statusCode = 503;
@@ -47,6 +55,10 @@ export function createGeminiProvider({ apiKey, model = DEFAULT_MODEL, fetchImpl 
 
         let response;
         try {
+          const timeoutSignal = AbortSignal.timeout(60_000);
+          const requestSignal = signal
+            ? AbortSignal.any([signal, timeoutSignal])
+            : timeoutSignal;
           response = await fetchImpl(
             `${API_URL}/${encodeURIComponent(model)}:generateContent`,
             {
@@ -56,10 +68,11 @@ export function createGeminiProvider({ apiKey, model = DEFAULT_MODEL, fetchImpl 
                 'content-type': 'application/json',
               },
               body: JSON.stringify(body),
-              signal: AbortSignal.timeout(60_000),
+              signal: requestSignal,
             },
           );
         } catch (error) {
+          if (signal?.aborted) throw cancelledRequestError();
           throw createProviderNetworkError('Gemini', error);
         }
 

@@ -50,6 +50,7 @@ async function startServer() {
     changes: (id, extra) => call('GET', `${base}/${id}/changes${extra ? `?${new URLSearchParams(extra)}` : ''}`),
     proposals: (id) => call('GET', `${base}/${id}/proposals`),
     apply: (id, proposalId) => call('POST', `${base}/${id}/proposals/${proposalId}/apply`),
+    reject: (id, proposalId) => call('POST', `${base}/${id}/proposals/${proposalId}/reject`),
   };
 }
 
@@ -294,6 +295,61 @@ test('agent proposals carry diffs, list over HTTP, apply once, then disappear', 
   assert.equal((await api.proposals(id)).data.proposals.length, 0);
   assert.equal((await api.apply(id, staged.proposalId)).status, 404);
   assert.equal((await api.apply(id, 'no-such-proposal')).status, 404);
+});
+
+test('discarding a proposal removes it, leaves files untouched, and blocks later apply', async () => {
+  const api = await startServer();
+  const id = await makeProject(api);
+
+  // New-file proposal: discarding must not create anything.
+  const staged = await api.tools.execute('create_file', {
+    projectId: id,
+    path: 'discarded.js',
+    content: 'export const discarded = true;\n',
+  });
+  const discarded = await api.reject(id, staged.proposalId);
+  assert.equal(discarded.status, 200);
+  assert.equal(discarded.data.ok, true);
+  assert.equal(discarded.data.status, 'rejected');
+  assert.equal(discarded.data.proposalId, staged.proposalId);
+  assert.equal((await api.proposals(id)).data.proposals.length, 0);
+  assert.equal(fs.existsSync(path.join(workspaceDir(id), 'discarded.js')), false);
+  assert.equal((await api.apply(id, staged.proposalId)).status, 404);
+  assert.equal(fs.existsSync(path.join(workspaceDir(id), 'discarded.js')), false);
+
+  // Update proposal: discarding must leave the original bytes alone.
+  fs.writeFileSync(path.join(workspaceDir(id), 'keep.js'), 'value = 1\n');
+  const update = await api.tools.execute('propose_file_change', {
+    projectId: id,
+    path: 'keep.js',
+    content: 'value = 2\n',
+  });
+  assert.equal((await api.reject(id, update.proposalId)).status, 200);
+  assert.equal(fs.readFileSync(path.join(workspaceDir(id), 'keep.js'), 'utf8'), 'value = 1\n');
+  assert.equal((await api.apply(id, update.proposalId)).status, 404);
+
+  // A discarded proposal never produces a file-change history entry.
+  assert.equal((await api.changes(id)).data.changes.length, 0);
+
+  // Repeat discards and unknown ids are 404.
+  assert.equal((await api.reject(id, update.proposalId)).status, 404);
+  assert.equal((await api.reject(id, 'no-such-proposal')).status, 404);
+
+  // A proposal staged for one project cannot be discarded through another.
+  const otherId = await makeProject(api, 'Other Edits Project');
+  const foreign = await api.tools.execute('create_file', {
+    projectId: id,
+    path: 'foreign.js',
+    content: 'export const foreign = true;\n',
+  });
+  assert.equal((await api.reject(otherId, foreign.proposalId)).status, 404);
+  assert.equal((await api.proposals(id)).data.proposals.length, 1,
+    'a foreign reject must not remove the original proposal');
+  assert.equal(fs.existsSync(path.join(workspaceDir(id), 'foreign.js')), false);
+
+  // ...but the owning project can.
+  assert.equal((await api.reject(id, foreign.proposalId)).status, 200);
+  assert.equal((await api.proposals(id)).data.proposals.length, 0);
 });
 
 test('update proposals diff old vs new content and record an agent update', async () => {

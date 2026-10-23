@@ -56,10 +56,27 @@ export function getProvider(name, settings = config) {
   return createProvider({
     apiKey: settings.aiApiKey,
     model: settings.aiModel || defaults[name],
+    ...(name === 'openai' && settings.openaiBaseUrl
+      ? { baseUrl: settings.openaiBaseUrl }
+      : {}),
   });
 }
 
 /** Lists the provider names that are currently implemented. */
 export function listProviders() {
   return ['mock', ...providerFactories.keys()];
+}
+
+// Providers whose adapters implement the workspace tool loop. A background task
+// needs one of these; otherwise it could answer without ever inspecting files.
+const TOOL_CAPABLE_PROVIDERS = new Set(['openai', 'gemini']);
+
+/**
+ * Whether a provider can execute workspace tools. Injected/test providers can
+ * declare `supportsTools` explicitly; otherwise the adapter id decides.
+ */
+export function supportsWorkspaceTools(provider) {
+  if (!provider || typeof provider.chat !== 'function') return false;
+  if (typeof provider.supportsTools === 'boolean') return provider.supportsTools;
+  return TOOL_CAPABLE_PROVIDERS.has(provider.name);
 }

@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import {
   createTextFile,
@@ -12,8 +11,21 @@ import {
   scanDirectory,
   searchWorkspace,
   WorkspaceError,
+  validateWritePath,
 } from '../workspace/files.js';
 import { unifiedDiff } from '../workspace/diff.js';
+import {
+  claimProposal,
+  completeProposal,
+  failProposal,
+  getPendingProposal,
+  listPendingProposals,
+  rejectProposal as rejectStoredProposal,
+  releaseClaim,
+  stageProposal,
+  findPendingProposal,
+} from '../proposals/store.js';
+import { recoverInterruptedProposals } from '../proposals/recovery.js';
 
 const MAX_COMMAND_OUTPUT = 16_000;
 const commandNames = new Set(['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check']);
@@ -60,7 +72,7 @@ export const geminiToolDeclarations = [{
     },
     {
       name: 'list_files',
-      description: 'List files recursively in the selected workspace, excluding dependencies, build output, and credentials.',
+      description: 'List the relative file paths under one directory of the selected workspace, excluding dependencies, build output, and credentials. Call it once per request for the requested directory (the project root when unspecified) and report the returned paths. It returns paths only and never reads file contents.',
       parameters: {
         type: 'OBJECT',
         properties: {
@@ -84,7 +96,7 @@ export const geminiToolDeclarations = [{
     },
     {
       name: 'run_command',
-      description: 'Run one safe predefined project check. This does not run arbitrary shell commands.',
+      description: 'Stage one safe predefined project check for user approval. This does not run arbitrary shell commands, and nothing is run until the user approves it.',
       parameters: {
         type: 'OBJECT',
         properties: {
@@ -108,12 +120,6 @@ function projectRootFor(db, projectId, workspaceRoot) {
   const root = getProjectRoot(db, workspaceRoot, projectId);
   ensureDir(root);
   return root;
-}
-
-/** Persists one entry in the file_changes history table. */
-function recordChange(db, projectId, relativePath, action, source, diffText) {
-  db.prepare('INSERT INTO file_changes (project_id, path, action, source, diff) VALUES (?, ?, ?, ?, ?)')
-    .run(Number(projectId), relativePath, action, source, diffText || null);
 }
 
 function truncateOutput(value) {
@@ -181,60 +187,103 @@ function runSafeCommand(root, command, relativePath) {
 }
 
 export function createWorkspaceTools({ db }) {
-  const pendingProposals = new Map();
+  // Finish or fail proposals left mid-application by a previous process before
+  // any request can see them. This is read-only for the workspace.
+  recoverInterruptedProposals({ db, workspaceRoot: config.workspaceRoot });
+
+  /**
+   * Stages a file change for review. Nothing is written: the proposal waits
+   * for the user to approve it and is applied later by `applyProposal`.
+   *
+   * This is the single staging path used by both the interactive
+   * `create_file`/`propose_file_change` tools and the background task
+   * executor, so path validation, size limits, diffs, and the proposal
+   * state machine behave identically in both places.
+   */
+  function stageFileChange({ projectId, kind = 'create', path, content }) {
+    const root = projectRootFor(db, projectId, config.workspaceRoot);
+    if (typeof path !== 'string' || typeof content !== 'string') {
+      throw new WorkspaceError(400, 'A file change requires a relative path and text content.');
+    }
+    if (Buffer.byteLength(content, 'utf8') > 1024 * 1024) {
+      throw new WorkspaceError(413, 'Proposed file content exceeds the 1 MiB limit.');
+    }
+    // Fail fast with the same pure guard the apply step uses, so a path that
+    // can never be written (traversal, absolute, credentials) is never shown
+    // to the user as "awaiting approval".
+    validateWritePath(path, 'The assistant cannot create credential or environment files.');
+
+    if (kind === 'update') {
+      const original = readTextFile(root, path);
+      const diff = unifiedDiff(original.content, content, { oldPath: original.path, newPath: original.path });
+      const existing = findPendingProposal(db, projectId, 'update', original.path, content, null);
+      if (existing) return existing;
+      return stageProposal(db, {
+        projectId,
+        kind: 'update',
+        path: original.path,
+        content,
+        originalContent: original.content,
+        diff,
+      });
+    }
+
+    const diff = unifiedDiff('', content, { oldPath: path, newPath: path });
+    const existing = findPendingProposal(db, projectId, 'create', path, content, null);
+    if (existing) return existing;
+    return stageProposal(db, {
+      projectId,
+      kind: 'create',
+      path,
+      content,
+      diff,
+    });
+  }
+
+  /**
+   * Stages one allowlisted command for review. Nothing is run: the proposal
+   * waits for the user to approve it and is executed later by
+   * `runApprovedCommand`.
+   */
+  function stageCommand({ projectId, command, path = null }) {
+    projectRootFor(db, projectId, config.workspaceRoot);
+    if (!commandNames.has(command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
+    const existing = findPendingProposal(db, projectId, 'command', null, null, command);
+    if (existing) return existing;
+    return stageProposal(db, {
+      projectId,
+      kind: 'command',
+      command,
+      commandPath: typeof path === 'string' ? path : null,
+    });
+  }
+
   return {
     declarations: geminiToolDeclarations,
+    stageFileChange,
+    stageCommand,
     async execute(name, args = {}) {
       const root = projectRootFor(db, args.projectId, config.workspaceRoot);
       switch (name) {
         case 'create_file': {
-          if (typeof args.path !== 'string' || typeof args.content !== 'string') {
-            throw new WorkspaceError(400, 'create_file requires a relative path and text content.');
-          }
-          if (Buffer.byteLength(args.content, 'utf8') > 1024 * 1024) {
-            throw new WorkspaceError(413, 'Proposed file content exceeds the 1 MiB limit.');
-          }
-          const proposalId = randomUUID();
-          const diff = unifiedDiff('', args.content, { oldPath: args.path, newPath: args.path });
-          const proposal = {
-            projectId: args.projectId,
-            path: args.path,
-            content: args.content,
-            diff,
-          };
-          pendingProposals.set(proposalId, proposal);
+          const proposal = stageFileChange({ projectId: args.projectId, kind: 'create', path: args.path, content: args.content });
           return {
-            proposalId,
+            proposalId: proposal.id,
             path: args.path,
             status: 'awaiting_user_approval',
-            diff,
-            note: 'File is staged only. Ask the user to review the diff and apply it.',
+            diff: proposal.diff,
+            note: 'NOTHING HAS BEEN WRITTEN. This new file is staged only and is waiting for the user to approve it. Tell the user it is staged and awaiting approval; never say it was created, written, or applied.',
           };
         }
         case 'propose_file_change': {
-          if (typeof args.path !== 'string' || typeof args.content !== 'string') {
-            throw new WorkspaceError(400, 'propose_file_change requires a relative path and text content.');
-          }
-          if (Buffer.byteLength(args.content, 'utf8') > 1024 * 1024) {
-            throw new WorkspaceError(413, 'Proposed file content exceeds the 1 MiB limit.');
-          }
-          const original = readTextFile(root, args.path);
-          const proposalId = randomUUID();
-          const diff = unifiedDiff(original.content, args.content, { oldPath: original.path, newPath: original.path });
-          pendingProposals.set(proposalId, {
-            projectId: args.projectId,
-            path: original.path,
-            content: args.content,
-            originalContent: original.content,
-            diff,
-          });
+          const proposal = stageFileChange({ projectId: args.projectId, kind: 'update', path: args.path, content: args.content });
           return {
-            proposalId,
-            path: original.path,
+            proposalId: proposal.id,
+            path: proposal.path,
             status: 'awaiting_user_approval',
-            diff,
-            note: 'The update is staged only. Ask the user to review the diff and apply it.',
-            originalContent: original.content,
+            diff: proposal.diff,
+            note: 'NOTHING HAS BEEN CHANGED. This edit is staged only and is waiting for the user to approve it. Tell the user it is staged and awaiting approval; never say it was updated, applied, or written.',
+            originalContent: proposal.original_content,
           };
         }
         case 'read_file':
@@ -244,18 +293,12 @@ export function createWorkspaceTools({ db }) {
         case 'search_files':
           return searchWorkspace(root, args.query);
         case 'run_command': {
-          if (!commandNames.has(args.command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
-          const proposalId = randomUUID();
-          pendingProposals.set(proposalId, {
-            projectId: args.projectId,
-            command: args.command,
-            path: args.path,
-          });
+          const proposal = stageCommand({ projectId: args.projectId, command: args.command, path: args.path });
           return {
-            proposalId,
+            proposalId: proposal.id,
             command: args.command,
             status: 'awaiting_user_approval',
-            note: 'The command has not been run. Ask the user to approve it.',
+            note: 'NOTHING HAS BEEN RUN. This command is staged only and is waiting for the user to approve it. Tell the user it is awaiting approval; never say it was run or executed.',
           };
         }
         default:
@@ -263,60 +306,107 @@ export function createWorkspaceTools({ db }) {
       }
     },
     applyProposal(projectId, proposalId) {
-      const proposal = pendingProposals.get(proposalId);
-      if (!proposal || proposal.projectId !== Number(projectId) || !proposal.path || !('content' in proposal)) {
+      const project = Number(projectId);
+      const proposal = getPendingProposal(db, project, proposalId);
+      if (!proposal || proposal.kind === 'command' || !proposal.path) {
         throw new WorkspaceError(404, 'Pending file proposal not found.');
       }
-      const root = projectRootFor(db, proposal.projectId, config.workspaceRoot);
-      const isUpdate = 'originalContent' in proposal;
-      const applied = isUpdate
-        ? replaceTextFile(root, proposal.path, proposal.originalContent, proposal.content)
-        : createTextFile(root, proposal.path, proposal.content);
-      pendingProposals.delete(proposalId);
+      // Persisted claim: a second click, a concurrent request, or a restart
+      // can never write the same proposal twice.
+      if (!claimProposal(db, project, proposalId)) {
+        throw new WorkspaceError(404, 'Pending file proposal not found.');
+      }
+
+      const isUpdate = proposal.kind === 'update';
+      let applied;
+      try {
+        const root = projectRootFor(db, proposal.project_id, config.workspaceRoot);
+        applied = isUpdate
+          ? replaceTextFile(root, proposal.path, proposal.original_content, proposal.content)
+          : createTextFile(root, proposal.path, proposal.content);
+      } catch (error) {
+        // The guards refused before writing (stale content, existing file,
+        // unsafe path), so the proposal is safe to keep for retry or discard.
+        releaseClaim(db, proposalId);
+        throw error;
+      }
+
       const diff = isUpdate
-        ? unifiedDiff(proposal.originalContent, proposal.content, { oldPath: applied.path, newPath: applied.path })
+        ? unifiedDiff(proposal.original_content, proposal.content, { oldPath: applied.path, newPath: applied.path })
         : unifiedDiff('', proposal.content, { oldPath: applied.path, newPath: applied.path });
-      recordChange(db, proposal.projectId, applied.path, isUpdate ? 'update' : 'create', 'agent', diff);
+      // If this transaction fails the row stays 'applying' and startup
+      // recovery reconciles it against the file instead of repeating the write.
+      completeProposal(db, proposal, {
+        path: applied.path,
+        action: isUpdate ? 'update' : 'create',
+        diff,
+      });
       return { ...applied, diff };
+    },
+    /**
+     * Discards a pending proposal (file or command) without touching the disk.
+     * The row becomes `rejected`, so a later apply/run fails with 404 exactly
+     * as the previous map deletion did.
+     */
+    rejectProposal(projectId, proposalId) {
+      if (!rejectStoredProposal(db, Number(projectId), proposalId)) {
+        throw new WorkspaceError(404, 'Pending proposal not found.');
+      }
+      return { proposalId, status: 'rejected' };
     },
     /** Pending proposals (file and command) for one project, with review diffs. */
     listProposals(projectId) {
-      const id = Number(projectId);
-      const proposals = [];
-      for (const [proposalId, proposal] of pendingProposals) {
-        if (proposal.projectId !== id) continue;
-        if (proposal.command) {
-          proposals.push({
-            proposalId,
+      const proposals = listPendingProposals(db, Number(projectId)).map((proposal) => {
+        if (proposal.kind === 'command') {
+          return {
+            proposalId: proposal.id,
             type: 'command',
             command: proposal.command,
-            path: proposal.path ?? null,
+            path: proposal.command_path ?? null,
             status: 'awaiting_user_approval',
-          });
-          continue;
+          };
         }
-        const isUpdate = 'originalContent' in proposal;
-        proposals.push({
-          proposalId,
+        const isUpdate = proposal.kind === 'update';
+        return {
+          proposalId: proposal.id,
           type: 'file',
-          action: isUpdate ? 'update' : 'create',
+          action: proposal.kind,
           path: proposal.path,
           status: 'awaiting_user_approval',
           diff: proposal.diff ?? (isUpdate
-            ? unifiedDiff(proposal.originalContent, proposal.content, { oldPath: proposal.path, newPath: proposal.path })
+            ? unifiedDiff(proposal.original_content, proposal.content, { oldPath: proposal.path, newPath: proposal.path })
             : unifiedDiff('', proposal.content, { oldPath: proposal.path, newPath: proposal.path })),
-        });
-      }
+        };
+      });
       return { proposals };
     },
     runApprovedCommand(projectId, proposalId) {
-      const proposal = pendingProposals.get(proposalId);
-      if (!proposal || proposal.projectId !== Number(projectId) || !proposal.command) {
+      const project = Number(projectId);
+      const proposal = getPendingProposal(db, project, proposalId);
+      if (!proposal || proposal.kind !== 'command' || !proposal.command) {
         throw new WorkspaceError(404, 'Pending command approval not found.');
       }
-      const root = projectRootFor(db, proposal.projectId, config.workspaceRoot);
-      const result = runSafeCommand(root, proposal.command, proposal.path);
-      pendingProposals.delete(proposalId);
+      if (!claimProposal(db, project, proposalId)) {
+        throw new WorkspaceError(404, 'Pending command approval not found.');
+      }
+
+      let result;
+      try {
+        const root = projectRootFor(db, proposal.project_id, config.workspaceRoot);
+        result = runSafeCommand(root, proposal.command, proposal.command_path);
+      } catch (error) {
+        if (error instanceof WorkspaceError) {
+          // Pre-flight refusal (missing package.json, bad node_check path,
+          // missing workspace): the command never started, so retry is safe.
+          releaseClaim(db, proposalId);
+        } else {
+          // Timeout or spawn failure: it may have partially run. Never retry.
+          failProposal(db, proposalId, error?.message || String(error));
+        }
+        throw error;
+      }
+
+      completeProposal(db, proposal, { result: { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, command: result.command } });
       return result;
     },
   };

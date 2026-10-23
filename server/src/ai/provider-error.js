@@ -17,6 +17,15 @@ function redactCredentialFragments(message, apiKey) {
     .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]');
 }
 
+/** Parses a Retry-After header (seconds or HTTP date) into milliseconds. */
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
+}
+
 export async function createProviderHttpError(response, provider, apiKey) {
   let payload;
   try {
@@ -31,11 +40,14 @@ export async function createProviderHttpError(response, provider, apiKey) {
   let context;
   if (status === 401 || status === 403) {
     context = `${provider} rejected the API key or credentials.`;
+  } else if (status === 402) {
+    context = `${provider} credit or budget error; available credits may be exhausted.`;
+  } else if (status === 429 && /free-models-per-day/i.test(upstreamMessage || '')) {
+    context = `${provider} free-model daily quota exhausted (free-models-per-day). No retries should burn more quota.`;
   } else if (status === 429 && code === 'insufficient_quota') {
     context = `${provider} account has no available API quota.`;
   } else if (status === 429) {
-    context = `${provider} is rate limiting requests; verify available quota.`;
-    context = `${provider} rate limit or quota was reached.`;
+    context = `${provider} rate limit or quota was reached; verify available quota.`;
   } else if (status >= 500) {
     context = `${provider} is temporarily unavailable.`;
   } else {
@@ -47,6 +59,16 @@ export async function createProviderHttpError(response, provider, apiKey) {
   error.publicMessage = upstreamMessage
     ? `${context} ${upstreamMessage}`
     : context;
+
+  // Let callers (the background executor) honor an explicit backoff window.
+  let retryAfterMs = null;
+  try {
+    retryAfterMs = parseRetryAfter(response.headers?.get?.('retry-after'));
+  } catch {
+    retryAfterMs = null;
+  }
+  if (retryAfterMs !== null) error.retryAfterMs = retryAfterMs;
+
   return error;
 }
 

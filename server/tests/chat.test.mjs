@@ -143,6 +143,42 @@ test('validator unit checks mirror the HTTP behavior', () => {
   assert.equal(normalizeChatInput({ messages: [] }).ok, false);
 });
 
+test('chat only offers workspace tools for a project that actually exists', async () => {
+  const { app, tools } = createApp({ provider: mockProvider });
+  const api = await startServer(app);
+  const created = await api.post('/api/projects', { name: 'Chat Tools Test' });
+  const projectId = created.data.project.id;
+
+  const seen = [];
+  const spyProvider = {
+    name: 'spy',
+    model: 'spy-1',
+    async chat({ tools: offeredTools, projectId: offeredProjectId }) {
+      seen.push({ hasTools: Boolean(offeredTools), projectId: offeredProjectId });
+      return { text: 'ok', provider: 'spy', model: 'spy-1' };
+    },
+  };
+  const spyApi = await startServer(createApp({ provider: spyProvider, tools }).app);
+
+  const withProject = await spyApi.post('/api/chat', { message: 'hi', projectId });
+  assert.equal(withProject.status, 200);
+  assert.deepEqual(seen.at(-1), { hasTools: true, projectId }, 'an existing project arms the tools');
+
+  const withoutProject = await spyApi.post('/api/chat', { message: 'hi' });
+  assert.equal(withoutProject.status, 200);
+  assert.deepEqual(seen.at(-1), { hasTools: false, projectId: null }, 'no project means no tools');
+
+  const missingProject = await spyApi.post('/api/chat', { message: 'hi', projectId: 99999999 });
+  assert.equal(missingProject.status, 200);
+  assert.deepEqual(seen.at(-1), { hasTools: false, projectId: null }, 'a missing project must not arm the tools');
+
+  for (const badId of [0, -3, 2.5, 'abc']) {
+    const { status, data } = await spyApi.post('/api/chat', { message: 'hi', projectId: badId });
+    assert.equal(status, 400, `projectId ${badId} must be rejected`);
+    assert.match(data.error, /valid workspace/);
+  }
+});
+
 test('chat debug logs identify provider without exposing prompt by default', async () => {
   const savedDebugSetting = config.debugChatPrompts;
   const logged = [];
@@ -228,6 +264,20 @@ test('health reports when OpenAI is selected without an API key', async () => {
   } finally {
     config.aiApiKey = savedKey;
   }
+});
+
+test('health names the real service behind an OpenAI-compatible base URL', async () => {
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    baseUrl: 'https://openrouter.ai/api/v1',
+  });
+  const api = await startServer(createApp({ provider, providerName: 'openai' }).app);
+  const { status, data } = await api.get('/api/health');
+
+  assert.equal(status, 200);
+  assert.equal(data.aiProvider, 'openai');
+  assert.equal(data.providerLabel, 'OpenRouter');
+  assert.ok(!JSON.stringify(data).includes('test-key'));
 });
 
 test('OpenAI missing key returns a clear configuration error without mock fallback', async () => {

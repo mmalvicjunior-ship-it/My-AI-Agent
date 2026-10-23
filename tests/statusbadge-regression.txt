@@ -1,0 +1,3 @@
+REGRESSION — statusBadgeClass undefined (TaskCenter.jsx:184)
+PASS: helper defined locally; all 7 statuses mapped (queued, running, waiting_approval, provider_paused, completed, failed, cancelled);
+build PASS; no .env/service/live-AI changes; browser rendering not claimed verified.

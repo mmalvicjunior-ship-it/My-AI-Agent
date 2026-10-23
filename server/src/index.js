@@ -9,7 +9,10 @@ import { getProvider } from './ai/index.js';
 import { createChatRouter } from './routes/chat.js';
 import { createFilesRouter } from './routes/files.js';
 import { createEditsRouter } from './routes/edits.js';
+import { createTasksRouter } from './routes/tasks.js';
 import { createWorkspaceTools } from './ai/tools.js';
+import { createTaskRunner } from './tasks/runner.js';
+import { createTaskExecutor } from './tasks/executor.js';
 import { ensureDir, projectDir } from './workspace/files.js';
 
 function localNetworkUrls(port) {
@@ -30,7 +33,8 @@ export function createApp(options = {}) {
   // AI provider: injected by tests, otherwise resolved from AI_PROVIDER in .env
   const provider = 'provider' in options ? options.provider : getProvider(config.aiProvider);
   const providerName = 'providerName' in options ? options.providerName : config.aiProvider;
-  const workspaceTools = createWorkspaceTools({ db });
+  // Workspace tools: injectable by tests, otherwise the real path-safe toolset.
+  const workspaceTools = 'tools' in options ? options.tools : createWorkspaceTools({ db });
 
   app.use(express.json({ limit: '1mb' }));
 
@@ -54,6 +58,8 @@ export function createApp(options = {}) {
       service: 'myai-agent-server',
       version: '0.1.0',
       aiProvider: activeProvider,
+      // The real service name (for example OpenRouter) so the UI can name it.
+      providerLabel: provider?.displayName || null,
       aiConfigured: activeProvider === 'mock' || activeProvider === 'ollama' || keyConfigured,
       aiWarning,
     });
@@ -100,7 +106,10 @@ export function createApp(options = {}) {
   app.use('/api/projects', createEditsRouter({ db, tools: workspaceTools }));
 
   // --- Chat (validated, routed through the pluggable AI adapter) ----------
-  app.use('/api/chat', createChatRouter({ provider, providerName, tools: workspaceTools }));
+  app.use('/api/chat', createChatRouter({ db, provider, providerName, tools: workspaceTools }));
+
+  // --- Background tasks (durable queue; executed by src/tasks/runner.js) --
+  app.use('/api/tasks', createTasksRouter({ db }));
 
   // --- Safety net for unknown API routes ----------------------------------
   app.use('/api', (req, res) => {
@@ -118,13 +127,21 @@ export function createApp(options = {}) {
     return next(err);
   });
 
-  return { app, db, tools: workspaceTools };
+  return { app, db, tools: workspaceTools, provider };
 }
 
 // Start the server only when this file is executed directly
 // (allows tests to import createApp without binding a port).
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const { app } = createApp();
+  const { app, db, tools: workspaceTools, provider } = createApp();
+  // Background queue: runs outside any HTTP request and is not started by
+  // createApp(), so importing the app in tests never spawns a worker.
+  const taskRunner = createTaskRunner({
+    db,
+    // Stage 3: read-only workspace inspection through the existing agent.
+    executor: createTaskExecutor({ db, provider, tools: workspaceTools }),
+  });
+  taskRunner.start();
   const onReady = () => {
     const shownHost = config.host || 'localhost';
     console.log(`[server] listening on http://${shownHost}:${config.port} (AI provider: ${config.aiProvider})`);

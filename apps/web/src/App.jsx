@@ -10,6 +10,38 @@ import bash from 'highlight.js/lib/languages/bash';
 import css from 'highlight.js/lib/languages/css';
 import xml from 'highlight.js/lib/languages/xml';
 import sql from 'highlight.js/lib/languages/sql';
+import TaskCenter from './TaskCenter';
+
+function formatTimeAgo(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const diff = Date.now() - d.getTime();
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return d.toLocaleDateString();
+}
+
+function statusBadgeClass(status) {
+  const map = {
+    queued: 'status-queued',
+    running: 'status-running',
+    waiting_approval: 'status-waiting',
+    completed: 'status-completed',
+    failed: 'status-failed',
+    cancelled: 'status-cancelled',
+  };
+  return map[status] || 'status-unknown';
+}
+
+function stepStatusClass(status) {
+  const map = {
+    done: 'step-done',
+    running: 'step-running',
+    failed: 'step-failed',
+  };
+  return map[status] || 'step-unknown';
+}
 
 [
   ['javascript', javascript],
@@ -151,7 +183,16 @@ function diffPreviewLines(originalContent = '', proposedContent = '') {
   return { lines: lines.slice(0, 500), truncated: lines.length > 500 };
 }
 
-function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, onApplyProposal, onRunCommand }) {
+// Agent tool activity states. "awaiting approval" is deliberately distinct
+// from "running": a staged change is not applied until the user approves it.
+const TOOL_STATUS_VIEW = {
+  completed: { className: 'completed', icon: '✓', label: 'done' },
+  failed: { className: 'failed', icon: '!', label: 'failed' },
+  'awaiting approval': { className: 'awaiting', icon: '⏸', label: 'awaiting approval' },
+  running: { className: 'running', icon: '…', label: 'running' },
+};
+
+function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, onApplyProposal, onDiscardProposal, onRunCommand }) {
   const articleRef = useRef(null);
 
   useEffect(() => {
@@ -197,16 +238,25 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
         />
         {message.toolActivity?.length > 0 && (
           <div className="tool-activity" aria-label="Agent actions">
-            {message.toolActivity.map((activity, activityIndex) => (
+            {message.toolActivity.map((activity, activityIndex) => {
+              const status = TOOL_STATUS_VIEW[activity.status] || TOOL_STATUS_VIEW.running;
+              return (
               <div key={`${activity.tool}-${activityIndex}`} className="tool-activity-group">
-                <span className={`tool-activity-item ${activity.status}`}>
-                  {activity.status === 'completed' ? '✓' : activity.status === 'failed' ? '!' : '…'} {activity.tool}
+                <span className={`tool-activity-item ${status.className}`}>
+                  {status.icon} {activity.tool} · {status.label}{activity.reused ? ' · reused previous result' : ''}
                 </span>
                 {activity.proposal && (
                   <div className="diff-proposal">
                     <div className="file-panel-heading">
                       <strong>{activity.proposal.originalContent === undefined ? 'New file' : 'File changes'}: {activity.proposal.path}</strong>
-                      <button onClick={() => onApplyProposal(activity.projectId, activity.proposal.proposalId)}>Apply file</button>
+                      {!activity.proposalState && (
+                        <>
+                          <button onClick={() => onApplyProposal(sessionId, index, activityIndex, activity.projectId, activity.proposal.proposalId)}>Apply file</button>
+                          <button onClick={() => onDiscardProposal(sessionId, index, activityIndex, activity.projectId, activity.proposal.proposalId)}>Discard</button>
+                        </>
+                      )}
+                      {activity.proposalState === 'applied' && <span className="proposal-state">Applied</span>}
+                      {activity.proposalState === 'discarded' && <span className="proposal-state">Discarded — nothing was written</span>}
                     </div>
                     {(() => {
                       const preview = diffPreviewLines(activity.proposal.originalContent, activity.proposal.content);
@@ -232,7 +282,8 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
                   </div>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
         <div className="message-actions">
@@ -261,6 +312,7 @@ function App() {
   const [health, setHealth] = useState({
     online: false,
     provider: null,
+    providerLabel: null,
     warning: 'Checking AI provider configuration…',
   });
   const [projects, setProjects] = useState([]);
@@ -268,19 +320,26 @@ function App() {
   const [toast, setToast] = useState(null);
   const [retryRequest, setRetryRequest] = useState(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
-  const [mobileView, setMobileView] = useState('chat');
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileContent, setFileContent] = useState('');
   const [fileSearch, setFileSearch] = useState('');
   const [codeSearchResults, setCodeSearchResults] = useState([]);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [taskInput, setTaskInput] = useState('');
+  const [tasks, setTasks] = useState([]);
+  const [tasksError, setTasksError] = useState(null);
+  const [taskLoading, setTaskLoading] = useState(false);
+  const [taskSubmitting, setTaskSubmitting] = useState(false);
+  const [taskDetail, setTaskDetail] = useState(null);
+  const [taskDetailError, setTaskDetailError] = useState(null);
+  const [taskPollInterval, setTaskPollInterval] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [diffPreview, setDiffPreview] = useState(false);
   const messageListRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
   const attachmentInputRef = useRef(null);
-  const touchStartRef = useRef(null);
   const controllerRef = useRef(null);
   const wasAtBottomRef = useRef(true);
   const activeSession = sessions.find((session) => session.id === activeId) || sessions[0];
@@ -311,6 +370,7 @@ function App() {
           setHealth({
             online: true,
             provider: data.aiProvider || 'mock',
+            providerLabel: data.providerLabel || null,
             warning: data.aiWarning || null,
           });
         }
@@ -319,6 +379,7 @@ function App() {
           setHealth({
             online: false,
             provider: null,
+            providerLabel: null,
             warning: 'Cannot reach the AI server. Start or restart the backend and try again.',
           });
         }
@@ -538,6 +599,34 @@ function App() {
     }
   };
 
+  const loadTasks = useCallback(async () => {
+    setTaskLoading(true);
+    try {
+      const url = `/api/tasks${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`;
+      const response = await fetch(url);
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load tasks.');
+      setTasks(Array.isArray(result.tasks) ? result.tasks : []);
+      setTasksError(null);
+    } catch (error) {
+      setTasksError(error.message);
+    } finally {
+      setTaskLoading(false);
+    }
+  }, [projectId]);
+
+  const loadTaskDetail = useCallback(async (taskId) => {
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(String(taskId))}`);
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load task.');
+      setTaskDetail({ task: result.task, steps: Array.isArray(result.steps) ? result.steps : [] });
+      setTaskDetailError(null);
+    } catch (error) {
+      setTaskDetailError(error.message);
+    }
+  }, []);
+
   const loadWorkspaceFiles = async (id = projectId) => {
     if (!id) {
       setWorkspaceFiles([]);
@@ -630,22 +719,56 @@ function App() {
     sendMessage(prompt);
   };
 
-  const applyFileProposal = async (id, proposalId) => {
+  // Records the outcome of a staged file proposal in the chat transcript so the
+  // Apply/Discard buttons disappear and the user sees what happened.
+  const markProposal = (sessionId, messageIndex, activityIndex, proposalState) => {
+    updateSession(sessionId, (session) => ({
+      ...session,
+      messages: session.messages.map((message, currentIndex) => (
+        currentIndex === messageIndex
+          ? {
+            ...message,
+            toolActivity: message.toolActivity.map((activity, currentActivityIndex) => (
+              currentActivityIndex === activityIndex
+                ? { ...activity, proposalState }
+                : activity
+            )),
+          }
+          : message
+      )),
+    }));
+  };
+
+  const applyFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
         method: 'POST',
       });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not apply the proposed file.');
+      markProposal(sessionId, messageIndex, activityIndex, 'applied');
       setToast({ message: `Applied changes to ${result.file.path}.` });
       await loadWorkspaceFiles(String(id));
-      setMobileView('files');
       const fileResponse = await fetch(`/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
       const fileResult = await fileResponse.json();
       if (!fileResponse.ok || !fileResult.ok) throw new Error(fileResult.error || 'Created file but could not open it.');
       setProjectId(String(id));
       setSelectedFile(fileResult.path);
       setFileContent(fileResult.content);
+    } catch (error) {
+      setToast({ message: error.message });
+    }
+  };
+
+  const discardFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+        method: 'POST',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not discard the proposed file.');
+      markProposal(sessionId, messageIndex, activityIndex, 'discarded');
+      setToast({ message: 'Proposal discarded. Nothing was written.' });
     } catch (error) {
       setToast({ message: error.message });
     }
@@ -728,6 +851,53 @@ function App() {
     setShowScrollButton(!atBottom && messages.length > 0);
   };
 
+  const refreshTasks = useCallback(async () => { await loadTasks(); }, [loadTasks]);
+
+  const createTask = useCallback(async () => {
+    const prompt = taskInput.trim();
+    if (!prompt) {
+      setToast({ message: 'Describe a coding task before creating it.' });
+      return;
+    }
+    if (prompt.length > 20_000) {
+      setToast({ message: 'Tasks must be 20,000 characters or fewer.' });
+      return;
+    }
+    setTaskSubmitting(true);
+    try {
+      const response = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: projectId ? Number(projectId) : undefined, instruction: prompt }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not create task.');
+      setTaskInput('');
+      setTaskSubmitting(false);
+      setTasks((current) => [result.task, ...current]);
+      await loadTaskDetail(result.task.id);
+      setTaskDetail({ task: result.task, steps: [] });
+      setTaskCenterOpen(true);
+      setToast({ message: 'Task created.' });
+    } catch (error) {
+      setTaskSubmitting(false);
+      setToast({ message: error.message });
+    }
+  }, [projectId, taskInput, loadTasks, loadTaskDetail]);
+
+  const cancelTask = useCallback(async (taskId) => {
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not cancel task.');
+      await loadTasks();
+      setTaskDetail(null);
+      setToast({ message: 'Task cancelled.' });
+    } catch (error) {
+      setToast({ message: error.message });
+    }
+  }, [loadTasks]);
+
   const sortedSessions = useMemo(
     () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
     [sessions],
@@ -782,21 +952,8 @@ function App() {
         </aside>
       )}
 
-      <main
-        className="main-panel"
-        onTouchStart={(event) => { touchStartRef.current = event.changedTouches[0]?.clientX ?? null; }}
-        onTouchEnd={(event) => {
-          const end = event.changedTouches[0]?.clientX;
-          if (touchStartRef.current === null || end === undefined) return;
-          const delta = end - touchStartRef.current;
-          if (Math.abs(delta) > 90 && window.innerWidth <= 700) {
-            setMobileView(delta < 0 ? 'files' : 'chat');
-            navigator.vibrate?.(8);
-          }
-          touchStartRef.current = null;
-        }}
-      >
-        <div className={`chat-pane ${mobileView === 'files' ? 'mobile-hidden' : ''}`}>
+      <main className="main-panel">
+        <div className="chat-pane">
         <header className="topbar">
           <div className="topbar-left">
             {!sidebarOpen && <button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="Show sidebar"><Icon name="panel" /></button>}
@@ -832,11 +989,13 @@ function App() {
           <div className="ai-warning" role="alert">
             <span className="ai-warning-icon">!</span>
             <div className="ai-warning-content">
-              <strong>{health.provider === 'openai'
-                ? 'OpenAI needs attention'
-                : health.provider === 'huggingface'
-                  ? 'Hugging Face needs attention'
-                  : 'AI provider status'}</strong>
+              <strong>{health.providerLabel
+                ? `${health.providerLabel} needs attention`
+                : health.provider === 'openai'
+                  ? 'OpenAI needs attention'
+                  : health.provider === 'huggingface'
+                    ? 'Hugging Face needs attention'
+                    : 'AI provider status'}</strong>
               <span>{health.warning}</span>
             </div>
           </div>
@@ -872,6 +1031,7 @@ function App() {
                   onRegenerate={regenerate}
                   onFeedback={setFeedback}
                   onApplyProposal={applyFileProposal}
+                  onDiscardProposal={discardFileProposal}
                   onRunCommand={runApprovedWorkspaceCommand}
                 />
               ))}
@@ -973,62 +1133,25 @@ function App() {
           </div>
           <p className="disclaimer">MyAI can make mistakes. Check important information.</p>
         </div>
+        <TaskCenter
+          projectId={projectId}
+          taskInput={taskInput}
+          setTaskInput={setTaskInput}
+          taskSubmitting={taskSubmitting}
+          createTask={createTask}
+          tasks={tasks}
+          setTasks={setTasks}
+          tasksError={tasksError}
+          taskLoading={taskLoading}
+          loadTasks={loadTasks}
+          loadTaskDetail={loadTaskDetail}
+          setTaskDetail={setTaskDetail}
+          taskDetail={taskDetail}
+          taskDetailError={taskDetailError}
+          cancelTask={cancelTask}
+          refreshTasks={refreshTasks}
+        />
         </div>
-        <aside className={`workspace-panel ${mobileView === 'chat' ? 'mobile-hidden' : ''}`}>
-          <div className="workspace-panel-header">
-            <div>
-              <strong>Files &amp; Code</strong>
-              <span>{projects.find((project) => String(project.id) === projectId)?.name || 'Select a project to inspect files'}</span>
-            </div>
-            <button className="icon-button" onClick={() => loadWorkspaceFiles()} aria-label="Refresh files">↻</button>
-          </div>
-          {projectId ? (
-            <>
-              <input
-                className="file-search"
-                value={fileSearch}
-                onChange={(event) => setFileSearch(event.target.value)}
-                onKeyDown={(event) => { if (event.key === 'Enter') searchWorkspaceCode(); }}
-                placeholder="Filter project files…"
-                aria-label="Filter names or search code; press Enter to search file contents"
-              />
-              {codeSearchResults.length > 0 && (
-                <div className="code-search-results">
-                  <strong>Code matches</strong>
-                  {codeSearchResults.map((result) => (
-                    <button key={`${result.path}:${result.line}`} onClick={() => openWorkspaceFile(result.path)}>
-                      <code>{result.path}:{result.line}</code><span>{result.content}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-              <div className="workspace-file-list">
-                {workspaceFiles
-                  .filter((file) => file.toLowerCase().includes(fileSearch.toLowerCase()))
-                  .map((file) => (
-                    <button key={file} className={`workspace-file ${selectedFile === file ? 'selected' : ''}`} onClick={() => openWorkspaceFile(file)}>
-                      <span>▤</span>{file}
-                    </button>
-                  ))}
-                {workspaceFiles.length === 0 && <p className="workspace-empty">No files found. Create or import a project workspace.</p>}
-              </div>
-              <div className="file-viewer">
-                <div className="file-panel-heading"><strong>{selectedFile || 'Code preview'}</strong></div>
-                {selectedFile
-                  ? <CodeViewer content={fileContent} filePath={selectedFile} />
-                  : <p className="workspace-empty">Choose a file to inspect it. The agent can search and read workspace files when you send a prompt.</p>}
-              </div>
-            </>
-          ) : (
-            <div className="workspace-empty">
-              Choose the workspace button in the sidebar to create a workspace or import an existing project directory.
-            </div>
-          )}
-        </aside>
-        <nav className="mobile-tabs" aria-label="Workspace tabs">
-          <button className={mobileView === 'chat' ? 'active' : ''} onClick={() => { setMobileView('chat'); navigator.vibrate?.(8); }}>💬 Chat</button>
-          <button className={mobileView === 'files' ? 'active' : ''} onClick={() => { setMobileView('files'); navigator.vibrate?.(8); }}>📁 Files &amp; Code</button>
-        </nav>
       </main>
     </div>
   );

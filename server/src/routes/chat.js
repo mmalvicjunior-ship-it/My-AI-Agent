@@ -7,6 +7,17 @@ const VALID_ROLES = new Set(['user', 'assistant', 'system']);
 
 const bad = (error) => ({ ok: false, error });
 
+/** Looks up a project row by id; returns null for missing/invalid ids. */
+function findProject(db, rawId) {
+  const id = Number(rawId);
+  if (!Number.isInteger(id) || id < 1) return null;
+  try {
+    return db.prepare('SELECT id FROM projects WHERE id = ?').get(id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Validates and normalizes a chat request body.
  * Accepts either { message: "..." } or { messages: [{ role, content }, ...] }.
@@ -61,7 +72,7 @@ export function normalizeChatInput(body) {
  * Chat router: validates the complete conversation history, calls the
  * pluggable provider, and keeps secrets out of every response and log line.
  */
-export function createChatRouter({ provider, providerName = 'unset', tools = null }) {
+export function createChatRouter({ db = null, provider, providerName = 'unset', tools = null }) {
   const router = express.Router();
 
   router.post('/', async (req, res) => {
@@ -96,10 +107,16 @@ export function createChatRouter({ provider, providerName = 'unset', tools = nul
       if (projectId !== null && (!Number.isInteger(projectId) || projectId < 1)) {
         return res.status(400).json({ ok: false, error: 'projectId must identify a valid workspace.' });
       }
+      // Workspace tools are only offered when the request names a project that
+      // actually exists, so the model can never call tools for a missing one.
+      const selectedProject = projectId === null ? null : findProject(db, projectId);
+      if (projectId !== null && !selectedProject) {
+        console.warn(`[chat] Request named workspace ${projectId}, which does not exist; continuing without workspace tools.`);
+      }
       const result = await provider.chat({
         messages: normalized.messages,
-        tools: projectId ? tools : null,
-        projectId,
+        tools: selectedProject ? tools : null,
+        projectId: selectedProject ? projectId : null,
       });
       if (!result || typeof result.text !== 'string') {
         throw new Error('Provider returned a malformed result (missing text).');

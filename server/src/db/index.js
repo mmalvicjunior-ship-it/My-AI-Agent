@@ -1,5 +1,7 @@
 // Lightweight persistence using Node's built-in SQLite (zero extra dependencies).
 import { DatabaseSync } from 'node:sqlite';
+import { ensurePlanColumn } from '../tasks/store.js';
+import { ensureResultColumn } from '../proposals/store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
@@ -52,6 +54,81 @@ export function openDb() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  // Background coding tasks. The queue lives in SQLite (not in the browser or
+  // an HTTP request) so a task keeps its status, progress and history across
+  // restarts; the in-process runner (src/tasks/runner.js) executes them.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id       INTEGER NOT NULL,
+      instruction      TEXT NOT NULL,
+      autonomy         TEXT NOT NULL DEFAULT 'allow_writes_and_commands'
+                       CHECK (autonomy IN ('propose', 'allow_writes', 'allow_writes_and_commands')),
+      status           TEXT NOT NULL DEFAULT 'queued'
+                       CHECK (status IN ('queued', 'running', 'waiting_approval', 'provider_paused', 'completed', 'failed', 'cancelled')),
+      last_step        TEXT,
+      error            TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      started_at       TEXT,
+      finished_at      TEXT
+    );
+  `);
+
+  // Ensure the plan_json column exists on the tasks table (idempotent migration).
+  ensurePlanColumn(db);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_steps (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id    INTEGER NOT NULL,
+      seq        INTEGER NOT NULL,
+      kind       TEXT NOT NULL DEFAULT 'note',
+      title      TEXT NOT NULL,
+      detail     TEXT,
+      status     TEXT NOT NULL DEFAULT 'done' CHECK (status IN ('pending', 'running', 'done', 'failed')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status, id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_task_steps_task ON task_steps (task_id, seq)');
+
+  // Staged workspace proposals (file creates/updates and approved commands).
+  // Persisting them lets the user approve a proposal after a server restart.
+  // `status` is also the crash guard: an application is claimed
+  // (pending -> applying) before any file is touched, and a row left in
+  // `applying` is reconciled at startup instead of being repeated.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS proposals (
+      id               TEXT PRIMARY KEY,
+      project_id       INTEGER NOT NULL,
+      kind             TEXT NOT NULL CHECK (kind IN ('create', 'update', 'command')),
+      path             TEXT,
+      content          TEXT,
+      original_content TEXT,
+      diff             TEXT,
+      command          TEXT,
+      command_path     TEXT,
+      status           TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending', 'applying', 'applied', 'rejected', 'failed', 'interrupted')),
+      error            TEXT,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at      TEXT
+    );
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_proposals_project_status
+      ON proposals (project_id, status, created_at)
+  `);
+
+  // Ensure the result_json column exists on the proposals table (idempotent
+  // migration). It stores a safe, size-limited command outcome so a task can
+  // report a real test result later.
+  ensureResultColumn(db);
 
   return db;
 }

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: myai-agent-malvic-backend
+    runtime: node
+    plan: starter
+    region: ohio
+    rootDir: .
+    buildCommand: npm ci --workspace=server --omit=dev
+    startCommand: npm run start --workspace=server
+    healthCheckPath: /api/health
+    disk:
+      name: myai-agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/app.db
+      - key: WORKSPACE_ROOT
+        value: /var/data/workspaces
+      - key: AI_PROVIDER
+        value: openai
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        sync: false
+      - key: OPENAI_BASE_URL
+        sync: false

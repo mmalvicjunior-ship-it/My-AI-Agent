@@ -254,6 +254,37 @@ workspace folder, so it never adds test projects to `server/data/app.db` or
 `server/workspaces/`. `npm run smoke` boots the server in-process and checks
 `/api/health`.
 
+### Deploy frontend to Vercel and backend to Render
+
+The frontend and backend remain separate npm workspaces: `apps/web` is the
+Vercel static site and `server` is the Render Node service. Keep the Vercel
+project root set to the repository root (`.`) so it can use the root npm
+lockfile and workspace dependencies. The root `vercel.json` builds only the
+`web` workspace, serves `apps/web/dist`, and proxies `/api/*` requests to the
+Render service.
+
+The root `render.yaml` defines the backend service. Create it as a Render
+Blueprint from this repository. It installs only the server workspace, starts
+the existing server entry point, and mounts a 1 GB persistent disk at
+`/var/data` for the SQLite database and project workspaces. Render's Starter
+service and persistent disk are paid resources; review current pricing before
+creating the service.
+
+During Render setup, provide `AI_API_KEY`, `AI_MODEL`, and `OPENAI_BASE_URL`
+through Render's environment-variable setup from your private provider
+configuration. Never put the key in either deployment manifest or source
+control. The Vercel rewrite currently targets
+`https://myai-agent-malvic-backend.onrender.com`; if Render assigns a different
+service URL, update the rewrite destination in `vercel.json` and redeploy the
+frontend.
+
+**Public deployment warning:** the API currently has no authentication. Its
+project, task, proposal, and approved-command endpoints would be publicly
+reachable through the deployed service and Vercel proxy. Do not make the
+deployment public or use it with valuable data until an authentication/access
+control layer is added and reviewed. These manifests prepare deployment only;
+they do not create or deploy either service.
+
 ## Principles
 
 - Minimal dependencies; no Docker, no emulators, no local AI models

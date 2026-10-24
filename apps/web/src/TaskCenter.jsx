@@ -13,6 +13,16 @@ function statusBadgeClass(status) {
   return map[status] || 'status-unknown';
 }
 
+function stepStatusClass(status) {
+  const map = {
+    queued: 'step-queued',
+    running: 'step-running',
+    completed: 'step-completed',
+    failed: 'step-failed',
+  };
+  return map[status] || 'step-unknown';
+}
+
 function statusLabel(status) {
   const map = {
     queued: 'Queued',
@@ -24,16 +34,6 @@ function statusLabel(status) {
     cancelled: 'Cancelled',
   };
   return map[status] || status;
-}
-
-function stepStatusClass(status) {
-  const map = {
-    queued: 'step-queued',
-    running: 'step-running',
-    completed: 'step-completed',
-    failed: 'step-failed',
-  };
-  return map[status] || 'step-unknown';
 }
 
 function statusColor(status) {

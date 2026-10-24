@@ -12,6 +12,8 @@ import xml from 'highlight.js/lib/languages/xml';
 import sql from 'highlight.js/lib/languages/sql';
 import TaskCenter from './TaskCenter';
 
+const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
+
 function formatTimeAgo(ts) {
   if (!ts) return '';
   const d = new Date(ts);
@@ -363,7 +365,7 @@ function App() {
     let cancelled = false;
     const checkHealth = async () => {
       try {
-        const response = await fetch('/api/health');
+        const response = await fetch(`${API_BASE}/api/health`);
         if (!response.ok) throw new Error(`Health check returned ${response.status}`);
         const data = await response.json();
         if (!cancelled) {
@@ -387,7 +389,7 @@ function App() {
     };
     const loadProjects = async () => {
       try {
-        const response = await fetch('/api/projects');
+        const response = await fetch(`${API_BASE}/api/projects`);
         if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
         const data = await response.json();
         if (!cancelled) setProjects(Array.isArray(data.projects) ? data.projects : []);
@@ -446,7 +448,7 @@ function App() {
     const controller = new AbortController();
     controllerRef.current = controller;
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -580,7 +582,7 @@ function App() {
     const existingPath = window.prompt('Optional: enter the full path of an existing project folder on this PC. Leave blank to create a new workspace.');
     if (existingPath === null) return;
     try {
-      const response = await fetch('/api/projects', {
+      const response = await fetch(`${API_BASE}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -603,7 +605,7 @@ function App() {
     setTaskLoading(true);
     try {
       const url = `/api/tasks${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`;
-      const response = await fetch(url);
+      const response = await fetch(`${API_BASE}${url}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load tasks.');
       setTasks(Array.isArray(result.tasks) ? result.tasks : []);
@@ -617,7 +619,7 @@ function App() {
 
   const loadTaskDetail = useCallback(async (taskId) => {
     try {
-      const response = await fetch(`/api/tasks/${encodeURIComponent(String(taskId))}`);
+      const response = await fetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load task.');
       setTaskDetail({ task: result.task, steps: Array.isArray(result.steps) ? result.steps : [] });
@@ -635,7 +637,7 @@ function App() {
       return;
     }
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(id)}/tree`);
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not scan the project.');
       setWorkspaceFiles(result.files);
@@ -647,7 +649,7 @@ function App() {
   const openWorkspaceFile = async (filePath) => {
     if (!projectId) return;
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`);
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not open file.');
       setSelectedFile(result.path);
@@ -660,7 +662,7 @@ function App() {
   const searchWorkspaceCode = async () => {
     if (!projectId || fileSearch.trim().length < 2) return;
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not search project code.');
       setCodeSearchResults(result.results);
@@ -741,7 +743,7 @@ function App() {
 
   const applyFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -749,7 +751,7 @@ function App() {
       markProposal(sessionId, messageIndex, activityIndex, 'applied');
       setToast({ message: `Applied changes to ${result.file.path}.` });
       await loadWorkspaceFiles(String(id));
-      const fileResponse = await fetch(`/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
+      const fileResponse = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
       const fileResult = await fileResponse.json();
       if (!fileResponse.ok || !fileResult.ok) throw new Error(fileResult.error || 'Created file but could not open it.');
       setProjectId(String(id));
@@ -762,7 +764,7 @@ function App() {
 
   const discardFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -776,7 +778,7 @@ function App() {
 
   const runApprovedWorkspaceCommand = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`/api/projects/${encodeURIComponent(id)}/commands/${encodeURIComponent(proposalId)}/run`, {
+      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/commands/${encodeURIComponent(proposalId)}/run`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -865,7 +867,7 @@ function App() {
     }
     setTaskSubmitting(true);
     try {
-      const response = await fetch('/api/tasks', {
+      const response = await fetch(`${API_BASE}/api/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId: projectId ? Number(projectId) : undefined, instruction: prompt }),
@@ -887,7 +889,7 @@ function App() {
 
   const cancelTask = useCallback(async (taskId) => {
     try {
-      const response = await fetch(`/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
+      const response = await fetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not cancel task.');
       await loadTasks();

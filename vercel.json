@@ -6,7 +6,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://myai-agent-malvic-backend.onrender.com/api/:path*"
+      "destination": "https://my-ai-agent-acqy.onrender.com/api/:path*"
     }
   ]
 }

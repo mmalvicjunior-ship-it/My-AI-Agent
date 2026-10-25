@@ -1,6 +1,6 @@
 // Lightweight persistence using Node's built-in SQLite (zero extra dependencies).
 import { DatabaseSync } from 'node:sqlite';
-import { ensurePlanColumn } from '../tasks/store.js';
+import { ensurePlanColumn, ensureAutonomyColumn } from '../tasks/store.js';
 import { ensureResultColumn } from '../proposals/store.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -79,6 +79,49 @@ export function openDb() {
 
   // Ensure the plan_json column exists on the tasks table (idempotent migration).
   ensurePlanColumn(db);
+  // Ensure autonomous mode column exists on the tasks table (idempotent migration).
+  ensureAutonomyColumn(db);
+
+  // Safe idempotent migration: add 'provider_paused' to status check for older DBs.
+  const tasksSchema = db.prepare("SELECT sql FROM sqlite_master WHERE name='tasks' AND type='table'").get();
+  if (tasksSchema && tasksSchema.sql && !tasksSchema.sql.includes('provider_paused')) {
+    // Recreate tasks table with updated status constraint, preserving all data.
+    db.exec(`
+      CREATE TABLE tasks_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        instruction TEXT NOT NULL,
+        autonomy TEXT NOT NULL DEFAULT 'allow_writes_and_commands'
+          CHECK (autonomy IN ('propose', 'allow_writes', 'allow_writes_and_commands')),
+        status TEXT NOT NULL DEFAULT 'queued'
+          CHECK (status IN ('queued', 'running', 'waiting_approval', 'provider_paused', 'completed', 'failed', 'cancelled')),
+        last_step TEXT,
+        error TEXT,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        started_at TEXT,
+        finished_at TEXT,
+        plan_json TEXT,
+        autonomous INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const cols = db.prepare('PRAGMA table_info(tasks)').all();
+    const colNames = cols.map(c => c.name);
+    const insertCols = ['id','project_id','instruction','autonomy','status','last_step','error','cancel_requested','created_at','updated_at','started_at','finished_at'];
+    const safeCols = insertCols.filter(c => colNames.includes(c));
+    const colList = safeCols.join(', ');
+    try {
+      db.exec(`INSERT INTO tasks_new (${colList}) SELECT ${colList} FROM tasks;`);
+    } catch {
+      const basicCols = ['id','project_id','instruction','autonomy','status','last_step','error','cancel_requested','created_at','updated_at','started_at','finished_at'];
+      const basicList = basicCols.filter(c => colNames.includes(c)).join(', ');
+      if (basicList) db.exec(`INSERT INTO tasks_new (${basicList}) SELECT ${basicList} FROM tasks;`);
+    }
+    db.exec('DROP TABLE tasks;');
+    db.exec('ALTER TABLE tasks_new RENAME TO tasks;');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status, id);');
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS task_steps (

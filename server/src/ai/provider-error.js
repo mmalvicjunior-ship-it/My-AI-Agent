@@ -69,6 +69,17 @@ export async function createProviderHttpError(response, provider, apiKey) {
   }
   if (retryAfterMs !== null) error.retryAfterMs = retryAfterMs;
 
+  // Structured error classification for recovery logic (never exposes keys).
+  const isQuotaDaily = status === 429 && /free-models-per-day/i.test(upstreamMessage || '');
+  const isQuotaBudget = status === 402 || (status === 429 && /insufficient_quota/i.test(upstreamMessage || '') || /quota|budget|credit/i.test(upstreamMessage || ''));
+  const isRateLimited = status === 429 && !isQuotaDaily && !isQuotaBudget;
+  const isInvalidKey = status === 401 || status === 403;
+
+  error.errorType = isQuotaDaily || isQuotaBudget ? 'QUOTA_EXHAUSTED'
+    : isRateLimited ? 'RATE_LIMITED'
+    : isInvalidKey ? 'INVALID_API_KEY'
+    : (status >= 500 ? 'PROVIDER_ERROR' : 'REQUEST_ERROR');
+
   return error;
 }
 

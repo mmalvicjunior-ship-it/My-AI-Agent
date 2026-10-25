@@ -19,6 +19,7 @@ export const TASK_STATUSES = Object.freeze([
  *  Null when no plan has been set.
  */
 export const TASK_PLAN_COLUMN = 'plan_json';
+export const TASK_AUTONOMOUS_COLUMN = 'autonomous';
 
 /** Ensure the tasks table has the plan column.
  *  Safe to call repeatedly; does nothing if the column already exists.
@@ -27,6 +28,14 @@ export function ensurePlanColumn(db) {
   const columns = db.prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
   if (!columns.includes(TASK_PLAN_COLUMN)) {
     db.exec(`ALTER TABLE tasks ADD COLUMN ${TASK_PLAN_COLUMN} TEXT`);
+  }
+}
+
+/** Ensure the tasks table has the autonomous column (idempotent migration). */
+export function ensureAutonomyColumn(db) {
+  const columns = db.prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
+  if (!columns.includes(TASK_AUTONOMOUS_COLUMN)) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN ${TASK_AUTONOMOUS_COLUMN} INTEGER NOT NULL DEFAULT 0`);
   }
 }
 
@@ -126,7 +135,17 @@ export function getTask(db, id) {
   return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) ?? null;
 }
 
-export function createTask(db, { projectId, instruction, autonomy = DEFAULT_AUTONOMY }) {
+export function createTask(db, { projectId, instruction, autonomy = DEFAULT_AUTONOMY, autonomous = false }) {
+  // Backward-compatible: some isolated test DBs create the tasks table without
+  // the autonomous column, so only include it when it already exists.
+  const hasAutonomousColumn = db.prepare('PRAGMA table_info(tasks)').all().some((c) => c.name === TASK_AUTONOMOUS_COLUMN);
+  if (hasAutonomousColumn) {
+    const result = db
+      .prepare(`INSERT INTO tasks (project_id, instruction, autonomy, ${TASK_AUTONOMOUS_COLUMN}) VALUES (?, ?, ?, ?)`)
+      .run(projectId, instruction, autonomy, autonomous ? 1 : 0);
+    return getTask(db, Number(result.lastInsertRowid));
+  }
+  // Existing DBs without the column: safe default to approval mode (no autonomous).
   const result = db
     .prepare('INSERT INTO tasks (project_id, instruction, autonomy) VALUES (?, ?, ?)')
     .run(projectId, instruction, autonomy);
@@ -320,6 +339,9 @@ export function claimRecoverableTask(db) {
       rec = plan.recovery || null;
     } catch {}
     const retryAt = rec?.nextRetryAt ? Number(new Date(rec.nextRetryAt).getTime()) : null;
+    // Cancellation takes priority over recovery scheduling. A task that was
+    // cancelled while paused is not resumed, even if its retry time passed.
+    if (Number(row.cancel_requested || 0)) continue;
     // Conservative: resume only if retry time is known and passed, or unknown but
     // we allow one bounded availability check (avoids repeated quota-consuming requests).
     if (retryAt !== null && retryAt <= now) {

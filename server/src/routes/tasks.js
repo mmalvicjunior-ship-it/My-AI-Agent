@@ -61,8 +61,10 @@ export function createTasksRouter({ db }) {
       });
     }
 
+    const autonomous = req.body?.autonomous ?? false;
+
     try {
-      const task = createTask(db, { projectId: project.id, instruction, autonomy });
+      const task = createTask(db, { projectId: project.id, instruction, autonomy, autonomous });
       return res.status(201).json({ ok: true, task });
     } catch (err) {
       return sendError(res, err, 'create');

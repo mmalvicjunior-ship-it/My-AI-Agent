@@ -28,6 +28,10 @@ const MAX_RESULT_CHARS = 10_000;
 const MAX_STEP_DETAIL_CHARS = 500;
 const MAX_TITLE_VALUE_CHARS = 80;
 
+/** Autonomous mode safety limits. */
+const MAX_AUTONOMOUS_ITERATIONS = 10;
+const MAX_AUTONOMOUS_TIME_MS = 30 * 60 * 1000; // 30 minutes
+
 const BACKGROUND_INSTRUCTION = [
   'You are MyAI running an unattended background task inside the user\'s selected project workspace.',
   'The only tools available to you are read_file, list_files, and search_files; all three are read-only.',
@@ -375,13 +379,15 @@ export function createTaskExecutor({
       throw error;
     }
 
+    const isAutonomous = task?.autonomous === 1 || task?.autonomous === true;
+
     addStep({
       kind: 'note',
       title: 'Agent started',
-      detail: `${providerLabel} (${provider.model || 'unknown model'}); read-only inspection. Autonomy "${task.autonomy}" is recorded, but edits and commands are disabled in this stage.`,
+      detail: `${providerLabel} (${provider.model || 'unknown model'}); ${isAutonomous ? 'autonomous mode — edits and commands enabled within workspace limits' : 'read-only inspection'}. Autonomy "${task.autonomy}" is recorded.`,
     });
 
-    const readOnlyTools = createReadOnlyTools({
+    const activeTools = isAutonomous ? tools : createReadOnlyTools({
       tools,
       projectId: project.id,
       addStep,
@@ -405,6 +411,42 @@ export function createTaskExecutor({
         title: 'Loaded saved plan',
         detail: metaSummary ? clip(redactSecrets(metaSummary), MAX_STEP_DETAIL_CHARS) : 'Plan metadata restored; no proposal details saved yet.',
       });
+      // Enforce autonomous limits across recovery: do not exceed iterations or time.
+      if (isAutonomous) {
+        const iterationCount = Number(savedPlan.iteration || 0);
+        const maxIterations = savedPlan.plan?.iteration !== undefined
+          ? MAX_AUTONOMOUS_ITERATIONS
+          : MAX_AUTONOMOUS_ITERATIONS;
+        const maxTimeMs = MAX_AUTONOMOUS_TIME_MS;
+        const startTimeMs = savedPlan.startTime ? Number(new Date(savedPlan.startTime).getTime()) : null;
+        const elapsedMs = startTimeMs === null ? 0 : Date.now() - startTimeMs;
+        if (iterationCount >= maxIterations) {
+          addStep({
+            kind: 'note',
+            title: 'Autonomous iteration limit reached',
+            detail: `Iteration ${iterationCount} >= ${maxIterations}. Stopping to avoid exceeding the safe run window.`,
+            status: 'failed',
+          });
+          return { status: 'failed', error: 'Iterative autonomous work exceeded the maximum iteration count.' };
+        }
+        if (elapsedMs >= maxTimeMs) {
+          addStep({
+            kind: 'note',
+            title: 'Autonomous time limit reached',
+            detail: `Elapsed ${Math.round(elapsedMs / 1000)}s >= ${maxTimeMs}ms. Stopping to avoid an unsafe long-running task.`,
+            status: 'failed',
+          });
+          return { status: 'failed', error: 'Autonomous work exceeded the maximum time limit.' };
+        }
+        if (savedPlan.iteration === undefined && iterationCount > 0) {
+          savedPlan.iteration = iterationCount + 1;
+          savePlan(db, task.id, savedPlan);
+        }
+        if (startTimeMs === null) {
+          savedPlan.startTime = new Date().toISOString();
+          savePlan(db, task.id, savedPlan);
+        }
+      }
     }
 
     async function stageOrderedStep(plan) {
@@ -839,7 +881,54 @@ export function createTaskExecutor({
     // If proposals were staged, the task must wait for approval.
     // The runner will observe the waiting_approval status and resume only
     // once the linked proposals reach a terminal outcome.
+    // If proposals were staged, the task must wait for approval (approval mode)
+    // or apply them automatically (autonomous mode). The isAutonomous flag from
+    // above (line ~385) is reused so the function scope stays consistent.
     if (proposalIds.length > 0) {
+      if (isAutonomous) {
+        // Autonomous mode: apply staged proposals automatically (bounded loop)
+        for (const entry of proposalIds) {
+          const proposalId = typeof entry === 'object' ? entry.id : entry;
+          if (!proposalId) continue;
+          try {
+            const proposal = db.prepare('SELECT id, kind, project_id FROM proposals WHERE id = ?').get(proposalId);
+            if (proposal && proposal.status === 'pending' && proposal.project_id === Number(project.id)) {
+              if (proposal.kind === 'command') {
+                await tools.runApprovedCommand(project.id, proposalId);
+              } else {
+                await tools.applyProposal(project.id, proposalId);
+              }
+              addStep({ kind: 'note', title: 'Auto-applied proposal', detail: `Applied proposal ${proposalId} (${proposal.kind}).`, status: 'done' });
+            }
+          } catch (applyErr) {
+            addStep({ kind: 'note', title: 'Auto-apply failed', detail: clip(redactSecrets(applyErr?.message || String(applyErr)), MAX_STEP_DETAIL_CHARS), status: 'failed' });
+          }
+        }
+        // After autonomous application, finalize based on proposal outcomes
+        const terminalIds = proposalIds.map((entry) => (typeof entry === 'object' ? entry.id : entry)).filter(Boolean);
+        const appliedCount = terminalIds.filter((pid) => {
+          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
+          return row && row.status === 'applied';
+        }).length;
+        const failedCount = terminalIds.filter((pid) => {
+          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
+          return row && row.status === 'failed';
+        }).length;
+        const interruptedCount = terminalIds.filter((pid) => {
+          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
+          return row && row.status === 'interrupted';
+        }).length;
+        const rejectedCount = terminalIds.filter((pid) => {
+          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
+          return row && row.status === 'rejected';
+        }).length;
+        const incomplete = failedCount > 0 || interruptedCount > 0 || rejectedCount > 0 || appliedCount < terminalIds.length;
+        const failureMessage = incomplete ? clip(
+          `Autonomous execution: applied=${appliedCount}, failed=${failedCount}, interrupted=${interruptedCount}, rejected=${rejectedCount}, total=${terminalIds.length}.`,
+          MAX_RESULT_CHARS
+        ) : null;
+        return { status: incomplete ? 'failed' : 'completed', error: failureMessage, outcome: { applied: appliedCount, total: terminalIds.length } };
+      }
       addStep({
         kind: 'note',
         title: 'Waiting for approval',

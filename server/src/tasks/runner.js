@@ -24,6 +24,28 @@ import {
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_CANCEL_POLL_MS = 250;
 
+/** Safe provider-status check for OpenRouter only (verified endpoint/auth).
+ * Never exposes key in logs; uses timeout; never assumes quota is restored.
+ */
+async function pollKeyStatus({ apiKey, baseUrl, signal, timeoutMs = 5000 }) {
+  if (!apiKey || typeof apiKey !== 'string') return { ok: false, reason: 'no_key' };
+  try {
+    const url = new URL('/api/v1/key', (baseUrl || 'https://openrouter.ai').replace(/\/$/, ''));
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    });
+    clearTimeout(id);
+    if (!response.ok) return { ok: false, reason: 'status_check_failed', status: response.status };
+    return { ok: true, reason: 'status_check_ok', note: 'Supporting evidence only; does not confirm model availability.' };
+  } catch (error) {
+    return { ok: false, reason: 'status_check_error', note: error?.message || 'Network failure during status check' };
+  }
+}
+
 export const NO_EXECUTOR_ERROR =
   'Background execution is not connected to the coding agent yet, so this task was not run.';
 
@@ -149,8 +171,39 @@ export function createTaskRunner({
       const message = error?.message || String(error);
       // Quota / provider-capacity pause: persist recovery state instead of hard failure
       const statusCode = error?.statusCode;
+      const errorType = error?.errorType;
       const isQuota = statusCode === 429 || statusCode === 402;
-      const isQuotaExhausted = isQuota && /quota|credit|budget|insufficient|free-models-per-day/i.test(message || '');
+      const isQuotaExhausted = errorType === 'QUOTA_EXHAUSTED' || (isQuota && /quota|credit|budget|insufficient|free-models-per-day/i.test(message || ''));
+      const isRateLimited = errorType === 'RATE_LIMITED' || (statusCode === 429 && !isQuotaExhausted);
+
+      // Rate-limit: bounded exponential backoff with jitter; honor Retry-After.
+      if (isRateLimited) {
+        const baseDelayMs = error?.retryAfterMs || 60_000; // configurable default 60s when provider gives no Retry-After
+        const maxDelayMs = 300_000; // 5 minutes cap
+        const jitterMs = Math.round(Math.random() * 5000); // small jitter to avoid thundering herd
+        const retryMs = Math.min(maxDelayMs, Math.max(baseDelayMs, baseDelayMs * 2)); // bounded growth on repeated limits
+        const recovery = {
+          reason: 'provider_rate_limited',
+          lastError: message.slice(0, 500),
+          retryAttempt: Math.min(Number(error?.retryAttempt || 0) + 1, 5),
+          nextRetryAt: new Date(Date.now() + retryMs).toISOString(),
+          pausedAt: new Date().toISOString(),
+        };
+        const plan = loadPlan(db, task.id) || {};
+        plan.recovery = { ...(plan.recovery || {}), ...recovery };
+        savePlan(db, task.id, plan);
+        const clearMsg = (error?.publicMessage || message).slice(0, 500);
+        db.prepare("UPDATE tasks SET status = 'provider_paused', error = ?, updated_at = datetime('now') WHERE id = ?").run(clearMsg, task.id);
+        appendStep(db, task.id, {
+          kind: 'note',
+          title: 'Provider rate limited',
+          detail: `Task paused: ${(error?.publicMessage || message).slice(0, 200)}. Retry scheduled (${retryMs}ms).`,
+          status: 'done',
+        });
+        return getTask(db, task.id);
+      }
+
+      // Quota exhaustion: stay paused; do not burn more quota with automatic retries.
       if (isQuotaExhausted) {
         const recovery = {
           reason: 'provider_quota_exhausted',

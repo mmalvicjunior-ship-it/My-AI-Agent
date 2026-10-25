@@ -23,15 +23,15 @@ function stepStatusClass(status) {
   return map[status] || 'step-unknown';
 }
 
-function statusLabel(status) {
+function statusLabel(status, autonomous = false) {
   const map = {
-    queued: 'Queued',
-    running: 'Running',
-    waiting_approval: 'Waiting for approval',
-    provider_paused: 'Paused (quota/retry)',
-    completed: 'Completed',
-    failed: 'Failed',
-    cancelled: 'Cancelled',
+    queued: autonomous ? 'Queued (autonomous)' : 'Queued',
+    running: autonomous ? 'Running (autonomous)' : 'Running',
+    waiting_approval: autonomous ? 'Waiting (autonomous)' : 'Waiting for approval',
+    provider_paused: autonomous ? 'Paused (quota/retry, autonomous)' : 'Paused (quota/retry)',
+    completed: autonomous ? 'Completed (autonomous)' : 'Completed',
+    failed: autonomous ? 'Failed (autonomous)' : 'Failed',
+    cancelled: autonomous ? 'Cancelled (autonomous)' : 'Cancelled',
   };
   return map[status] || status;
 }
@@ -169,6 +169,15 @@ export default function TaskCenter({
             {tasksError && (
               <div className="task-error" role="alert">{tasksError}</div>
             )}
+            {tasks.some((t) => t.status === 'provider_paused') && (
+              <div className="provider-status-warning" role="alert">
+                <span className="provider-status-icon">⏸</span>
+                <div>
+                  <strong>Provider paused</strong>
+                  <span>A previous task hit a quota or rate limit. Check the task error for details. New submissions are allowed but may also pause.</span>
+                </div>
+              </div>
+            )}
           </form>
         </div>
       </div>
@@ -207,7 +216,7 @@ export default function TaskCenter({
                       className={`task-status ${statusBadgeClass(task.status)}`}
                       style={{ color: statusColor(task.status) }}
                     >
-                      {statusLabel(task.status)}
+                      {statusLabel(task.status, task.autonomous === 1 || task.autonomous === true)}
                     </span>
                   </div>
                   <div className="task-card-body">

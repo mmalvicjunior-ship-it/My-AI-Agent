@@ -1,6 +1,6 @@
 import { createProviderHttpError, createProviderNetworkError } from './provider-error.js';
 
-const DEFAULT_MODEL = 'gemini-flash-latest';
+const DEFAULT_MODEL = 'gemini-2.5-flash';
 const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const SYSTEM_INSTRUCTION = "You are a helpful coding assistant. Follow the user's instructions directly. When a project workspace is selected, inspect relevant files with tools before proposing changes, use create_file for new files and propose_file_change for edits to existing files. All file changes and commands require explicit user approval; use only the provided safe command tools. Never claim a tool succeeded unless its result confirms success.";
 

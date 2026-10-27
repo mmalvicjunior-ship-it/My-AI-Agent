@@ -14,9 +14,11 @@ export const mockToolProvider = {
     if (signal?.aborted) throw new Error('Cancelled');
 
     const latest = messages.filter((m) => m.role === 'user').at(-1)?.content || '';
-    const text = (latest.toLowerCase().includes('autonomous') || latest.toLowerCase().includes('fix') || latest.toLowerCase().includes('test'))
-      ? '{"summary":"Mock autonomous plan","needsChanges":true,"changes":[{"kind":"update","path":"test.js","content":"// fixed\nexport const ok = true;\n","goal":"fix failing test"}],"commands":[{"command":"npm_test","goal":"verify fix"}]}'
-      : '{"summary":"No changes needed","needsChanges":false}';
+    // This provider never touches real code; it only simulates a planning reply for offline tests.
+    const isAutonomousOrFix = latest.toLowerCase().includes('autonomous') || latest.toLowerCase().includes('fix') || latest.toLowerCase().includes('test');
+    const text = isAutonomousOrFix
+      ? '{"summary":"Mock autonomous plan (simulated only — no files were edited or commands executed; this is the mock-tool provider for offline verification)","needsChanges":true,"changes":[{"kind":"update","path":"test.js","content":"// simulated fix — not applied\\nexport const ok = true;\\n","goal":"simulated verification only"}],"commands":[{"command":"npm_test","goal":"simulated verification only"}]}'
+      : '{"summary":"No changes needed (simulated/mock mode — no real code generated)","needsChanges":false}';
 
     return {
       text,

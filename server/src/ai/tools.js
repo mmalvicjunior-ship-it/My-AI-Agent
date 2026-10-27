@@ -27,6 +27,15 @@ import {
 } from '../proposals/store.js';
 import { recoverInterruptedProposals } from '../proposals/recovery.js';
 
+export const PROPOSAL_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export function isProposalExpired(proposal) {
+  if (!proposal || !proposal.created_at) return false;
+  const createdTime = new Date(proposal.created_at).getTime();
+  if (Number.isNaN(createdTime)) return false;
+  return (Date.now() - createdTime) > PROPOSAL_EXPIRATION_MS;
+}
+
 const MAX_COMMAND_OUTPUT = 16_000;
 const commandNames = new Set(['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check']);
 
@@ -211,7 +220,7 @@ export function createWorkspaceTools({ db }) {
     // Fail fast with the same pure guard the apply step uses, so a path that
     // can never be written (traversal, absolute, credentials) is never shown
     // to the user as "awaiting approval".
-    validateWritePath(path, 'The assistant cannot create credential or environment files.');
+    validateWritePath(path, 'The assistant cannot create credential or environment files.', { allowDeployment: true });
 
     if (kind === 'update') {
       const original = readTextFile(root, path);
@@ -311,6 +320,9 @@ export function createWorkspaceTools({ db }) {
       if (!proposal || proposal.kind === 'command' || !proposal.path) {
         throw new WorkspaceError(404, 'Pending file proposal not found.');
       }
+      if (isProposalExpired(proposal)) {
+        throw new WorkspaceError(410, 'Proposal approval has expired. Staged changes must be approved within 24 hours.');
+      }
       // Persisted claim: a second click, a concurrent request, or a restart
       // can never write the same proposal twice.
       if (!claimProposal(db, project, proposalId)) {
@@ -322,8 +334,8 @@ export function createWorkspaceTools({ db }) {
       try {
         const root = projectRootFor(db, proposal.project_id, config.workspaceRoot);
         applied = isUpdate
-          ? replaceTextFile(root, proposal.path, proposal.original_content, proposal.content)
-          : createTextFile(root, proposal.path, proposal.content);
+          ? replaceTextFile(root, proposal.path, proposal.original_content, proposal.content, { allowDeployment: true })
+          : createTextFile(root, proposal.path, proposal.content, { allowDeployment: true });
       } catch (error) {
         // The guards refused before writing (stale content, existing file,
         // unsafe path), so the proposal is safe to keep for retry or discard.
@@ -385,6 +397,9 @@ export function createWorkspaceTools({ db }) {
       const proposal = getPendingProposal(db, project, proposalId);
       if (!proposal || proposal.kind !== 'command' || !proposal.command) {
         throw new WorkspaceError(404, 'Pending command approval not found.');
+      }
+      if (isProposalExpired(proposal)) {
+        throw new WorkspaceError(410, 'Command proposal approval has expired. Staged commands must be approved within 24 hours.');
       }
       if (!claimProposal(db, project, proposalId)) {
         throw new WorkspaceError(404, 'Pending command approval not found.');

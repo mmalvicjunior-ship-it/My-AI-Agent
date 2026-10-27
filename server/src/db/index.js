@@ -63,8 +63,8 @@ export function openDb() {
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       project_id       INTEGER NOT NULL,
       instruction      TEXT NOT NULL,
-      autonomy         TEXT NOT NULL DEFAULT 'allow_writes_and_commands'
-                       CHECK (autonomy IN ('propose', 'allow_writes', 'allow_writes_and_commands')),
+      autonomy         TEXT NOT NULL DEFAULT 'propose'
+                       CHECK (autonomy IN ('supervised', 'propose', 'approved_autonomous', 'allow_writes', 'allow_writes_and_commands')),
       status           TEXT NOT NULL DEFAULT 'queued'
                        CHECK (status IN ('queued', 'running', 'waiting_approval', 'provider_paused', 'completed', 'failed', 'cancelled')),
       last_step        TEXT,
@@ -82,17 +82,17 @@ export function openDb() {
   // Ensure autonomous mode column exists on the tasks table (idempotent migration).
   ensureAutonomyColumn(db);
 
-  // Safe idempotent migration: add 'provider_paused' to status check for older DBs.
+  // Safe idempotent migration: add 'provider_paused' and new autonomy modes for older DBs.
   const tasksSchema = db.prepare("SELECT sql FROM sqlite_master WHERE name='tasks' AND type='table'").get();
-  if (tasksSchema && tasksSchema.sql && !tasksSchema.sql.includes('provider_paused')) {
+  if (tasksSchema && tasksSchema.sql && (!tasksSchema.sql.includes('provider_paused') || !tasksSchema.sql.includes('approved_autonomous'))) {
     // Recreate tasks table with updated status constraint, preserving all data.
     db.exec(`
       CREATE TABLE tasks_new (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER NOT NULL,
         instruction TEXT NOT NULL,
-        autonomy TEXT NOT NULL DEFAULT 'allow_writes_and_commands'
-          CHECK (autonomy IN ('propose', 'allow_writes', 'allow_writes_and_commands')),
+        autonomy TEXT NOT NULL DEFAULT 'propose'
+          CHECK (autonomy IN ('supervised', 'propose', 'approved_autonomous', 'allow_writes', 'allow_writes_and_commands')),
         status TEXT NOT NULL DEFAULT 'queued'
           CHECK (status IN ('queued', 'running', 'waiting_approval', 'provider_paused', 'completed', 'failed', 'cancelled')),
         last_step TEXT,

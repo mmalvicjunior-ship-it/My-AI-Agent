@@ -40,9 +40,22 @@ export function getProjectRoot(db, workspaceRoot, projectId) {
   }
 }
 
-function isSensitiveFile(fileName) {
+export function isSensitiveFile(fileName) {
   return /^(?:\.env(?:\..*)?|.*\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx)|id_rsa|id_ed25519)$/i.test(fileName)
-    || /(?:secret|credential|token)/i.test(fileName);
+    || /(?:secret|credential|token|password)/i.test(fileName);
+}
+
+export function isProtectedDeploymentConfig(filePath) {
+  const normalized = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+  const base = path.basename(normalized);
+  if (/^(?:render\.ya?ml|vercel\.json|netlify\.toml|fly\.toml|docker-compose.*\.ya?ml|dockerfile.*)$/i.test(base)) {
+    return true;
+  }
+  const segments = normalized.split('/');
+  if (segments.includes('.github') || segments.includes('.gitlab')) {
+    return true;
+  }
+  return false;
 }
 
 /** Creates a directory (and parents) if missing. */
@@ -159,13 +172,13 @@ export function readTextFile(rootDir, relativePath) {
   return { path: target.relative, size: stat.size, content: buffer.toString('utf8') };
 }
 
-export function createTextFile(rootDir, relativePath, content) {
+export function createTextFile(rootDir, relativePath, content, { allowDeployment = false } = {}) {
   if (typeof content !== 'string') throw new WorkspaceError(400, 'File content must be text.');
   if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
     throw new WorkspaceError(413, `File content exceeds the ${MAX_READ_BYTES}-byte limit.`);
   }
   const { destination, relative } = prepareWrite(rootDir, relativePath,
-    'The assistant cannot create credential or environment files.');
+    'The assistant cannot create credential or environment files.', { allowDeployment });
   if (fs.existsSync(destination)) throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
   fs.writeFileSync(destination, content, { encoding: 'utf8', flag: 'wx' });
   return { path: relative, size: Buffer.byteLength(content, 'utf8') };
@@ -176,7 +189,7 @@ export function createTextFile(rootDir, relativePath, content) {
  * checks with no filesystem side effects. Returns the normalized path.
  * Shared by prepareWrite (writes) and the preview route (dry runs).
  */
-export function validateWritePath(relativePath, sensitiveMessage) {
+export function validateWritePath(relativePath, sensitiveMessage, { allowDeployment = false } = {}) {
   if (typeof relativePath !== 'string' || relativePath.includes('\0')
     || path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
     throw new WorkspaceError(400, 'Use a valid relative file path inside the project.');
@@ -188,6 +201,9 @@ export function validateWritePath(relativePath, sensitiveMessage) {
   if (isSensitiveFile(path.basename(normalized))) {
     throw new WorkspaceError(403, sensitiveMessage);
   }
+  if (!allowDeployment && isProtectedDeploymentConfig(normalized)) {
+    throw new WorkspaceError(403, 'Deployment, CI/CD, and cloud infrastructure configuration files cannot be modified through the assistant without explicit user approval.');
+  }
   return normalized;
 }
 
@@ -197,8 +213,8 @@ export function validateWritePath(relativePath, sensitiveMessage) {
  * inside the workspace root. Shared by createTextFile/writeTextFile so both
  * enforce identical traversal and credential-file guards.
  */
-function prepareWrite(rootDir, relativePath, sensitiveMessage) {
-  const normalized = validateWritePath(relativePath, sensitiveMessage);
+function prepareWrite(rootDir, relativePath, sensitiveMessage, { allowDeployment = false } = {}) {
+  const normalized = validateWritePath(relativePath, sensitiveMessage, { allowDeployment });
   const root = fs.realpathSync(rootDir);
   const segments = normalized.split(path.sep);
   const parentSegments = segments.slice(0, -1);
@@ -259,8 +275,8 @@ export function deletePath(rootDir, relativePath) {
   if (target.relative === '.') {
     throw new WorkspaceError(400, 'The project root cannot be deleted.');
   }
-  if (isSensitiveFile(path.basename(target.absolute))) {
-    throw new WorkspaceError(403, 'Credential or environment files cannot be deleted through the workspace API.');
+  if (isSensitiveFile(path.basename(target.absolute)) || isProtectedDeploymentConfig(target.relative)) {
+    throw new WorkspaceError(403, 'Credential, environment, and deployment configuration files cannot be deleted through the workspace API.');
   }
   const stat = fs.statSync(target.absolute);
   if (stat.isDirectory()) {
@@ -282,9 +298,12 @@ export function deletePath(rootDir, relativePath) {
   };
 }
 
-export function replaceTextFile(rootDir, relativePath, expectedContent, content) {
+export function replaceTextFile(rootDir, relativePath, expectedContent, content, { allowDeployment = false } = {}) {
   if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
     throw new WorkspaceError(413, `Updated file must be text and no larger than ${MAX_READ_BYTES} bytes.`);
+  }
+  if (!allowDeployment && isProtectedDeploymentConfig(relativePath)) {
+    throw new WorkspaceError(403, 'Deployment, CI/CD, and cloud infrastructure configuration files cannot be modified without explicit user approval.');
   }
   const current = readTextFile(rootDir, relativePath);
   if (current.content !== expectedContent) {

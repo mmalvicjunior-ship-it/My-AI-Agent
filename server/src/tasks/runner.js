@@ -19,6 +19,7 @@ import {
   savePlan,
   isCancelRequested,
   setWaitingApproval,
+  getTask,
 } from './store.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;

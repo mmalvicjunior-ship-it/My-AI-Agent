@@ -13,10 +13,11 @@
 // Retry policy: at most three provider attempts (two retries) for transient
 // failures only (HTTP 429, 502, 504). Auth/configuration errors, malformed
 // responses, tool-support failures, and cancellation are never retried.
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { redactSecrets } from '../config.js';
 import { supportsWorkspaceTools } from '../ai/index.js';
-import { WorkspaceError } from '../workspace/files.js';
+import { WorkspaceError, isSensitiveFile, isProtectedDeploymentConfig } from '../workspace/files.js';
 import { loadPlan, savePlan } from './store.js';
 import { describePlan, sanitizePlan, buildPlanMetadata, parseJsonReply } from './plan.js';
 
@@ -379,7 +380,8 @@ export function createTaskExecutor({
       throw error;
     }
 
-    const isAutonomous = task?.autonomous === 1 || task?.autonomous === true;
+    const mode = task?.autonomy || 'propose';
+    const isAutonomous = (mode === 'approved_autonomous' || mode === 'allow_writes_and_commands') && (task?.autonomous === 1 || task?.autonomous === true);
 
     addStep({
       kind: 'note',
@@ -636,7 +638,7 @@ export function createTaskExecutor({
             messages,
             // The provider always receives the read-only tool surface, so
             // `tools.execute` is never undefined for an adapter or a stub.
-            tools: readOnlyTools,
+            tools: activeTools,
             projectId: project.id,
             signal,
           });
@@ -887,12 +889,33 @@ export function createTaskExecutor({
     if (proposalIds.length > 0) {
       if (isAutonomous) {
         // Autonomous mode: apply staged proposals automatically (bounded loop)
+        let anyApprovalRequired = false;
         for (const entry of proposalIds) {
           const proposalId = typeof entry === 'object' ? entry.id : entry;
           if (!proposalId) continue;
           try {
-            const proposal = db.prepare('SELECT id, kind, project_id FROM proposals WHERE id = ?').get(proposalId);
+            const proposal = db.prepare('SELECT id, kind, project_id, path, command, status FROM proposals WHERE id = ?').get(proposalId);
             if (proposal && proposal.status === 'pending' && proposal.project_id === Number(project.id)) {
+              if (proposal.kind === 'command' && !['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check'].includes(proposal.command)) {
+                anyApprovalRequired = true;
+                addStep({
+                  kind: 'note',
+                  title: 'Approval required for command',
+                  detail: `Command "${proposal.command}" requires explicit user approval.`,
+                  status: 'pending',
+                });
+                continue;
+              }
+              if (proposal.kind !== 'command' && (isSensitiveFile(path.basename(proposal.path)) || isProtectedDeploymentConfig(proposal.path))) {
+                anyApprovalRequired = true;
+                addStep({
+                  kind: 'note',
+                  title: 'Approval required for sensitive file',
+                  detail: `File "${proposal.path}" modifies credentials or deployment settings and requires explicit user approval.`,
+                  status: 'pending',
+                });
+                continue;
+              }
               if (proposal.kind === 'command') {
                 await tools.runApprovedCommand(project.id, proposalId);
               } else {
@@ -903,6 +926,14 @@ export function createTaskExecutor({
           } catch (applyErr) {
             addStep({ kind: 'note', title: 'Auto-apply failed', detail: clip(redactSecrets(applyErr?.message || String(applyErr)), MAX_STEP_DETAIL_CHARS), status: 'failed' });
           }
+        }
+        if (anyApprovalRequired) {
+          addStep({
+            kind: 'note',
+            title: 'Waiting for approval',
+            detail: 'Actions outside the low-risk autonomous scope were staged and require explicit user review.',
+          });
+          return { status: 'waiting_approval' };
         }
         // After autonomous application, finalize based on proposal outcomes
         const terminalIds = proposalIds.map((entry) => (typeof entry === 'object' ? entry.id : entry)).filter(Boolean);

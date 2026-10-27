@@ -49,7 +49,7 @@ export function getProvider(name, settings = config) {
 
   const defaults = {
     openai: 'gpt-4o-mini',
-    gemini: 'gemini-flash-latest',
+    gemini: 'gemini-2.5-flash',
     huggingface: 'meta-llama/Meta-Llama-3-8B-Instruct',
     ollama: 'llama3',
   };

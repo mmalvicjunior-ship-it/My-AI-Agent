@@ -64,7 +64,7 @@ test('creates a queued task with the default autonomy', async () => {
   assert.equal(data.task.project_id, projectId);
   assert.equal(data.task.instruction, 'Fix the failing test');
   assert.equal(data.task.status, 'queued');
-  assert.equal(data.task.autonomy, 'allow_writes_and_commands');
+  assert.equal(data.task.autonomy, 'propose');
   assert.equal(data.task.cancel_requested, 0);
   assert.equal(data.task.last_step, null);
   assert.equal(data.task.error, null);

@@ -116,15 +116,30 @@ export function loadPlan(db, taskId) {
 export const ACTIVE_TASK_STATUSES = Object.freeze(['queued', 'running', 'waiting_approval', 'provider_paused']);
 
 export const AUTONOMY_LEVELS = Object.freeze([
+  'supervised',
   'propose',
+  'approved_autonomous',
   'allow_writes',
   'allow_writes_and_commands',
 ]);
 
-// Default: unattended runs may apply their own file edits and run the
-// allowlisted workspace commands (npm test/build, node --check). Arbitrary
-// commands still go through the existing approval flow.
-export const DEFAULT_AUTONOMY = 'allow_writes_and_commands';
+// Default: Propose mode. The agent can independently inspect the workspace,
+// read files, search code, prepare a plan, and stage change proposals. It must
+// wait for user approval before applying changes or executing commands.
+export const DEFAULT_AUTONOMY = 'propose';
+
+/**
+ * Validates whether a task has permission for autonomous execution.
+ * Only 'approved_autonomous' (or legacy 'allow_writes_and_commands' when explicitly flagged)
+ * is permitted autonomous execution; 'propose' and 'supervised' always require approval.
+ */
+export function isAutonomousTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  const autonomy = task.autonomy || DEFAULT_AUTONOMY;
+  if (autonomy === 'propose' || autonomy === 'supervised') return false;
+  const flag = task.autonomous === 1 || task.autonomous === true;
+  return (autonomy === 'approved_autonomous' || autonomy === 'allow_writes_and_commands') && flag;
+}
 
 export const MAX_INSTRUCTION_CHARS = 20_000;
 
@@ -136,19 +151,23 @@ export function getTask(db, id) {
 }
 
 export function createTask(db, { projectId, instruction, autonomy = DEFAULT_AUTONOMY, autonomous = false }) {
+  const safeAutonomy = AUTONOMY_LEVELS.includes(autonomy) ? autonomy : DEFAULT_AUTONOMY;
+  const isAutoApproved = safeAutonomy === 'approved_autonomous' || (safeAutonomy === 'allow_writes_and_commands' && Boolean(autonomous));
+  const effectiveAutonomous = (safeAutonomy === 'propose' || safeAutonomy === 'supervised') ? 0 : (isAutoApproved ? 1 : 0);
+
   // Backward-compatible: some isolated test DBs create the tasks table without
   // the autonomous column, so only include it when it already exists.
   const hasAutonomousColumn = db.prepare('PRAGMA table_info(tasks)').all().some((c) => c.name === TASK_AUTONOMOUS_COLUMN);
   if (hasAutonomousColumn) {
     const result = db
       .prepare(`INSERT INTO tasks (project_id, instruction, autonomy, ${TASK_AUTONOMOUS_COLUMN}) VALUES (?, ?, ?, ?)`)
-      .run(projectId, instruction, autonomy, autonomous ? 1 : 0);
+      .run(projectId, instruction, safeAutonomy, effectiveAutonomous);
     return getTask(db, Number(result.lastInsertRowid));
   }
   // Existing DBs without the column: safe default to approval mode (no autonomous).
   const result = db
     .prepare('INSERT INTO tasks (project_id, instruction, autonomy) VALUES (?, ?, ?)')
-    .run(projectId, instruction, autonomy);
+    .run(projectId, instruction, safeAutonomy);
   return getTask(db, Number(result.lastInsertRowid));
 }
 

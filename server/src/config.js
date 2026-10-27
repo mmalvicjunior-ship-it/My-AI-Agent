@@ -59,8 +59,17 @@ export function safeSummary() {
   };
 }
 
-// Remove the API key (if set) from any text before it is logged.
+// Remove API keys, credentials, and tokens from any text before it is logged or stored.
 export function redactSecrets(text) {
-  if (typeof text !== 'string' || !text || !config.aiApiKey) return text;
-  return text.split(config.aiApiKey).join('[redacted]');
+  if (typeof text !== 'string' || !text) return text;
+  let safe = text;
+  if (config.aiApiKey) {
+    safe = safe.split(config.aiApiKey).join('[redacted]');
+  }
+  // Redact standard secret patterns: Bearer tokens, OpenAI/Anthropic/Google keys, GitHub PATs
+  safe = safe
+    .replace(/\b(?:sk-|key_|ghp_|gho_|xox[baprs]-)[A-Za-z0-9_*.-]{8,}/gi, '[redacted credential]')
+    .replace(/\bBearer\s+[A-Za-z0-9_.-]+/gi, 'Bearer [redacted]')
+    .replace(/(?:AI_API_KEY|API_KEY|SECRET|PASSWORD|TOKEN)=["']?[^"'\s]+["']?/gi, '$1=[redacted]');
+  return safe;
 }

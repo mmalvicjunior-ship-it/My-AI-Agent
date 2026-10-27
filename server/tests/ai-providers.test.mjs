@@ -1241,3 +1241,19 @@ test('OpenAI adapter gives clear authentication and quota errors', async (t) => 
     });
   }
 });
+
+test('Gemini adapter uses supported default model gemini-2.5-flash', async () => {
+  let request;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return Response.json({
+        candidates: [{ content: { parts: [{ text: 'Hello from Gemini 2.5 Flash.' }] } }],
+      });
+    },
+  });
+  const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+  assert.ok(request.url.includes('gemini-2.5-flash'), 'Default model should be gemini-2.5-flash');
+  assert.equal(result.text, 'Hello from Gemini 2.5 Flash.');
+});

@@ -83,6 +83,15 @@ export const mockProvider = {
       text = 'I can help you think this through. What would be most useful right now: a quick explanation, a plan, or help with a specific problem?';
     }
 
+    // Mock-mode communication: clearly mark simulated/offline replies.
+    const isCodingOrFix = /\b(fix|bug|error|fail|broken|refactor|generate|write|create|edit)\b/i.test(normalized);
+    if (isCodingOrFix && !calculation) {
+      text += " (Note: this is the offline mock provider — simulated output only; no real code was generated or fixed; set AI_PROVIDER to gemini/openai for genuine AI coding.)";
+    }
+    if (/\b(who are you|what are you)\b/i.test(normalized)) {
+      text += " I am running in simulated/mock mode (provider=" + this.name + ", model=" + this.model + "). No real AI language model or autonomous coding capability is active.";
+    }
+
     return { text, provider: this.name, model: this.model };
   },
 };

@@ -238,7 +238,7 @@ test('stops after three attempts and reports the rate limit honestly', async () 
   const result = await makeRunner(makeExecutor(provider)).tick();
 
   assert.equal(attempts, 3);
-  assert.equal(result.status, 'failed');
+  assert.equal(result.status, 'provider_paused');
   assert.match(result.error, /rate limit/i);
   assert.match(result.error, /after 3 attempts/);
   const retrySteps = listSteps(db, task.id)

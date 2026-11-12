@@ -22,7 +22,7 @@ const qsOf = (p, extra) => {
 };
 
 async function startServer() {
-  const { app, tools } = createApp();
+  const { app, tools } = createApp({ auth: false });
   const server = app.listen(0);
   await once(server, 'listening');
   servers.push(server);
@@ -181,6 +181,108 @@ test('PUT rejects bad paths, bodies, and project ids', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// F2: hard link and symlink destination safety
+// ---------------------------------------------------------------------------
+test('PUT rejects writing through a hard link to an outside file and leaves it untouched', async (t) => {
+  if (process.platform !== 'win32') {
+    // Hard links do not need extra privileges on Windows, but this test is
+    // simplest and most reliable on Windows.
+  }
+
+  const api = await startServer();
+  const id = await makeProject(api);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-f2-outside-'));
+  tempDirs.push(outside);
+  const outsideFile = path.join(outside, 'secret.txt');
+  fs.writeFileSync(outsideFile, 'CLASSIFIED');
+
+  const inside = workspaceDir(id);
+  fs.mkdirSync(path.join(inside, 'src'), { recursive: true });
+  fs.linkSync(outsideFile, path.join(inside, 'src', 'hardlink.txt'));
+
+  const res = await api.put(id, 'src/hardlink.txt', 'pwned\n');
+  assert.equal(res.status, 403, res.data?.error);
+  assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'CLASSIFIED',
+    'hard-linked destination must never be modified');
+});
+
+test('PUT rejects writing through a symlink to an outside file and leaves it untouched', async (t) => {
+  const api = await startServer();
+  const id = await makeProject(api);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-f2-outside-'));
+  tempDirs.push(outside);
+  const outsideFile = path.join(outside, 'secret.txt');
+  fs.writeFileSync(outsideFile, 'CLASSIFIED');
+
+  const inside = workspaceDir(id);
+  fs.mkdirSync(path.join(inside, 'src'), { recursive: true });
+  const linkPath = path.join(inside, 'src', 'symlink.txt');
+
+  let linked = false;
+  for (const type of ['file', 'junction']) {
+    try {
+      fs.symlinkSync(outsideFile, linkPath, type);
+      linked = true;
+      break;
+    } catch { /* try next type */ }
+  }
+  if (!linked) {
+    t.diagnostic('symlink creation not permitted on this system - link test skipped');
+    return;
+  }
+
+  const res = await api.put(id, 'src/symlink.txt', 'pwned\n');
+  assert.equal(res.status, 403, res.data?.error);
+  assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'CLASSIFIED',
+    'symlink target must never be modified');
+});
+
+test('PUT rejects writing through a dangling symlink without escaping', async (t) => {
+  const api = await startServer();
+  const id = await makeProject(api);
+
+  const inside = workspaceDir(id);
+  fs.mkdirSync(path.join(inside, 'src'), { recursive: true });
+  const linkPath = path.join(inside, 'src', 'dangling.txt');
+
+  let linked = false;
+  for (const type of ['file', 'junction']) {
+    try {
+      fs.symlinkSync(path.join(inside, 'does-not-exist.txt'), linkPath, type);
+      linked = true;
+      break;
+    } catch { /* try next type */ }
+  }
+  if (!linked) {
+    t.diagnostic('symlink creation not permitted on this system - link test skipped');
+    return;
+  }
+
+  const res = await api.put(id, 'src/dangling.txt', 'pwned\n');
+  assert.equal(res.status, 403, res.data?.error);
+  assert.equal(fs.existsSync(path.join(inside, 'does-not-exist.txt')), false,
+    'dangling symlink target must not be created');
+});
+
+test('PUT legitimate file editing still works after destination safety changes', async () => {
+  const api = await startServer();
+  const id = await makeProject(api);
+  fs.mkdirSync(path.join(workspaceDir(id), 'src'), { recursive: true });
+
+  const created = await api.put(id, 'src/new.js', 'export const answer = 42;\n');
+  assert.equal(created.status, 201);
+  assert.equal(fs.readFileSync(path.join(workspaceDir(id), 'src', 'new.js'), 'utf8'), 'export const answer = 42;\n');
+
+  const updated = await api.put(id, 'src/new.js', 'export const answer = 43;\n');
+  assert.equal(updated.status, 200);
+  assert.equal(fs.readFileSync(path.join(workspaceDir(id), 'src', 'new.js'), 'utf8'), 'export const answer = 43;\n');
+
+  // Writes go through a temp file + atomic rename; no temp artifacts linger.
+  const leftovers = fs.readdirSync(path.join(workspaceDir(id), 'src')).filter((name) => name.startsWith('.myai-tmp-'));
+  assert.deepEqual(leftovers, [], 'atomic write leaves no temp files behind');
+});
+
+// ---------------------------------------------------------------------------
 // DELETE
 // ---------------------------------------------------------------------------
 test('DELETE removes a file, returns its old text, and records history', async () => {
@@ -251,6 +353,8 @@ test('change history lists create, update, and delete newest-first with diffs', 
   assert.equal((await api.changes(99999999)).status, 404, 'unknown project');
 });
 
+// ---------------------------------------------------------------------------
+// F2: symlink and hardlink destination safety
 // ---------------------------------------------------------------------------
 // Agent proposals: staged -> listed with diff -> applied -> history
 // ---------------------------------------------------------------------------

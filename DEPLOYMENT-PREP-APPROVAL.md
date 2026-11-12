@@ -1,10 +1,18 @@
 # Deployment Prep — CORS + Persistent Storage (Approved Investigation Only; No Changes Applied Yet)
 
+> **Verified update (2026-11-12):** the live backend is
+> `https://my-ai-agent-acqy.onrender.com`; `GET /api/health` from that host
+> returns the `myai-agent-server` service, while
+> `https://myai-agent-malvic-backend.onrender.com` returns `404`. `vercel.json`
+> already targets the verified host. This document records the earlier
+> investigation; `README.md` contains the current deployment checklist,
+> including the Gemini variables and persistent-disk operational limits.
+
 ## 1. CORS — Inspect / Explain / Required Change
 
 ### How requests travel today
 - **Local dev:** Vite dev server proxies `/api/*` → `127.0.0.1:3001` (`vite.config.js` proxy config). Same-origin.
-- **Production (current vercel.json):** Vercel rewrites `/api/*` → `https://myai-agent-malvic-backend.onrender.com/api/*`. Browser sees Vercel domain; response comes back through Vercel edge. **Same-origin from browser perspective** — CORS headers not strictly required for this path.
+- **Production (current vercel.json):** Vercel rewrites `/api/*` → `https://my-ai-agent-acqy.onrender.com/api/*`. Browser sees Vercel domain; response comes back through Vercel edge. **Same-origin from browser perspective** — CORS headers not strictly required for this path.
 - **Production (direct via VITE_API_BASE_URL set to Render URL):** Browser calls Render directly from Vercel domain → **cross-origin**. Server currently has **zero CORS middleware** (`express.json` only at `server/src/index.js`). Browser will block response without `Access-Control-Allow-Origin`.
 
 ### Recommended narrow fix (only if using direct base URL or as defense)

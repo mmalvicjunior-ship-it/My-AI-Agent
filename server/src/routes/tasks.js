@@ -14,12 +14,7 @@ import {
   listTasks,
   requestCancel,
 } from '../tasks/store.js';
-
-function findProject(db, rawId) {
-  const id = Number(rawId);
-  if (!Number.isInteger(id) || id < 1) return null;
-  return db.prepare('SELECT id FROM projects WHERE id = ?').get(id) ?? null;
-}
+import { findOwnedProject, isBypassUser } from '../auth/index.js';
 
 function parseTaskId(raw) {
   const id = Number(raw);
@@ -37,7 +32,7 @@ export function createTasksRouter({ db }) {
   // Create a task: POST /api/tasks
   //   { projectId, instruction, autonomy? }  -> 201, task stays 'queued'
   router.post('/', (req, res) => {
-    const project = findProject(db, req.body?.projectId);
+    const project = findOwnedProject(db, req.user, req.body?.projectId);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
 
     const instruction = typeof req.body?.instruction === 'string'
@@ -79,6 +74,9 @@ export function createTasksRouter({ db }) {
       if (projectId === null) {
         return res.status(400).json({ ok: false, error: 'Query parameter "projectId" must be a positive integer.' });
       }
+      if (!findOwnedProject(db, req.user, projectId)) {
+        return res.status(404).json({ ok: false, error: 'Project not found.' });
+      }
     }
     let status = null;
     if (req.query.status !== undefined) {
@@ -94,7 +92,12 @@ export function createTasksRouter({ db }) {
     const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, 100) : 20;
 
     try {
-      const tasks = listTasks(db, { projectId, status, limit });
+      const tasks = listTasks(db, {
+        projectId,
+        status,
+        limit,
+        ownerId: isBypassUser(req.user) ? null : req.user.id,
+      });
       return res.json({ ok: true, tasks });
     } catch (err) {
       return sendError(res, err, 'list');
@@ -107,7 +110,9 @@ export function createTasksRouter({ db }) {
     if (id === null) return res.status(404).json({ ok: false, error: 'Task not found.' });
     try {
       const task = getTask(db, id);
-      if (!task) return res.status(404).json({ ok: false, error: 'Task not found.' });
+      if (!task || !findOwnedProject(db, req.user, task.project_id)) {
+        return res.status(404).json({ ok: false, error: 'Task not found.' });
+      }
       return res.json({ ok: true, task, steps: listSteps(db, id) });
     } catch (err) {
       return sendError(res, err, 'detail');
@@ -122,7 +127,9 @@ export function createTasksRouter({ db }) {
     if (id === null) return res.status(404).json({ ok: false, error: 'Task not found.' });
     try {
       const task = getTask(db, id);
-      if (!task) return res.status(404).json({ ok: false, error: 'Task not found.' });
+      if (!task || !findOwnedProject(db, req.user, task.project_id)) {
+        return res.status(404).json({ ok: false, error: 'Task not found.' });
+      }
       const { task: updated, accepted } = requestCancel(db, task);
       if (!accepted) {
         return res.status(409).json({

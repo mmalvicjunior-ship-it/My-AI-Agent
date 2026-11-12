@@ -25,7 +25,9 @@ npm run dev           # start backend and web app together
 npm run dev:clean     # Windows: stop this project's port 3001 listener, then start both
 ```
 
-Open `http://localhost:5173`. If you already have the backend running in another
+Open `http://localhost:5173`. The first screen asks you to register or sign in;
+see [Accounts and sessions](#accounts-and-sessions). If you already have the
+backend running in another
 terminal, stop it with Ctrl+C before running `npm run dev`; otherwise port 3001
 will already be occupied. On Windows, `npm run dev:clean` verifies that a
 process listening on port 3001 belongs to this project before stopping it and
@@ -43,16 +45,62 @@ shortcut) from the repository root. The development command runs the server
 without Node's built-in watcher to avoid overlapping restarts on a fixed port;
 restart it manually after backend code changes.
 
+### Accounts and sessions
+
+The web app and API require an account. On first load the browser shows a
+sign-in/registration screen; register with an email and a password of at least
+8 characters, then use the **Sign out** control in the sidebar to end the
+session. Accounts are stored locally in SQLite.
+
+- Passwords are hashed with Node's built-in `scrypt`; the raw password is never
+  stored or logged. Session tokens are random 256-bit values, and only their
+  SHA-256 hash is written to the database.
+- The browser keeps the bearer token in `localStorage` (`myai.auth.v1`) and
+  sends it as `Authorization: Bearer <token>` on every `/api` request. There is
+  no cookie, so no CSRF token is needed. Clearing site data signs you out.
+- Sessions expire after `AUTH_SESSION_DAYS` (default 30). Expired or revoked
+  tokens receive `401` and return the UI to the sign-in screen.
+- `/api/health` is the only public endpoint besides register/login/logout. Every
+  project, file, task, proposal, and command endpoint requires a session and is
+  scoped to the owning account. Requesting another account's project returns
+  `404`, not its contents.
+- The first account may only be created with the server-side `BOOTSTRAP_TOKEN`
+  (a fail-closed shared secret), so a public visitor can never race the
+  administrator onto a fresh deployment. After the first account exists the
+  token is ignored and `ALLOW_REGISTRATION=false` closes public registration;
+  existing accounts can always log in. The first account adopts projects that
+  predate accounts (`owner_id IS NULL`) so existing local data stays reachable;
+  later accounts inherit nothing. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
+- Register/login are throttled in memory (10 attempts per 15 minutes per IP,
+  with a per-IP registration limit and a login spray backstop; `TRUST_PROXY`
+  controls how many proxy hops are trusted for client IPs). The counters reset
+  when the server restarts.
+
+These routes are public:
+
+```text
+POST /api/auth/register   { email, password, bootstrapToken? } -> { token, expiresAt, user }
+                          (bootstrapToken is required only while no account exists)
+POST /api/auth/login      { email, password } -> { token, expiresAt, user }
+POST /api/auth/logout     invalidates the presented session (idempotent)
+GET  /api/auth/me         verifies a token and returns the current user
+GET  /api/health          provider status only; no credentials
+```
+
 ### Configure real AI responses
 
 Copy `.env.example` to `.env` in the repository root, then configure one provider:
 
 ```dotenv
 AI_PROVIDER=gemini
-AI_API_KEY=your_gemini_api_key_here
-# Optional; defaults to gemini-flash-latest
-AI_MODEL=gemini-flash-latest
+GEMINI_API_KEY=your_gemini_api_key_here
+# Optional; defaults to gemini-2.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 ```
+
+Gemini can also use the legacy shared `AI_API_KEY`/`AI_MODEL` values when
+`AI_PROVIDER=gemini`. The independent `GEMINI_*` variables are recommended so
+OpenRouter and Gemini can both be configured at once.
 
 Or use OpenAI:
 
@@ -78,6 +126,13 @@ listed as available in your OpenRouter account if this example is unavailable.
 The free tier allows a limited number of requests per day; when that limit is
 reached the app reports the rate limit by name instead of failing silently, and
 it never switches to a different model on its own.
+
+With both `AI_API_KEY`/`AI_MODEL` (OpenRouter) and `GEMINI_API_KEY`/`GEMINI_MODEL`
+configured, use the provider selector in the app's top bar to switch chat between
+**OpenRouter** and **Google Gemini**. The choice is saved in the browser and is
+sent with each chat request. This switch is chat-only: background tasks continue
+using the startup `AI_PROVIDER`. Both API keys stay in the backend `.env`; the
+browser only receives the provider name and whether it is configured.
 
 Or use Hugging Face Inference Providers with a token that has Inference Providers permission:
 
@@ -120,11 +175,14 @@ and assistant turns to the AI API.
 
 ### Workspace coding tools
 
-Create a workspace in the app, or import an existing directory by entering its
-absolute path on the computer running the backend. The file scanner skips
-dependency/build folders and credential files. Gemini can inspect/search files
-and request the predefined `npm test`, `npm run build`, `npm run lint`,
-`npm run format`, and `node --check` tools.
+Create a workspace in the app. Importing an existing server directory through
+`POST /api/projects` is **disabled by default**; it only works when the operator
+sets `PROJECT_IMPORT_ROOT`, and the requested path must resolve inside that
+root. Paths inside the managed `WORKSPACE_ROOT` are always rejected because that
+tree holds every account's project files. The file scanner skips dependency/build
+folders and credential files. Gemini can inspect/search files and request the
+predefined `npm test`, `npm run build`, `npm run lint`, `npm run format`, and
+`node --check` tools.
 
 OpenAI-compatible providers, including OpenRouter, can also use these workspace
 tools when the selected model supports function calling. Workspace tools are
@@ -263,27 +321,133 @@ lockfile and workspace dependencies. The root `vercel.json` builds only the
 `web` workspace, serves `apps/web/dist`, and proxies `/api/*` requests to the
 Render service.
 
-The root `render.yaml` defines the backend service. Create it as a Render
-Blueprint from this repository. It installs only the server workspace, starts
-the existing server entry point, and mounts a 1 GB persistent disk at
-`/var/data` for the SQLite database and project workspaces. Render's Starter
-service and persistent disk are paid resources; review current pricing before
-creating the service.
+#### Verified backend URL and rewrite
 
-During Render setup, provide `AI_API_KEY`, `AI_MODEL`, and `OPENAI_BASE_URL`
-through Render's environment-variable setup from your private provider
-configuration. Never put the key in either deployment manifest or source
-control. The Vercel rewrite currently targets
-`https://myai-agent-malvic-backend.onrender.com`; if Render assigns a different
-service URL, update the rewrite destination in `vercel.json` and redeploy the
-frontend.
+The live backend is `https://my-ai-agent-acqy.onrender.com`. This was verified
+by requesting `GET /api/health` from that host, which returned the
+`myai-agent-server` service; the previously documented
+`https://myai-agent-malvic-backend.onrender.com` returned `404`. `vercel.json`
+already rewrites `/api/*` to the verified origin, so browser requests remain
+same-origin and the server does not need CORS middleware.
 
-**Public deployment warning:** the API currently has no authentication. Its
-project, task, proposal, and approved-command endpoints would be publicly
-reachable through the deployed service and Vercel proxy. Do not make the
-deployment public or use it with valuable data until an authentication/access
-control layer is added and reviewed. These manifests prepare deployment only;
-they do not create or deploy either service.
+If you create a new Render service from the Blueprint (or rename the existing
+one), confirm its URL in the Render dashboard and update the rewrite
+destination. A different service name produces a different `onrender.com`
+hostname. Keep the `/api/:path*` rewrite; do not replace it with a direct
+frontend-to-Render URL.
+
+#### Why `VITE_API_BASE_URL` must stay unset
+
+When `VITE_API_BASE_URL` is unset, `apps/web/src/App.jsx` uses relative `/api`
+paths and Vercel proxies them to Render. Setting it to the Render URL makes
+every chat request cross-origin; the backend has no CORS or preflight handling,
+so JSON POSTs would fail. Vite also inlines `VITE_*` values into the public
+JavaScript bundle at build time, so a base URL change would require a frontend
+redeploy. Leave it unset in Vercel.
+
+#### Node.js version
+
+`node:sqlite` requires Node.js 22.5 or newer, and Vite 7 requires Node.js
+20.19+ or 22.12+. The repository declares `>=22.12`, `render.yaml` sets
+`NODE_VERSION=22`, and the Vercel project should use Node.js 22.x. Node 22 LTS
+is the supported production runtime for both services.
+
+#### Render environment variables
+
+Set these in the Render dashboard (or accept the Blueprint's `sync: false`
+prompts). Never commit real values.
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `AI_PROVIDER` | Yes | `openai` starts the OpenRouter adapter and is the provider used by background tasks. |
+| `AI_API_KEY` | Yes for OpenRouter | Secret OpenRouter key. Backend only. |
+| `AI_MODEL` | Yes in practice | An OpenRouter model slug, for example `meta-llama/llama-3.1-8b-instruct:free`. The adapter's built-in `gpt-4o-mini` default is not a valid OpenRouter slug. |
+| `OPENAI_BASE_URL` | Yes for OpenRouter | `https://openrouter.ai/api/v1` (the adapter appends `/chat/completions`). |
+| `GEMINI_API_KEY` | Optional | Required only to use Gemini chat. Secret; backend only. |
+| `GEMINI_MODEL` | Optional | Defaults to `gemini-2.5-flash`. |
+| `DATABASE_PATH` | Yes | `/var/data/app.db` on the mounted disk. |
+| `WORKSPACE_ROOT` | Yes | `/var/data/workspaces` on the mounted disk. |
+| `AUTH_SESSION_DAYS` | No | Session lifetime in days (1-365). Defaults to `30`. |
+| `BOOTSTRAP_TOKEN` | Yes before first account | Shared secret required to create the FIRST account only. Set in the Render dashboard; never commit it. Ignored once an account exists. |
+| `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after creating your account to close public registration. Does not affect the first account. |
+| `PROJECT_IMPORT_ROOT` | No | Leave unset to disable importing existing server directories. When set, imports must resolve inside this directory; paths inside `WORKSPACE_ROOT` are always rejected. |
+| `NODE_VERSION` | Recommended | `22`. |
+| `PORT` | No | Render injects it; do not set it. |
+| `HOST` | No | Leave unset so the server binds all interfaces. |
+| `DEBUG_CHAT_PROMPTS` | No | Keep `false` in production. |
+
+`AI_API_KEY`/`AI_MODEL`/`OPENAI_BASE_URL` configure OpenRouter.
+`GEMINI_API_KEY`/`GEMINI_MODEL` configure Gemini independently, so both
+providers can be available at once and the in-app selector can switch chat
+between them. Background tasks keep using the startup `AI_PROVIDER`.
+
+**Migration note:** if the Render service previously used `AI_PROVIDER=gemini`
+with the Gemini key stored in `AI_API_KEY`, move that key to
+`GEMINI_API_KEY` and put the OpenRouter key in `AI_API_KEY` before switching
+the startup provider to `openai`. Otherwise OpenRouter would receive a Gemini
+key. If Gemini is not configured, the selector still shows it, but the UI
+reports that its key is missing and the request fails with a configuration
+error; it never silently falls back to OpenRouter.
+
+#### Vercel environment variables
+
+No application environment variables are required. Leave `VITE_API_BASE_URL`
+unset. The only Vercel settings are:
+
+- Project root: repository root (`.`).
+- Node.js version: 22.x.
+- Build command and output directory: from `vercel.json`
+  (`npm run build --workspace=web`, `apps/web/dist`).
+
+`AI_API_KEY`, `GEMINI_API_KEY`, and `OPENROUTER_API_KEY` must never be added to
+Vercel or prefixed with `VITE_`/`NEXT_PUBLIC_`. Vite inlines those values into
+the public bundle. The browser only receives provider names and
+configured/not-configured booleans from `/api/health`.
+
+#### Persistent storage on Render
+
+`render.yaml` mounts a 1 GB disk at `/var/data` and sets
+`DATABASE_PATH=/var/data/app.db` and `WORKSPACE_ROOT=/var/data/workspaces`.
+Render's default filesystem is ephemeral, so these paths are what make the
+SQLite database and agent workspaces survive restarts and redeploys. Changing
+the mount path requires moving the data first; do not point these variables
+back at the relative defaults.
+
+Operational limits:
+
+- Use one Render instance only. SQLite and the local workspace directory are
+  not safe for multiple instances or horizontal scaling.
+- Render disks are not a managed backup service. Take periodic copies of
+  `/var/data/app.db` and `/var/data/workspaces` and store them outside the
+  service.
+- The disk is 1 GB. Agent workspaces grow over time; monitor usage and increase
+  the disk before it fills.
+- A fresh deploy starts with an empty database and no workspaces, because
+  `server/data/` and `server/workspaces/` are git-ignored. Migrate existing
+  data deliberately if you need it in production.
+
+**Deployment security notes:** every sensitive API route now requires a bearer
+session and is scoped to the owning account, so one account cannot read, write,
+approve, or run another account's projects. Imports of existing server
+directories are off unless `PROJECT_IMPORT_ROOT` is configured. Before exposing
+the service publicly:
+
+- Generate a strong `BOOTSTRAP_TOKEN` and set it in the Render dashboard
+  BEFORE the first deploy; the first account can only be registered by
+  entering that token on the sign-up form (see
+  `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
+- Keep `PROJECT_IMPORT_ROOT` unset unless you deliberately need directory
+  imports; if set, point it at a dedicated folder, never the filesystem root or
+  the workspace tree.
+- Use HTTPS (Render provides it) because bearer tokens travel in the
+  `Authorization` header. They are stored in browser `localStorage`, so a
+  cross-site scripting bug could read them; keep the frontend dependencies
+  patched and the bundle free of untrusted HTML.
+- Treat `/var/data/app.db` as sensitive: it holds password and session hashes.
+
+`createApp({ auth: false })` exists only for the automated tests. The production
+entry point calls `createApp()` with no options, so a deployed server always
+enforces authentication.
 
 ## Principles
 

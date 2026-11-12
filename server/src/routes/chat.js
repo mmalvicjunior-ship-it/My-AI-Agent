@@ -1,21 +1,31 @@
 import express from 'express';
 import { config, redactSecrets } from '../config.js';
+import { findOwnedProject } from '../auth/index.js';
 
 export const MAX_MESSAGE_CHARS = 20_000;
 export const MAX_MESSAGES = 50;
 const VALID_ROLES = new Set(['user', 'assistant', 'system']);
+// Chat can be switched between the existing OpenRouter adapter and Gemini.
+// Other providers remain selectable only through AI_PROVIDER at startup.
+export const CHAT_PROVIDER_IDS = Object.freeze(['openai', 'gemini']);
+const CHAT_PROVIDERS = new Set(CHAT_PROVIDER_IDS);
 
 const bad = (error) => ({ ok: false, error });
 
-/** Looks up a project row by id; returns null for missing/invalid ids. */
-function findProject(db, rawId) {
-  const id = Number(rawId);
-  if (!Number.isInteger(id) || id < 1) return null;
-  try {
-    return db.prepare('SELECT id FROM projects WHERE id = ?').get(id) ?? null;
-  } catch {
-    return null;
+/**
+ * Validates the optional per-request provider override. Omitting it keeps the
+ * startup provider (including mock/ollama and background-task behaviour).
+ */
+export function normalizeChatProvider(value) {
+  if (value === undefined || value === null) return { ok: true, provider: null };
+  if (typeof value !== 'string') {
+    return bad('Field "provider" must be a string.');
   }
+  const provider = value.trim().toLowerCase();
+  if (!CHAT_PROVIDERS.has(provider)) {
+    return bad(`Field "provider" must be one of: ${CHAT_PROVIDER_IDS.join(', ')}.`);
+  }
+  return { ok: true, provider };
 }
 
 /**
@@ -72,7 +82,13 @@ export function normalizeChatInput(body) {
  * Chat router: validates the complete conversation history, calls the
  * pluggable provider, and keeps secrets out of every response and log line.
  */
-export function createChatRouter({ db = null, provider, providerName = 'unset', tools = null }) {
+export function createChatRouter({
+  db = null,
+  provider,
+  providerName = 'unset',
+  tools = null,
+  providerResolver = null,
+}) {
   const router = express.Router();
 
   router.post('/', async (req, res) => {
@@ -81,6 +97,19 @@ export function createChatRouter({ db = null, provider, providerName = 'unset', 
       console.warn(`[chat] Request rejected: provider=${providerName} status=400`);
       return res.status(400).json({ ok: false, error: normalized.error });
     }
+
+    const requested = normalizeChatProvider(req.body?.provider);
+    if (!requested.ok) {
+      console.warn(`[chat] Request rejected: provider=${providerName} status=400`);
+      return res.status(400).json({ ok: false, error: requested.error });
+    }
+
+    // Chat-only override. The startup provider (and therefore the background
+    // task executor) is untouched.
+    const activeProvider = requested.provider && typeof providerResolver === 'function'
+      ? providerResolver(requested.provider)
+      : provider;
+    const activeProviderName = requested.provider || providerName;
 
     const latestUserMessage = [...normalized.messages]
       .reverse()
@@ -91,12 +120,12 @@ export function createChatRouter({ db = null, provider, providerName = 'unset', 
         ? redactSecrets(latestUserMessage)
         : `[hidden; ${latestUserMessage.length} characters]`;
     console.log('[chat] Received user message:', safeMessageLog);
-    console.log('[chat] Active provider:', provider?.name ?? config.aiProvider ?? providerName);
+    console.log('[chat] Active provider:', activeProvider?.name ?? config.aiProvider ?? activeProviderName);
 
-    if (!provider || typeof provider.chat !== 'function') {
+    if (!activeProvider || typeof activeProvider.chat !== 'function') {
       return res.status(503).json({
         ok: false,
-        error: `AI provider "${providerName}" is not available. Choose mock, gemini, openai, huggingface, or ollama in the project-root .env (see .env.example).`,
+        error: `AI provider "${activeProviderName}" is not available. Choose openai or gemini for chat, or configure mock, huggingface, or ollama in the project-root .env (see .env.example).`,
       });
     }
 
@@ -109,11 +138,11 @@ export function createChatRouter({ db = null, provider, providerName = 'unset', 
       }
       // Workspace tools are only offered when the request names a project that
       // actually exists, so the model can never call tools for a missing one.
-      const selectedProject = projectId === null ? null : findProject(db, projectId);
+      const selectedProject = projectId === null ? null : findOwnedProject(db, req.user, projectId);
       if (projectId !== null && !selectedProject) {
         console.warn(`[chat] Request named workspace ${projectId}, which does not exist; continuing without workspace tools.`);
       }
-      const result = await provider.chat({
+      const result = await activeProvider.chat({
         messages: normalized.messages,
         tools: selectedProject ? tools : null,
         projectId: selectedProject ? projectId : null,
@@ -121,11 +150,11 @@ export function createChatRouter({ db = null, provider, providerName = 'unset', 
       if (!result || typeof result.text !== 'string') {
         throw new Error('Provider returned a malformed result (missing text).');
       }
-      console.info(`[chat] Request succeeded: provider=${result.provider ?? provider.name ?? providerName} status=200`);
+      console.info(`[chat] Request succeeded: provider=${result.provider ?? activeProvider.name ?? activeProviderName} status=200`);
       return res.json({
         ok: true,
-        provider: result.provider ?? provider.name ?? providerName,
-        model: result.model ?? provider.model ?? null,
+        provider: result.provider ?? activeProvider.name ?? activeProviderName,
+        model: result.model ?? activeProvider.model ?? null,
         reply: result.text,
         toolActivity: result.toolActivity || [],
       });
@@ -133,7 +162,7 @@ export function createChatRouter({ db = null, provider, providerName = 'unset', 
       // Log only a redacted one-liner; the client gets a generic message.
       const status = err.statusCode || 502;
       console.error(
-        `[chat] Request failed: provider=${provider.name ?? providerName} status=${status}:`,
+        `[chat] Request failed: provider=${activeProvider.name ?? activeProviderName} status=${status}:`,
         redactSecrets(`${err.name}: ${err.message}`),
       );
       return res.status(status).json({

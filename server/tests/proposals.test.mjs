@@ -17,7 +17,7 @@ import { config } from '../src/config.js';
 const servers = [];
 
 async function boot() {
-  const created = createApp({ provider: mockProvider });
+  const created = createApp({ auth: false, provider: mockProvider });
   const server = created.app.listen(0);
   await once(server, 'listening');
   servers.push(server);

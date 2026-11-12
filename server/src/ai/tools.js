@@ -38,6 +38,43 @@ export function isProposalExpired(proposal) {
 
 const MAX_COMMAND_OUTPUT = 16_000;
 const commandNames = new Set(['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check']);
+// In a multi-user deployment every project's package.json is user-writable, so
+// an allowlisted `npm run <script>` would execute arbitrary code as the server
+// user (database, every workspace, environment secrets). Until a real sandbox
+// exists, multi-user mode only permits node_check, which parses a file without
+// executing it. Approval prompts and project ownership are not a boundary.
+const multiuserCommandNames = new Set(['node_check']);
+
+function assertCommandAllowed(command, allowedCommands) {
+  if (!commandNames.has(command)) {
+    throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
+  }
+  if (!allowedCommands.has(command)) {
+    throw new WorkspaceError(403, 'Project npm scripts are disabled in multi-user deployments; only node_check is available.');
+  }
+}
+
+function declarationsFor(allowedCommands) {
+  if (allowedCommands === commandNames) return geminiToolDeclarations;
+  return geminiToolDeclarations.map((group) => ({
+    functionDeclarations: group.functionDeclarations.map((declaration) => {
+      if (declaration.name !== 'run_command') return declaration;
+      return {
+        ...declaration,
+        parameters: {
+          ...declaration.parameters,
+          properties: {
+            ...declaration.parameters.properties,
+            command: {
+              ...declaration.parameters.properties.command,
+              enum: [...allowedCommands],
+            },
+          },
+        },
+      };
+    }),
+  }));
+}
 
 export const geminiToolDeclarations = [{
   functionDeclarations: [
@@ -138,8 +175,8 @@ function truncateOutput(value) {
     : text;
 }
 
-function runSafeCommand(root, command, relativePath) {
-  if (!commandNames.has(command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
+function runSafeCommand(root, command, relativePath, allowedCommands) {
+  if (!allowedCommands.has(command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
   let executable;
   let args;
   if (command === 'node_check') {
@@ -195,10 +232,18 @@ function runSafeCommand(root, command, relativePath) {
   };
 }
 
-export function createWorkspaceTools({ db }) {
+export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
   // Finish or fail proposals left mid-application by a previous process before
   // any request can see them. This is read-only for the workspace.
   recoverInterruptedProposals({ db, workspaceRoot: config.workspaceRoot });
+
+  // Multi-user deployments disable npm_* scripts: project package.json is
+  // user-writable, so `npm run <script>` would execute arbitrary code as the
+  // server user (database, every workspace, environment secrets). Until a real
+  // sandbox exists, only node_check (a non-executing syntax check) is allowed.
+  // The same restricted set is enforced here, so the background task executor
+  // and the HTTP approval flow can never bypass it.
+  const allowedCommands = allowProjectCommands ? commandNames : multiuserCommandNames;
 
   /**
    * Stages a file change for review. Nothing is written: the proposal waits
@@ -256,7 +301,7 @@ export function createWorkspaceTools({ db }) {
    */
   function stageCommand({ projectId, command, path = null }) {
     projectRootFor(db, projectId, config.workspaceRoot);
-    if (!commandNames.has(command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
+    assertCommandAllowed(command, allowedCommands);
     const existing = findPendingProposal(db, projectId, 'command', null, null, command);
     if (existing) return existing;
     return stageProposal(db, {
@@ -268,7 +313,7 @@ export function createWorkspaceTools({ db }) {
   }
 
   return {
-    declarations: geminiToolDeclarations,
+    declarations: declarationsFor(allowedCommands),
     stageFileChange,
     stageCommand,
     async execute(name, args = {}) {
@@ -408,7 +453,7 @@ export function createWorkspaceTools({ db }) {
       let result;
       try {
         const root = projectRootFor(db, proposal.project_id, config.workspaceRoot);
-        result = runSafeCommand(root, proposal.command, proposal.command_path);
+        result = runSafeCommand(root, proposal.command, proposal.command_path, allowedCommands);
       } catch (error) {
         if (error instanceof WorkspaceError) {
           // Pre-flight refusal (missing package.json, bad node_check path,

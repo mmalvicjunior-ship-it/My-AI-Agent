@@ -8,6 +8,7 @@ import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createOllamaProvider } from '../src/ai/ollama.js';
 import { getProvider, listProviders } from '../src/ai/index.js';
 import { createChatRouter } from '../src/routes/chat.js';
+import { config, redactSecrets, safeSummary } from '../src/config.js';
 
 test('offline provider responds naturally to a greeting', async () => {
   const result = await mockProvider.chat({
@@ -111,6 +112,109 @@ test('Gemini provider clearly rejects missing API key instead of falling back', 
       return true;
     },
   );
+});
+
+test('provider selection keeps OpenRouter and Gemini credentials independent', () => {
+  const settings = {
+    aiProvider: 'openai',
+    aiApiKey: 'openrouter-key',
+    aiModel: 'openrouter-model',
+    openaiBaseUrl: 'https://openrouter.ai/api/v1',
+    geminiApiKey: 'gemini-key',
+    geminiModel: 'gemini-test-model',
+  };
+
+  const openai = getProvider('openai', settings);
+  assert.equal(openai.name, 'openai');
+  assert.equal(openai.displayName, 'OpenRouter');
+  assert.equal(openai.model, 'openrouter-model');
+
+  const gemini = getProvider('gemini', settings);
+  assert.equal(gemini.name, 'gemini');
+  assert.equal(gemini.model, 'gemini-test-model');
+});
+
+test('Gemini keeps legacy shared AI_API_KEY/AI_MODEL settings working', () => {
+  // Existing Gemini-only deployments configured the key/model through the
+  // shared variables, so those must continue to work.
+  const legacySelected = {
+    aiProvider: 'gemini',
+    aiApiKey: 'legacy-gemini-key',
+    aiModel: 'legacy-gemini-model',
+    geminiApiKey: '',
+    geminiModel: '',
+  };
+  assert.equal(getProvider('gemini', legacySelected).model, 'legacy-gemini-model');
+
+  // Settings objects that predate the split have no Gemini-specific fields.
+  const oldShape = { aiApiKey: 'legacy-key', aiModel: 'custom-model' };
+  assert.equal(getProvider('gemini', oldShape).model, 'custom-model');
+});
+
+test('Gemini never receives the OpenRouter key when keys are independent', async () => {
+  const provider = getProvider('gemini', {
+    aiProvider: 'openai',
+    aiApiKey: 'openrouter-key',
+    aiModel: 'openrouter-model',
+    geminiApiKey: '',
+    geminiModel: '',
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.statusCode, 503);
+      assert.match(error.publicMessage, /Google AI API key/);
+      return true;
+    },
+  );
+});
+
+test('OpenRouter never receives a legacy Gemini-only key when switching providers', async () => {
+  const provider = getProvider('openai', {
+    aiProvider: 'gemini',
+    aiApiKey: 'legacy-gemini-key',
+    aiModel: 'legacy-gemini-model',
+    openaiBaseUrl: 'https://openrouter.ai/api/v1',
+    geminiApiKey: '',
+    geminiModel: '',
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.statusCode, 503);
+      assert.match(error.publicMessage, /AI_API_KEY/);
+      return true;
+    },
+  );
+});
+
+test('secret redaction and safe summaries cover both provider keys', () => {
+  const savedAiKey = config.aiApiKey;
+  const savedGeminiKey = config.geminiApiKey;
+  config.aiApiKey = 'sk-openrouter-secret-value';
+  config.geminiApiKey = 'AIzaSyGeminiSecretValue1234567890';
+
+  try {
+    const otherGoogleKey = 'AIzaSyOtherGoogleKey1234567890abcdef';
+    const safe = redactSecrets(
+      `openrouter=${config.aiApiKey} gemini=${config.geminiApiKey} other=${otherGoogleKey}`,
+    );
+
+    assert.ok(!safe.includes(config.aiApiKey));
+    assert.ok(!safe.includes(config.geminiApiKey));
+    assert.ok(!safe.includes(otherGoogleKey));
+    assert.match(safe, /\[redacted/);
+
+    const summary = JSON.stringify(safeSummary());
+    assert.ok(!summary.includes(config.aiApiKey));
+    assert.ok(!summary.includes(config.geminiApiKey));
+    assert.match(summary, /hidden/);
+  } finally {
+    config.aiApiKey = savedAiKey;
+    config.geminiApiKey = savedGeminiKey;
+  }
 });
 
 test('OpenAI adapter forwards history, model, and API key', async () => {

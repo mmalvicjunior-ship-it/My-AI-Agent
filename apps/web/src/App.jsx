@@ -11,8 +11,31 @@ import css from 'highlight.js/lib/languages/css';
 import xml from 'highlight.js/lib/languages/xml';
 import sql from 'highlight.js/lib/languages/sql';
 import TaskCenter from './TaskCenter';
+import AuthScreen from './AuthScreen';
 
 const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
+const AUTH_KEY = 'myai.auth.v1';
+
+function readStoredAuth() {
+  try {
+    const raw = localStorage.getItem(AUTH_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.token === 'string' && parsed.token) return parsed;
+  } catch {
+    /* Ignore unreadable or legacy storage. */
+  }
+  return null;
+}
+
+function persistAuth(auth) {
+  try {
+    if (auth) localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+    else localStorage.removeItem(AUTH_KEY);
+  } catch {
+    /* Storage may be unavailable in private browsing; the session still works. */
+  }
+}
 
 function formatTimeAgo(ts) {
   if (!ts) return '';
@@ -56,9 +79,28 @@ function stepStatusClass(status) {
   ['sql', sql],
 ].forEach(([name, language]) => hljs.registerLanguage(name, language));
 
+// Chat history is namespaced per authenticated account so two accounts that
+// share a browser never see each other's conversations. The legacy global
+// key is migrated into the signed-in account's namespace on first load.
 const STORAGE_KEY = 'myai.chat-sessions.v1';
+function sessionsStorageKey(userId) {
+  return userId === null || userId === undefined ? `${STORAGE_KEY}.anonymous` : `${STORAGE_KEY}.${userId}`;
+}
 const THEME_KEY = 'myai.theme';
+const PROVIDER_KEY = 'myai.provider';
 const MAX_CHARS = 20_000;
+const CHAT_PROVIDER_IDS = new Set(['openai', 'gemini']);
+const PROVIDER_LABELS = { openai: 'OpenRouter', gemini: 'Google Gemini' };
+
+function readProvider() {
+  try {
+    const stored = localStorage.getItem(PROVIDER_KEY);
+    return CHAT_PROVIDER_IDS.has(stored) ? stored : '';
+  } catch (error) {
+    console.warn('Could not restore the AI provider choice.', error);
+    return '';
+  }
+}
 
 const starters = [
   { icon: '⚡', title: 'Generate code', prompt: 'Write a small, well-documented utility function for a common programming task.' },
@@ -74,9 +116,9 @@ const initialSession = () => ({
   updatedAt: Date.now(),
 });
 
-function readSessions() {
+function readSessions(namespace) {
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    const stored = JSON.parse(localStorage.getItem(namespace) || '[]');
     if (Array.isArray(stored) && stored.length) {
       const validSessions = stored.filter((session) => session && typeof session.id === 'string'
         && Array.isArray(session.messages));
@@ -301,20 +343,22 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
 }
 
 function App() {
-  const [initialData] = useState(() => {
-    const restoredSessions = readSessions();
-    return { sessions: restoredSessions, activeId: restoredSessions[0].id };
-  });
-  const [sessions, setSessions] = useState(initialData.sessions);
-  const [activeId, setActiveId] = useState(initialData.activeId);
+  const [sessions, setSessions] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  // Which storage namespace the current `sessions` state belongs to, and
+  // whether the load effect has run yet (guards the persist effect).
+  const sessionsNamespaceRef = useRef(null);
+  const sessionsLoadedRef = useRef(false);
   const [input, setInput] = useState('');
   const [generating, setGenerating] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia('(max-width: 560px)').matches);
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || 'dark');
+  const [selectedProvider, setSelectedProvider] = useState(readProvider);
   const [health, setHealth] = useState({
     online: false,
     provider: null,
     providerLabel: null,
+    providers: null,
     warning: 'Checking AI provider configuration…',
   });
   const [projects, setProjects] = useState([]);
@@ -338,19 +382,143 @@ function App() {
   const [taskPollInterval, setTaskPollInterval] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [diffPreview, setDiffPreview] = useState(false);
+  const [auth, setAuth] = useState(() => readStoredAuth());
+  const [authChecking, setAuthChecking] = useState(() => Boolean(readStoredAuth()));
+  const authRef = useRef(auth);
   const messageListRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
   const attachmentInputRef = useRef(null);
   const controllerRef = useRef(null);
   const wasAtBottomRef = useRef(true);
+
+  const applyAuth = useCallback((next) => {
+    authRef.current = next;
+    persistAuth(next);
+    setAuth(next);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    const current = authRef.current;
+    if (current?.token) {
+      try {
+        await globalThis.fetch(`${API_BASE}/api/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${current.token}` },
+        });
+      } catch {
+        /* Best effort: local sign-out still happens. */
+      }
+    }
+    applyAuth(null);
+    setProjects([]);
+    setProjectId('');
+    setWorkspaceFiles([]);
+    setSelectedFile(null);
+    setFileContent('');
+    setTasks([]);
+    setTaskDetail(null);
+    setTaskCenterOpen(false);
+  }, [applyAuth]);
+
+  // Every API call goes through here so the bearer token is attached in one
+  // place. A 401 (expired or revoked session) returns to the sign-in screen.
+  const apiFetch = useCallback(async (input, init = {}) => {
+    const headers = new Headers(init.headers || {});
+    const current = authRef.current;
+    if (current?.token) headers.set('Authorization', `Bearer ${current.token}`);
+    const response = await globalThis.fetch(input, { ...init, headers });
+    if (response.status === 401 && current) applyAuth(null);
+    return response;
+  }, [applyAuth]);
+
+  useEffect(() => {
+    authRef.current = auth;
+  }, [auth]);
+
+  // Verify a stored token once on load instead of trusting localStorage blindly.
+  useEffect(() => {
+    const current = readStoredAuth();
+    if (!current?.token) {
+      setAuthChecking(false);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await globalThis.fetch(`${API_BASE}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${current.token}` },
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data?.ok || !data.user) throw new Error('Session expired.');
+        if (!cancelled) applyAuth({ ...current, user: data.user });
+      } catch {
+        if (!cancelled) applyAuth(null);
+      } finally {
+        if (!cancelled) setAuthChecking(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyAuth]);
+
   const activeSession = sessions.find((session) => session.id === activeId) || sessions[0];
   const messages = activeSession?.messages || [];
   const tokenEstimate = Math.ceil(input.length / 4);
+  const selectedProviderStatus = selectedProvider ? health.providers?.[selectedProvider] : null;
+  const selectedProviderWarning = health.online && selectedProviderStatus?.configured === false
+    ? `${selectedProviderStatus.label || PROVIDER_LABELS[selectedProvider] || selectedProvider} is selected, but its API key is missing from the project-root .env.`
+    : null;
+  // Startup-provider warnings are irrelevant once a different, configured
+  // provider is selected for chat. Keep offline warnings visible.
+  const showStartupWarning = !health.online || !selectedProvider || selectedProvider === health.provider;
+  const warningText = selectedProviderWarning || (showStartupWarning ? health.warning : null);
+  const warningTitle = selectedProviderWarning
+    ? `${selectedProviderStatus.label || PROVIDER_LABELS[selectedProvider] || selectedProvider} needs attention`
+    : health.providerLabel
+      ? `${health.providerLabel} needs attention`
+      : health.provider === 'openai'
+        ? 'OpenRouter needs attention'
+        : health.provider === 'gemini'
+          ? 'Google Gemini needs attention'
+          : health.provider === 'huggingface'
+            ? 'Hugging Face needs attention'
+            : 'AI provider status';
+
+  // Load the chat history that belongs to the signed-in account. Every
+  // account gets its own namespace, so signing out and into a different
+  // account can never reveal the previous account's conversations. The
+  // legacy global key is migrated into this account's namespace exactly
+  // once (kept on first account for continuity) and then removed.
+  const authUserId = auth?.user?.id ?? null;
+  useEffect(() => {
+    const namespace = sessionsStorageKey(authUserId);
+    sessionsNamespaceRef.current = namespace;
+    sessionsLoadedRef.current = false;
+    try {
+      const legacy = localStorage.getItem(STORAGE_KEY);
+      if (legacy !== null) {
+        if (authUserId !== null && localStorage.getItem(namespace) === null) {
+          localStorage.setItem(namespace, legacy);
+        }
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn('Could not migrate saved conversations into this account.', error);
+    }
+    const restored = readSessions(namespace);
+    setSessions(restored);
+    setActiveId(restored[0].id);
+    sessionsLoadedRef.current = true;
+  }, [authUserId]);
 
   useEffect(() => {
+    if (!sessionsLoadedRef.current) return; // wait for the namespace load
+    const namespace = sessionsNamespaceRef.current;
+    if (!namespace) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+      localStorage.setItem(namespace, JSON.stringify(sessions));
     } catch (error) {
       console.warn('Could not save conversations in this browser.', error);
     }
@@ -361,11 +529,27 @@ function App() {
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
+  // If the user has not chosen a provider yet, follow the backend default when
+  // it is one of the switchable chat providers. An explicit choice always wins.
+  useEffect(() => {
+    if (selectedProvider) return;
+    if (CHAT_PROVIDER_IDS.has(health.provider)) setSelectedProvider(health.provider);
+  }, [health.provider, selectedProvider]);
+
+  useEffect(() => {
+    if (!CHAT_PROVIDER_IDS.has(selectedProvider)) return;
+    try {
+      localStorage.setItem(PROVIDER_KEY, selectedProvider);
+    } catch (error) {
+      console.warn('Could not save the AI provider choice in this browser.', error);
+    }
+  }, [selectedProvider]);
+
   useEffect(() => {
     let cancelled = false;
     const checkHealth = async () => {
       try {
-        const response = await fetch(`${API_BASE}/api/health`);
+        const response = await apiFetch(`${API_BASE}/api/health`);
         if (!response.ok) throw new Error(`Health check returned ${response.status}`);
         const data = await response.json();
         if (!cancelled) {
@@ -373,6 +557,7 @@ function App() {
             online: true,
             provider: data.aiProvider || 'mock',
             providerLabel: data.providerLabel || null,
+            providers: data.providers || null,
             warning: data.aiWarning || null,
           });
         }
@@ -382,14 +567,20 @@ function App() {
             online: false,
             provider: null,
             providerLabel: null,
+            providers: null,
             warning: 'Cannot reach the AI server. Start or restart the backend and try again.',
           });
         }
       }
     };
     const loadProjects = async () => {
+      if (!authRef.current) {
+        setProjects([]);
+        setProjectId('');
+        return;
+      }
       try {
-        const response = await fetch(`${API_BASE}/api/projects`);
+        const response = await apiFetch(`${API_BASE}/api/projects`);
         if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
         const data = await response.json();
         if (!cancelled) setProjects(Array.isArray(data.projects) ? data.projects : []);
@@ -404,11 +595,12 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [apiFetch, auth?.token]);
 
   useEffect(() => {
+    if (!authRef.current) return;
     loadWorkspaceFiles(projectId);
-  }, [projectId]);
+  }, [projectId, auth?.token]);
 
   useEffect(() => {
     const list = messageListRef.current;
@@ -447,13 +639,17 @@ function App() {
     setToast(null);
     const controller = new AbortController();
     controllerRef.current = controller;
+    const providerForRequest = CHAT_PROVIDER_IDS.has(selectedProvider)
+      ? selectedProvider
+      : (CHAT_PROVIDER_IDS.has(health.provider) ? health.provider : null);
     try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
+      const response = await apiFetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
           messages: [...history, { role: 'user', content: prompt }],
+          ...(providerForRequest ? { provider: providerForRequest } : {}),
           ...(projectId ? { projectId: Number(projectId) } : {}),
         }),
       });
@@ -490,7 +686,7 @@ function App() {
         setGenerating(false);
       }
     }
-  }, [generating, health.online, health.provider, projectId, updateSession]);
+  }, [generating, health.online, health.provider, projectId, selectedProvider, updateSession]);
 
   const sendMessage = useCallback(async (value = input) => {
     const displayPrompt = attachment ? `${value}\n\n📎 ${attachment.name}` : value;
@@ -582,7 +778,7 @@ function App() {
     const existingPath = window.prompt('Optional: enter the full path of an existing project folder on this PC. Leave blank to create a new workspace.');
     if (existingPath === null) return;
     try {
-      const response = await fetch(`${API_BASE}/api/projects`, {
+      const response = await apiFetch(`${API_BASE}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -605,7 +801,7 @@ function App() {
     setTaskLoading(true);
     try {
       const url = `/api/tasks${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`;
-      const response = await fetch(`${API_BASE}${url}`);
+      const response = await apiFetch(`${API_BASE}${url}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load tasks.');
       setTasks(Array.isArray(result.tasks) ? result.tasks : []);
@@ -619,7 +815,7 @@ function App() {
 
   const loadTaskDetail = useCallback(async (taskId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
+      const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load task.');
       setTaskDetail({ task: result.task, steps: Array.isArray(result.steps) ? result.steps : [] });
@@ -637,7 +833,7 @@ function App() {
       return;
     }
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not scan the project.');
       setWorkspaceFiles(result.files);
@@ -649,7 +845,7 @@ function App() {
   const openWorkspaceFile = async (filePath) => {
     if (!projectId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not open file.');
       setSelectedFile(result.path);
@@ -662,7 +858,7 @@ function App() {
   const searchWorkspaceCode = async () => {
     if (!projectId || fileSearch.trim().length < 2) return;
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not search project code.');
       setCodeSearchResults(result.results);
@@ -743,7 +939,7 @@ function App() {
 
   const applyFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -751,7 +947,7 @@ function App() {
       markProposal(sessionId, messageIndex, activityIndex, 'applied');
       setToast({ message: `Applied changes to ${result.file.path}.` });
       await loadWorkspaceFiles(String(id));
-      const fileResponse = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
+      const fileResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
       const fileResult = await fileResponse.json();
       if (!fileResponse.ok || !fileResult.ok) throw new Error(fileResult.error || 'Created file but could not open it.');
       setProjectId(String(id));
@@ -764,7 +960,7 @@ function App() {
 
   const discardFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -778,7 +974,7 @@ function App() {
 
   const runApprovedWorkspaceCommand = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/commands/${encodeURIComponent(proposalId)}/run`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/commands/${encodeURIComponent(proposalId)}/run`, {
         method: 'POST',
       });
       const result = await response.json();
@@ -867,7 +1063,7 @@ function App() {
     }
     setTaskSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/tasks`, {
+      const response = await apiFetch(`${API_BASE}/api/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId: projectId ? Number(projectId) : undefined, instruction: prompt }),
@@ -889,7 +1085,7 @@ function App() {
 
   const cancelTask = useCallback(async (taskId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not cancel task.');
       await loadTasks();
@@ -904,6 +1100,23 @@ function App() {
     () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
     [sessions],
   );
+
+  if (authChecking) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card auth-loading">Checking your session…</div>
+      </div>
+    );
+  }
+
+  if (!auth) {
+    return (
+      <AuthScreen
+        apiBase={API_BASE}
+        onAuthenticated={(token, user) => applyAuth({ token, user })}
+      />
+    );
+  }
 
   return (
     <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
@@ -946,9 +1159,9 @@ function App() {
               <button className="icon-button workspace-add" onClick={createProject} title="Create workspace" aria-label="Create workspace"><Icon name="plus" size={16} /></button>
             </div>
             <div className="profile-row">
-              <span className="avatar">M</span>
-              <span className="profile-name">My workspace</span>
-              <span className="profile-plan">Personal</span>
+              <span className="avatar">{(auth.user?.email || '?').charAt(0).toUpperCase()}</span>
+              <span className="profile-name" title={auth.user?.email || ''}>{auth.user?.email || 'Signed in'}</span>
+              <button type="button" className="profile-logout" onClick={signOut} title="Sign out">Sign out</button>
             </div>
           </div>
         </aside>
@@ -962,16 +1175,14 @@ function App() {
             <div className="model-select-wrap">
               <select
                 className="model-select"
-                value={health.provider || 'mock'}
-                disabled
-                aria-label="Configured AI provider"
+                value={selectedProvider}
+                onChange={(event) => setSelectedProvider(event.target.value)}
+                aria-label="Select AI provider"
+                title="Choose the provider used for chat"
               >
-                <option value="mock">MyAI · Offline fallback</option>
-                <option value="openai">OpenAI · Configured in .env</option>
-                <option value="anthropic">Anthropic · Not implemented</option>
-                <option value="gemini">Gemini · Configured in .env</option>
-                <option value="huggingface">Hugging Face · Configured in .env</option>
-                <option value="ollama">Ollama · Local model</option>
+                {!selectedProvider && <option value="" disabled>Backend default</option>}
+                <option value="openai">OpenRouter</option>
+                <option value="gemini">Google Gemini</option>
               </select>
             </div>
           </div>
@@ -987,18 +1198,12 @@ function App() {
           </div>
         </header>
 
-        {health.warning && (
+        {warningText && (
           <div className="ai-warning" role="alert">
             <span className="ai-warning-icon">!</span>
             <div className="ai-warning-content">
-              <strong>{health.providerLabel
-                ? `${health.providerLabel} needs attention`
-                : health.provider === 'openai'
-                  ? 'OpenAI needs attention'
-                  : health.provider === 'huggingface'
-                    ? 'Hugging Face needs attention'
-                    : 'AI provider status'}</strong>
-              <span>{health.warning}</span>
+              <strong>{warningTitle}</strong>
+              <span>{warningText}</span>
             </div>
           </div>
         )}

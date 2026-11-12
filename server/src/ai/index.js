@@ -53,8 +53,36 @@ export function getProvider(name, settings = config) {
     huggingface: 'meta-llama/Meta-Llama-3-8B-Instruct',
     ollama: 'llama3',
   };
+
+  if (name === 'gemini') {
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(settings, key);
+    // Independent Gemini settings. A legacy Gemini-only setup (AI_PROVIDER=gemini
+    // with a shared AI_API_KEY/AI_MODEL) keeps working, but the OpenRouter key is
+    // never sent to Google when the providers are configured separately.
+    if (hasOwn('geminiApiKey') || hasOwn('geminiModel')) {
+      // Only fall back to the shared values when Gemini itself is the startup
+      // provider and no independent Gemini key is configured.
+      const legacyGemini = !settings.geminiApiKey && settings.aiProvider === 'gemini';
+      return createProvider({
+        apiKey: settings.geminiApiKey || (legacyGemini ? settings.aiApiKey : ''),
+        model: settings.geminiModel
+          || (legacyGemini ? settings.aiModel : '')
+          || defaults.gemini,
+      });
+    }
+    // Settings objects created before independent Gemini config only have the
+    // shared fields; preserve that behaviour.
+    return createProvider({
+      apiKey: settings.aiApiKey,
+      model: settings.aiModel || defaults.gemini,
+    });
+  }
+
+  // In a legacy Gemini-only setup, AI_API_KEY belongs to Gemini. Do not forward
+  // that credential to the OpenAI/OpenRouter adapter when switching providers.
+  const legacyGeminiKey = !settings.geminiApiKey && settings.aiProvider === 'gemini';
   return createProvider({
-    apiKey: settings.aiApiKey,
+    apiKey: legacyGeminiKey ? '' : settings.aiApiKey,
     model: settings.aiModel || defaults[name],
     ...(name === 'openai' && settings.openaiBaseUrl
       ? { baseUrl: settings.openaiBaseUrl }

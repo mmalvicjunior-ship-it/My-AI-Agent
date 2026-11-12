@@ -8,7 +8,14 @@ import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
 import { mockProvider } from '../src/ai/mock.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
-import { normalizeChatInput, MAX_MESSAGE_CHARS, MAX_MESSAGES } from '../src/routes/chat.js';
+import { createGeminiProvider } from '../src/ai/gemini.js';
+import {
+  normalizeChatInput,
+  normalizeChatProvider,
+  CHAT_PROVIDER_IDS,
+  MAX_MESSAGE_CHARS,
+  MAX_MESSAGES,
+} from '../src/routes/chat.js';
 
 const servers = [];
 
@@ -51,7 +58,7 @@ after(() => {
 // 1. Normal chat requests (mock provider, offline)
 // ---------------------------------------------------------------------------
 test('normal single message returns a mock reply', async () => {
-  const api = await startServer(createApp({ provider: mockProvider }).app);
+  const api = await startServer(createApp({ auth: false, provider: mockProvider }).app);
   const { status, data } = await api.post('/api/chat', { message: 'hie' });
 
   assert.equal(status, 200);
@@ -63,7 +70,7 @@ test('normal single message returns a mock reply', async () => {
 });
 
 test('messages array form is accepted', async () => {
-  const api = await startServer(createApp({ provider: mockProvider }).app);
+  const api = await startServer(createApp({ auth: false, provider: mockProvider }).app);
   const { status, data } = await api.post('/api/chat', {
     messages: [
       { role: 'system', content: 'You are a coding assistant.' },
@@ -79,7 +86,7 @@ test('messages array form is accepted', async () => {
 });
 
 test('boundary: message of exactly MAX_MESSAGE_CHARS is accepted', async () => {
-  const api = await startServer(createApp({ provider: mockProvider }).app);
+  const api = await startServer(createApp({ auth: false, provider: mockProvider }).app);
   const { status } = await api.post('/api/chat', { message: 'x'.repeat(MAX_MESSAGE_CHARS) });
   assert.equal(status, 200);
 });
@@ -88,7 +95,7 @@ test('response never contains an API key', async () => {
   const savedKey = config.aiApiKey;
   config.aiApiKey = 'sk-test-SECRET-must-not-leak';
   try {
-    const api = await startServer(createApp({ provider: mockProvider }).app);
+    const api = await startServer(createApp({ auth: false, provider: mockProvider }).app);
     const { data } = await api.post('/api/chat', { message: 'hi' });
     const serialized = JSON.stringify(data);
     assert.ok(!serialized.includes('sk-test-SECRET-must-not-leak'));
@@ -103,7 +110,7 @@ test('response never contains an API key', async () => {
 // 2. Invalid input -> 400 with a clear error
 // ---------------------------------------------------------------------------
 test('invalid inputs return 400 with clear errors', async () => {
-  const api = await startServer(createApp().app);
+  const api = await startServer(createApp({ auth: false }).app);
   const longMessage = 'x'.repeat(MAX_MESSAGE_CHARS + 1);
   const tooMany = new Array(MAX_MESSAGES + 1).fill({ role: 'user', content: 'hi' });
 
@@ -144,7 +151,7 @@ test('validator unit checks mirror the HTTP behavior', () => {
 });
 
 test('chat only offers workspace tools for a project that actually exists', async () => {
-  const { app, tools } = createApp({ provider: mockProvider });
+  const { app, tools } = createApp({ auth: false, provider: mockProvider });
   const api = await startServer(app);
   const created = await api.post('/api/projects', { name: 'Chat Tools Test' });
   const projectId = created.data.project.id;
@@ -158,7 +165,7 @@ test('chat only offers workspace tools for a project that actually exists', asyn
       return { text: 'ok', provider: 'spy', model: 'spy-1' };
     },
   };
-  const spyApi = await startServer(createApp({ provider: spyProvider, tools }).app);
+  const spyApi = await startServer(createApp({ auth: false, provider: spyProvider, tools }).app);
 
   const withProject = await spyApi.post('/api/chat', { message: 'hi', projectId });
   assert.equal(withProject.status, 200);
@@ -187,7 +194,7 @@ test('chat debug logs identify provider without exposing prompt by default', asy
   console.log = (...args) => logged.push(args.join(' '));
 
   try {
-    const api = await startServer(createApp({ provider: mockProvider }).app);
+    const api = await startServer(createApp({ auth: false, provider: mockProvider }).app);
     const message = 'private prompt text';
     const { status } = await api.post('/api/chat', { message });
     const output = logged.join('\n');
@@ -222,7 +229,7 @@ test('OpenAI request preserves the exact prompt and full conversation history', 
       });
     },
   });
-  const api = await startServer(createApp({ provider }).app);
+  const api = await startServer(createApp({ auth: false, provider }).app);
   const { status, data } = await api.post('/api/chat', {
     messages: [...history, { role: 'user', content: exactPrompt }],
   });
@@ -236,11 +243,135 @@ test('OpenAI request preserves the exact prompt and full conversation history', 
   assert.equal(upstreamTemperature, 0.7);
 });
 
+test('chat switches providers per request without replacing the startup provider', async () => {
+  const calls = [];
+  const startupProvider = {
+    name: 'openai',
+    model: 'startup-model',
+    async chat() {
+      calls.push('startup');
+      return { text: 'OpenRouter reply', provider: 'openai', model: 'startup-model' };
+    },
+  };
+  const geminiProvider = {
+    name: 'gemini',
+    model: 'gemini-model',
+    async chat() {
+      calls.push('gemini');
+      return { text: 'Gemini reply', provider: 'gemini', model: 'gemini-model' };
+    },
+  };
+  const api = await startServer(createApp({ auth: false, provider: startupProvider,
+    providerName: 'openai',
+    providerResolver: (name) => (name === 'gemini' ? geminiProvider : startupProvider),
+  }).app);
+
+  const defaultRequest = await api.post('/api/chat', { message: 'hi' });
+  assert.equal(defaultRequest.status, 200);
+  assert.equal(defaultRequest.data.provider, 'openai');
+  assert.equal(defaultRequest.data.reply, 'OpenRouter reply');
+
+  const geminiRequest = await api.post('/api/chat', { message: 'hi', provider: 'gemini' });
+  assert.equal(geminiRequest.status, 200);
+  assert.equal(geminiRequest.data.provider, 'gemini');
+  assert.equal(geminiRequest.data.reply, 'Gemini reply');
+  assert.deepEqual(calls, ['startup', 'gemini']);
+});
+
+test('chat rejects unknown providers instead of silently using the startup provider', async () => {
+  let called = false;
+  const startupProvider = {
+    name: 'mock',
+    model: 'mock',
+    async chat() {
+      called = true;
+      return { text: 'should not run', provider: 'mock', model: 'mock' };
+    },
+  };
+  const api = await startServer(createApp({ auth: false, provider: startupProvider }).app);
+
+  for (const provider of ['anthropic', 'OPENAI?', '', 123, {}]) {
+    const { status, data } = await api.post('/api/chat', { message: 'hi', provider });
+    assert.equal(status, 400, `provider ${JSON.stringify(provider)} must be rejected`);
+    assert.equal(data.ok, false);
+    assert.match(data.error, /provider/i);
+  }
+  assert.equal(called, false);
+});
+
+test('provider override validator only accepts the two switchable providers', () => {
+  assert.deepEqual(CHAT_PROVIDER_IDS, ['openai', 'gemini']);
+  assert.deepEqual(normalizeChatProvider(undefined), { ok: true, provider: null });
+  assert.deepEqual(normalizeChatProvider('openai'), { ok: true, provider: 'openai' });
+  assert.deepEqual(normalizeChatProvider(' Gemini '), { ok: true, provider: 'gemini' });
+  assert.equal(normalizeChatProvider('mock').ok, false);
+  assert.equal(normalizeChatProvider('').ok, false);
+  assert.equal(normalizeChatProvider(42).ok, false);
+});
+
+test('health reports Gemini key status without exposing either key', async () => {
+  const savedGeminiKey = config.geminiApiKey;
+  const savedAiKey = config.aiApiKey;
+  config.geminiApiKey = '';
+  config.aiApiKey = 'sk-openrouter-secret-present';
+
+  try {
+    const provider = createGeminiProvider({ apiKey: '' });
+    const api = await startServer(createApp({ auth: false, provider, providerName: 'gemini' }).app);
+    const { status, data } = await api.get('/api/health');
+
+    assert.equal(status, 200);
+    assert.equal(data.aiProvider, 'gemini');
+    assert.equal(data.providerLabel, 'Google Gemini');
+    assert.equal(data.aiConfigured, false);
+    assert.match(data.aiWarning, /GEMINI_API_KEY is missing/);
+    assert.equal(data.providers.gemini.configured, false);
+    assert.equal(data.providers.openai.configured, true);
+
+    const serialized = JSON.stringify(data);
+    assert.ok(!serialized.includes('sk-openrouter-secret-present'));
+    assert.ok(!serialized.includes('apiKey'));
+  } finally {
+    config.geminiApiKey = savedGeminiKey;
+    config.aiApiKey = savedAiKey;
+  }
+});
+
+test('health exposes only safe per-provider labels and configured flags', async () => {
+  const savedGeminiKey = config.geminiApiKey;
+  const savedAiKey = config.aiApiKey;
+  config.geminiApiKey = 'AIzaSyGeminiHealthSecret1234567890';
+  config.aiApiKey = 'sk-openrouter-health-secret';
+
+  try {
+    const provider = createOpenAIProvider({
+      apiKey: config.aiApiKey,
+      baseUrl: 'https://openrouter.ai/api/v1',
+    });
+    const api = await startServer(createApp({ auth: false, provider, providerName: 'openai' }).app);
+    const { status, data } = await api.get('/api/health');
+
+    assert.equal(status, 200);
+    assert.equal(data.providers.openai.label, 'OpenRouter');
+    assert.equal(data.providers.openai.configured, true);
+    assert.equal(data.providers.gemini.label, 'Google Gemini');
+    assert.equal(data.providers.gemini.configured, true);
+
+    const serialized = JSON.stringify(data);
+    assert.ok(!serialized.includes(config.aiApiKey));
+    assert.ok(!serialized.includes(config.geminiApiKey));
+    assert.ok(!serialized.includes('apiKey'));
+  } finally {
+    config.geminiApiKey = savedGeminiKey;
+    config.aiApiKey = savedAiKey;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 3. Provider problems -> 503 (unavailable) or 502 (failed), secrets redacted
 // ---------------------------------------------------------------------------
 test('unavailable provider returns 503 with a clear error', async () => {
-  const api = await startServer(createApp({ provider: null, providerName: 'nonexistent' }).app);
+  const api = await startServer(createApp({ auth: false, provider: null, providerName: 'nonexistent' }).app);
   const { status, data } = await api.post('/api/chat', { message: 'hi' });
 
   assert.equal(status, 503);
@@ -253,7 +384,7 @@ test('health reports when OpenAI is selected without an API key', async () => {
   config.aiApiKey = '';
   try {
     const provider = createOpenAIProvider({ apiKey: '' });
-    const api = await startServer(createApp({ provider, providerName: 'openai' }).app);
+    const api = await startServer(createApp({ auth: false, provider, providerName: 'openai' }).app);
     const { status, data } = await api.get('/api/health');
 
     assert.equal(status, 200);
@@ -271,7 +402,7 @@ test('health names the real service behind an OpenAI-compatible base URL', async
     apiKey: 'test-key',
     baseUrl: 'https://openrouter.ai/api/v1',
   });
-  const api = await startServer(createApp({ provider, providerName: 'openai' }).app);
+  const api = await startServer(createApp({ auth: false, provider, providerName: 'openai' }).app);
   const { status, data } = await api.get('/api/health');
 
   assert.equal(status, 200);
@@ -282,7 +413,7 @@ test('health names the real service behind an OpenAI-compatible base URL', async
 
 test('OpenAI missing key returns a clear configuration error without mock fallback', async () => {
   const provider = createOpenAIProvider({ apiKey: '' });
-  const api = await startServer(createApp({ provider, providerName: 'openai' }).app);
+  const api = await startServer(createApp({ auth: false, provider, providerName: 'openai' }).app);
   const { status, data } = await api.post('/api/chat', { message: 'hi' });
 
   assert.equal(status, 503);
@@ -303,7 +434,7 @@ test('OpenAI authentication and quota errors reach the user safely', async (t) =
           { status: statusCode },
         ),
       });
-      const api = await startServer(createApp({ provider, providerName: 'openai' }).app);
+      const api = await startServer(createApp({ auth: false, provider, providerName: 'openai' }).app);
       const { status, data } = await api.post('/api/chat', { message: 'hi' });
 
       assert.equal(status, statusCode);
@@ -333,7 +464,7 @@ test('provider failure returns 502 and redacts secrets from logs and response', 
   console.error = (...args) => logged.push(args.join(' '));
 
   try {
-    const api = await startServer(createApp({ provider: failingProvider }).app);
+    const api = await startServer(createApp({ auth: false, provider: failingProvider }).app);
     const { status, data } = await api.post('/api/chat', { message: 'hi' });
 
     assert.equal(status, 502);
@@ -351,7 +482,7 @@ test('provider failure returns 502 and redacts secrets from logs and response', 
 
 test('malformed provider result is treated as a provider error', async () => {
   const brokenProvider = { name: 'broken', model: 'none', chat: async () => ({}) };
-  const api = await startServer(createApp({ provider: brokenProvider }).app);
+  const api = await startServer(createApp({ auth: false, provider: brokenProvider }).app);
   const { status, data } = await api.post('/api/chat', { message: 'hi' });
 
   assert.equal(status, 502);

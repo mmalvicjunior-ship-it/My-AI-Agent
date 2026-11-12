@@ -2,6 +2,7 @@
 // Every function here confines access to a single project directory:
 // absolute paths, traversal ("../"), null bytes, and symlinks that point
 // outside the authorized workspace are rejected with a WorkspaceError.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -66,6 +67,81 @@ export function ensureDir(dir) {
 function isInside(root, target) {
   const rel = path.relative(root, target);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * True when `target` is `root` itself or lives underneath it.
+ * Used to confine imported project directories to PROJECT_IMPORT_ROOT.
+ */
+export function isPathInside(root, target) {
+  return isInside(path.resolve(root), path.resolve(target));
+}
+
+/**
+ * Destination safety for writes: the final path component itself must be a
+ * plain file. A symlink or junction (even a dangling one) is refused, and so
+ * is a regular file with more than one hard link — writing through either
+ * would reach content outside the workspace without ever showing up as a
+ * path escape in resolveInside() (which only checks existing links by
+ * realpath, and cannot see a link that is itself the destination).
+ *
+ * `lstat` (not `stat`) is essential: `stat` would follow the link and the
+ * check would silently pass for exactly the cases we must reject.
+ */
+function assertSafeDestination(root, destination) {
+  let stat;
+  try {
+    stat = fs.lstatSync(destination);
+  } catch (err) {
+    if (err.code === 'ENOENT') return; // nothing there yet: a fresh create is fine
+    throw err;
+  }
+  if (stat.isSymbolicLink()) {
+    throw new WorkspaceError(403, 'Writing through a symlink or junction is not allowed.');
+  }
+  if (stat.isFile() && stat.nlink > 1) {
+    throw new WorkspaceError(403, 'Writing through a hard link is not allowed.');
+  }
+  const real = fs.realpathSync(destination);
+  if (!isInside(root, real)) {
+    throw new WorkspaceError(403, 'Path escapes the authorized workspace.');
+  }
+}
+
+/**
+ * Writes `content` to `destination` atomically by creating a fresh temporary
+ * file in the same directory (exclusive create) and renaming it over the
+ * destination. `rename` replaces the directory entry rather than following
+ * it, so a destination that is swapped for a symlink or hard link between
+ * validation and the write is never written through: the link itself is
+ * replaced atomically, or (for a symlink created by another process at the
+ * exact moment of the rename) the rename either succeeds on the entry we
+ * validated or fails cleanly — the outside target is never opened.
+ *
+ * Residual risk that cannot be closed here: a hostile process that swaps a
+ * *parent directory* for a symlink between path validation and the write.
+ * Closing that requires openat2-style directory handles, which Node does not
+ * portably expose. Workspace files are only writable by the same OS user, so
+ * this is a documented limitation, not a regression.
+ */
+function writeFileAtomic(destination, content) {
+  const directory = path.dirname(destination);
+  const tempPath = path.join(directory, `.myai-tmp-${process.pid}-${crypto.randomBytes(8).toString('hex')}`);
+  let fd = null;
+  try {
+    fd = fs.openSync(tempPath, 'wx', 0o644);
+    fs.writeSync(fd, content, null, 'utf8');
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, destination);
+    return;
+  } catch (error) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+    try { fs.unlinkSync(tempPath); } catch { /* temp never created or already renamed */ }
+    throw error;
+  }
 }
 
 function toPosix(p) {
@@ -180,7 +256,14 @@ export function createTextFile(rootDir, relativePath, content, { allowDeployment
   const { destination, relative } = prepareWrite(rootDir, relativePath,
     'The assistant cannot create credential or environment files.', { allowDeployment });
   if (fs.existsSync(destination)) throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
-  fs.writeFileSync(destination, content, { encoding: 'utf8', flag: 'wx' });
+  try {
+    // 'wx' is an atomic exclusive create, so a concurrent create_file for the
+    // same path loses cleanly with a 409 instead of a raw EEXIST failure.
+    fs.writeFileSync(destination, content, { encoding: 'utf8', flag: 'wx' });
+  } catch (error) {
+    if (error.code === 'EEXIST') throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
+    throw error;
+  }
   return { path: relative, size: Buffer.byteLength(content, 'utf8') };
 }
 
@@ -221,7 +304,19 @@ function prepareWrite(rootDir, relativePath, sensitiveMessage, { allowDeployment
   let parentPath = root;
   for (const segment of parentSegments) {
     const candidate = path.join(parentPath, segment);
-    if (!fs.existsSync(candidate)) fs.mkdirSync(candidate);
+    if (!fs.existsSync(candidate)) {
+      // Ensure the parent path exists; if the candidate is a dangling symlink
+      // then mkdir will fail with ENOTDIR, which is safe and consistent.
+      try {
+        fs.mkdirSync(candidate);
+      } catch (err) {
+        if (err.code === 'ENOTDIR') {
+          // candidate was a broken symlink; treat it as an escape attempt.
+          throw new WorkspaceError(403, 'Path escapes the authorized workspace.');
+        }
+        throw err;
+      }
+    }
     const real = fs.realpathSync(candidate);
     if (!isInside(root, real) || !fs.statSync(real).isDirectory()) {
       throw new WorkspaceError(403, 'Path escapes the authorized workspace.');
@@ -229,6 +324,7 @@ function prepareWrite(rootDir, relativePath, sensitiveMessage, { allowDeployment
     parentPath = real;
   }
   const destination = path.join(parentPath, segments.at(-1));
+  assertSafeDestination(root, destination);
   return { root, destination, relative: toPosix(path.relative(rootDir, destination)) };
 }
 
@@ -242,7 +338,7 @@ export function writeTextFile(rootDir, relativePath, content) {
   if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
     throw new WorkspaceError(413, `File content exceeds the ${MAX_READ_BYTES}-byte limit.`);
   }
-  const { destination, relative } = prepareWrite(rootDir, relativePath,
+  const { root, destination, relative } = prepareWrite(rootDir, relativePath,
     'Credential or environment files cannot be edited through the workspace API.');
 
   const exists = fs.existsSync(destination);
@@ -259,7 +355,11 @@ export function writeTextFile(rootDir, relativePath, content) {
     }
     previous = buffer.toString('utf8');
   }
-  fs.writeFileSync(destination, content, 'utf8');
+  // Re-check immediately before writing so a same-tick link swap is caught,
+  // and write atomically (temp file + rename in the destination directory) so
+  // a destination swapped for a link afterwards is never written through.
+  assertSafeDestination(root, destination);
+  writeFileAtomic(destination, content);
   return { path: relative, created: !exists, size: Buffer.byteLength(content, 'utf8'), previous };
 }
 
@@ -305,12 +405,16 @@ export function replaceTextFile(rootDir, relativePath, expectedContent, content,
   if (!allowDeployment && isProtectedDeploymentConfig(relativePath)) {
     throw new WorkspaceError(403, 'Deployment, CI/CD, and cloud infrastructure configuration files cannot be modified without explicit user approval.');
   }
+  const target = resolveInside(rootDir, relativePath);
+  const root = fs.realpathSync(rootDir);
+  assertSafeDestination(root, target.absolute);
   const current = readTextFile(rootDir, relativePath);
   if (current.content !== expectedContent) {
     throw new WorkspaceError(409, 'File changed since the proposal was prepared. Re-read it and create a fresh proposal.');
   }
-  const target = resolveInside(rootDir, relativePath);
-  fs.writeFileSync(target.absolute, content, 'utf8');
+  // The 409 check above is advisory for content, never a path boundary; the
+  // atomic rename is what guarantees no link is written through.
+  writeFileAtomic(target.absolute, content);
   return { path: target.relative, size: Buffer.byteLength(content, 'utf8') };
 }
 

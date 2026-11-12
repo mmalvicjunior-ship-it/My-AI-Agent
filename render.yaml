@@ -1,5 +1,8 @@
 services:
   - type: web
+    # Dashboard service name. The currently verified URL is
+    # https://my-ai-agent-acqy.onrender.com (see README.md). If this Blueprint
+    # creates a new service, update the vercel.json rewrite to its URL.
     name: myai-agent-malvic-backend
     runtime: node
     plan: starter
@@ -25,3 +28,26 @@ services:
         sync: false
       - key: OPENAI_BASE_URL
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false
+      - key: NODE_VERSION
+        value: "22"
+      # Bootstrap procedure: before the first deploy, enter BOOTSTRAP_TOKEN
+      # (a long random string) in the Render dashboard. Deploy, then register
+      # the first (administrator) account by entering that token on the sign-up
+      # form. Registration of the first account fails with 403 otherwise, so
+      # a public visitor can never race the administrator. Afterwards set
+      # ALLOW_REGISTRATION to "false" (existing accounts can always log in).
+      # BOOTSTRAP_TOKEN is only read while no user exists; it may be removed
+      # after bootstrap. sync:false keeps the real value out of the repo.
+      - key: BOOTSTRAP_TOKEN
+        sync: false
+      - key: AUTH_SESSION_DAYS
+        value: "30"
+      - key: ALLOW_REGISTRATION
+        # Governs accounts created AFTER the first one. Leave "true" only while
+        # you are bootstrapping; set "false" in the dashboard once the admin
+        # account exists. Login for existing accounts is unaffected.
+        value: "true"

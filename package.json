@@ -19,7 +19,7 @@
     "test": "npm run test -w server"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "devDependencies": {
     "concurrently": "^10.0.6"

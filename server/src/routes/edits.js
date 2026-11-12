@@ -13,12 +13,7 @@ import {
   validateWritePath,
 } from '../workspace/files.js';
 import { unifiedDiff } from '../workspace/diff.js';
-
-function findProject(db, rawId) {
-  const id = Number(rawId);
-  if (!Number.isInteger(id) || id < 1) return null;
-  return db.prepare('SELECT id FROM projects WHERE id = ?').get(id) ?? null;
-}
+import { findOwnedProject } from '../auth/index.js';
 
 function sendError(res, err, label) {
   if (err instanceof WorkspaceError) {
@@ -39,7 +34,7 @@ export function createEditsRouter({ db, tools = null }) {
   //   PUT /api/projects/:id/file?path=src/app.js        body: { content }
   //   PUT /api/projects/:id/file?path=...&preview=1     returns the diff only, writes nothing.
   router.put('/:id/file', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (typeof req.query.path !== 'string' || req.query.path.trim() === '') {
       return res.status(400).json({ ok: false, error: 'Query parameter "path" is required.' });
@@ -103,7 +98,7 @@ export function createEditsRouter({ db, tools = null }) {
   // Delete a file or empty directory:
   //   DELETE /api/projects/:id/file?path=src/old.js
   router.delete('/:id/file', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (typeof req.query.path !== 'string' || req.query.path.trim() === '') {
       return res.status(400).json({ ok: false, error: 'Query parameter "path" is required.' });
@@ -127,7 +122,7 @@ export function createEditsRouter({ db, tools = null }) {
 
   // Change history: GET /api/projects/:id/changes?limit=50
   router.get('/:id/changes', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     const requested = Number(req.query.limit);
     const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, 200) : 50;
@@ -144,7 +139,7 @@ export function createEditsRouter({ db, tools = null }) {
   // Pending agent proposals (staged, not yet applied), with review diffs:
   //   GET /api/projects/:id/proposals
   router.get('/:id/proposals', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (!tools?.listProposals) {
       return res.status(503).json({ ok: false, error: 'Proposal listing is unavailable.' });

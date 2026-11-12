@@ -29,7 +29,7 @@ async function request(method, path, body) {
 }
 
 before(async () => {
-  const created = createApp({ provider: mockProvider });
+  const created = createApp({ auth: false, provider: mockProvider });
   db = created.db;
   server = created.app.listen(0);
   await once(server, 'listening');

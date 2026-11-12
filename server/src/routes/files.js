@@ -13,12 +13,7 @@ import {
   scanDirectory,
   searchWorkspace,
 } from '../workspace/files.js';
-
-function findProject(db, rawId) {
-  const id = Number(rawId);
-  if (!Number.isInteger(id) || id < 1) return null;
-  return db.prepare('SELECT id FROM projects WHERE id = ?').get(id) ?? null;
-}
+import { findOwnedProject } from '../auth/index.js';
 
 function sendError(res, err, label) {
   if (err instanceof WorkspaceError) {
@@ -33,7 +28,7 @@ export function createFilesRouter({ db, tools = null }) {
 
   // List a directory: GET /api/projects/:id/files?path=src
   router.get('/:id/files', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     try {
       const dir = getProjectRoot(db, config.workspaceRoot, project.id);
@@ -47,7 +42,7 @@ export function createFilesRouter({ db, tools = null }) {
 
   // Read a file: GET /api/projects/:id/file?path=src/index.js
   router.get('/:id/file', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (typeof req.query.path !== 'string' || req.query.path.trim() === '') {
       return res.status(400).json({ ok: false, error: 'Query parameter "path" is required.' });
@@ -63,7 +58,7 @@ export function createFilesRouter({ db, tools = null }) {
   });
 
   router.get('/:id/tree', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     try {
       const dir = getProjectRoot(db, config.workspaceRoot, project.id);
@@ -74,7 +69,7 @@ export function createFilesRouter({ db, tools = null }) {
   });
 
   router.get('/:id/search', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     try {
       const dir = getProjectRoot(db, config.workspaceRoot, project.id);
@@ -85,7 +80,7 @@ export function createFilesRouter({ db, tools = null }) {
   });
 
   router.post('/:id/proposals/:proposalId/apply', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (!tools?.applyProposal) {
       return res.status(503).json({ ok: false, error: 'File proposal approval is unavailable.' });
@@ -99,7 +94,7 @@ export function createFilesRouter({ db, tools = null }) {
   });
 
   router.post('/:id/proposals/:proposalId/reject', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (!tools?.rejectProposal) {
       return res.status(503).json({ ok: false, error: 'Proposal rejection is unavailable.' });
@@ -112,7 +107,7 @@ export function createFilesRouter({ db, tools = null }) {
   });
 
   router.post('/:id/commands/:proposalId/run', (req, res) => {
-    const project = findProject(db, req.params.id);
+    const project = findOwnedProject(db, req.user, req.params.id);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
     if (!tools?.runApprovedCommand) {
       return res.status(503).json({ ok: false, error: 'Command approval is unavailable.' });

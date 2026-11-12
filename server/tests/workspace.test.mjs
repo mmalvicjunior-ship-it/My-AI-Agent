@@ -23,7 +23,9 @@ const servers = [];
 const tempDirs = [];
 
 async function startServer() {
-  const server = createApp().app.listen(0);
+  // Imported fixtures live in the OS temp directory; allow that as the safe
+  // import root while keeping the managed workspace root off-limits.
+  const server = createApp({ auth: false, projectImportRoot: os.tmpdir() }).app.listen(0);
   await once(server, 'listening');
   servers.push(server);
   const base = `http://127.0.0.1:${server.address().port}/api/projects`;

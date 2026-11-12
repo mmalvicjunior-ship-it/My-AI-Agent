@@ -171,12 +171,17 @@ export function createTask(db, { projectId, instruction, autonomy = DEFAULT_AUTO
   return getTask(db, Number(result.lastInsertRowid));
 }
 
-export function listTasks(db, { projectId = null, status = null, limit = 20 } = {}) {
+export function listTasks(db, { projectId = null, status = null, limit = 20, ownerId = null } = {}) {
   const clauses = [];
   const params = [];
   if (projectId !== null) {
     clauses.push('t.project_id = ?');
     params.push(projectId);
+  }
+  // Non-bypass callers only ever see tasks whose project they own.
+  if (ownerId !== null) {
+    clauses.push('t.project_id IN (SELECT id FROM projects WHERE owner_id = ?)');
+    params.push(ownerId);
   }
   if (status !== null) {
     clauses.push('t.status = ?');

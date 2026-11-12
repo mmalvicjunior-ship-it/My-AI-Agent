@@ -16,6 +16,9 @@ import path from 'node:path';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), `myai-test-${process.pid}-`));
 process.env.DATABASE_PATH = path.join(root, 'test.db');
 process.env.WORKSPACE_ROOT = path.join(root, 'workspaces');
+// The first account requires BOOTSTRAP_TOKEN. Tests register through the same
+// public route, so they get a known test-only token.
+process.env.BOOTSTRAP_TOKEN = 'test-bootstrap-token';
 
 // Windows keeps the SQLite file open until after the 'exit' handler runs, so a
 // single run can leave its folder behind. Sweep up old ones (older than an hour,

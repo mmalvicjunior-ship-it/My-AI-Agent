@@ -31,6 +31,35 @@ export function openDb() {
   if (!projectColumns.some((column) => column.name === 'root_path')) {
     db.exec('ALTER TABLE projects ADD COLUMN root_path TEXT');
   }
+  // Per-user ownership. Existing rows migrate with owner_id = NULL and are
+  // adopted by the first account created after authentication is enabled.
+  if (!projectColumns.some((column) => column.name === 'owner_id')) {
+    db.exec('ALTER TABLE projects ADD COLUMN owner_id INTEGER');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects (owner_id, id)');
+
+  // Accounts. Passwords are scrypt hashes; the raw password is never stored.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      email         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      password_hash TEXT NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // Bearer sessions. Only the SHA-256 hash of each token is stored, so a leaked
+  // database file cannot be replayed as a live session.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token_hash   TEXT PRIMARY KEY,
+      user_id      INTEGER NOT NULL,
+      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id)');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS chat_messages (

@@ -3,7 +3,7 @@
 // these routes are the only public write endpoints besides /api/health.
 import crypto from 'node:crypto';
 import express from 'express';
-import { config } from '../config.js';
+import { config, redactSecrets } from '../config.js';
 import {
   bearerToken,
   createAttemptLimiter,
@@ -11,15 +11,25 @@ import {
   deleteSession,
   findSessionUser,
   hashPassword,
+  hashToken,
   normalizeEmail,
   validatePassword,
   verifyPassword,
   burnPasswordCheck,
   claimUnclaimedProjects,
 } from '../auth/index.js';
+import {
+  googleAuthorizeUrl,
+  verifyGoogleIdentity,
+  createOAuthState,
+  STATE_TTL_MS,
+} from '../auth/google.js';
 
 function publicUser(row) {
-  return { id: row.id, email: row.email };
+  // row may be either a raw database row (is_admin) or the session projection
+  // returned by findSessionUser (isAdmin). Normalize to one public shape.
+  const rawAdmin = row.is_admin === undefined ? row.isAdmin : row.is_admin;
+  return { id: row.id, email: row.email, isAdmin: Boolean(rawAdmin) };
 }
 
 function clientKey(req) {
@@ -60,6 +70,15 @@ export function createAuthRouter({ db }) {
   // from one source at 50 attempts per window.
   const loginLimiter = createAttemptLimiter({ max: 10 });
   const loginBackstopLimiter = createAttemptLimiter({ max: 50 });
+  // Google sign-in has its own bucket so a broken third party can never lock
+  // out email/password authentication.
+  const googleLimiter = createAttemptLimiter({ max: 20 });
+
+  /** True only when every value needed for the Google flow is configured. */
+  function googleConfigured(cfg) {
+    return Boolean(cfg.googleClientId && cfg.googleClientSecret && cfg.googleRedirectUri);
+  }
+
 
   router.post('/register', (req, res) => {
     const limit = registerLimiter(clientKey(req));
@@ -78,7 +97,7 @@ export function createAuthRouter({ db }) {
       if (!tokensEqual(provided, config.bootstrapToken)) {
         return res.status(403).json({
           ok: false,
-          error: 'Creating the first account requires the server bootstrap token. Set BOOTSTRAP_TOKEN in the server environment and enter it on the registration form.',
+          error: 'Creating the first account requires the server bootstrap token. Provide it via the setup URL (#bootstrap=<token>) when registering the first account.',
         });
       }
     } else if (!config.allowRegistration) {
@@ -101,9 +120,12 @@ export function createAuthRouter({ db }) {
 
     let userId;
     try {
+      // The first account becomes the administrator; later accounts are
+      // ordinary users and can never self-promote to admin.
+      const isAdmin = userCount === 0;
       const result = db
-        .prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)')
-        .run(email, hashPassword(req.body.password));
+        .prepare('INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)')
+        .run(email, hashPassword(req.body.password), isAdmin ? 1 : 0);
       userId = Number(result.lastInsertRowid);
     } catch (error) {
       // Unique constraint race with another registration for the same email.
@@ -122,8 +144,117 @@ export function createAuthRouter({ db }) {
       ok: true,
       token: session.token,
       expiresAt: session.expiresAt,
-      user: { id: userId, email },
+      user: { id: userId, email, isAdmin: userCount === 0 },
     });
+  });
+
+  router.post('/google/start', (req, res) => {
+    const limit = googleLimiter(clientKey(req));
+    if (!limit.allowed) {
+      return rejectRateLimited(res, limit, 'Too many sign-in attempts. Try again later.');
+    }
+    if (!googleConfigured(config)) {
+      return res.status(503).json({ ok: false, error: 'Google sign-in is not configured on this server.' });
+    }
+    const userCount = Number(db.prepare('SELECT COUNT(*) AS count FROM users').get().count);
+    const provided = typeof req.body?.bootstrapToken === 'string' ? req.body.bootstrapToken.trim() : '';
+    // The FIRST account is always governed by the bootstrap protection, even
+    // when it is created through Google. Fail here, not after a round trip.
+    if (userCount === 0 && !tokensEqual(provided, config.bootstrapToken)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Creating the first account requires the server bootstrap token. Provide it via the setup URL (#bootstrap=<token>) when registering the first account.',
+      });
+    }
+    const bootstrapOk = userCount === 0 ? 1 : 0;
+    const allowCreate = (userCount === 0 ? bootstrapOk === 1 : Boolean(config.allowRegistration)) ? 1 : 0;
+
+    const state = createOAuthState();
+    // One-time state, stored only as a SHA-256 hash, valid for 10 minutes.
+    db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(new Date().toISOString());
+    db.prepare('INSERT INTO oauth_states (state_hash, bootstrap_ok, allow_create, expires_at) VALUES (?, ?, ?, ?)')
+      .run(hashToken(state), bootstrapOk, allowCreate, new Date(Date.now() + STATE_TTL_MS).toISOString());
+    return res.json({
+      ok: true,
+      url: googleAuthorizeUrl({ clientId: config.googleClientId, redirectUri: config.googleRedirectUri, state }),
+    });
+  });
+
+  router.get('/google/callback', async (req, res) => {
+    const limit = googleLimiter(clientKey(req));
+    if (!limit.allowed) {
+      return rejectRateLimited(res, limit, 'Too many sign-in attempts. Try again later.');
+    }
+    const origin = typeof config.appOrigin === 'string' ? config.appOrigin.replace(/\/+$/, '') : '';
+    const redirectWithError = (code) => res.redirect(302, `${origin}/#auth_error=${encodeURIComponent(code)}`);
+    if (!googleConfigured(config)) return redirectWithError('google_not_configured');
+
+    // Google reports user cancellation through the `error` query parameter.
+    if (typeof req.query.error === 'string' && req.query.error) return redirectWithError('google_cancelled');
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    if (!code || !state) return redirectWithError('google_state');
+
+    // Consume the state atomically: the row is deleted and returned in one
+    // statement, so a replayed or concurrent second callback finds nothing.
+    const stateHash = hashToken(state);
+    const stateRow = db.prepare(
+      'DELETE FROM oauth_states WHERE state_hash = ? RETURNING bootstrap_ok, allow_create, expires_at',
+    ).get(stateHash);
+    if (!stateRow) return redirectWithError('google_state');
+    if (new Date(stateRow.expires_at).getTime() <= Date.now()) return redirectWithError('google_state');
+
+    let identity;
+    try {
+      identity = await verifyGoogleIdentity({
+        code,
+        clientId: config.googleClientId,
+        clientSecret: config.googleClientSecret,
+        redirectUri: config.googleRedirectUri,
+      });
+    } catch (error) {
+      return redirectWithError(error && error.code ? error.code : 'google_identity_invalid');
+    }
+
+    try {
+      const normalized = normalizeEmail(identity.email);
+      if (!normalized) return redirectWithError('google_identity_invalid');
+
+      const finish = (userId) => {
+        const session = createSession(db, userId, config.authSessionDays);
+        return res.redirect(302, `${origin}/#auth_token=${session.token}&auth_expires=${encodeURIComponent(session.expiresAt)}`);
+      };
+
+      const bySub = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
+      if (bySub) return finish(bySub.id);
+
+      const existing = db.prepare('SELECT id, google_sub FROM users WHERE email = ?').get(normalized);
+      if (existing) {
+        // Never silently link a password account to a Google identity.
+        return redirectWithError(existing.google_sub ? 'google_identity_conflict' : 'google_account_exists');
+      }
+
+      const userCount = Number(db.prepare('SELECT COUNT(*) AS count FROM users').get().count);
+      if (userCount === 0) {
+        if (stateRow.bootstrap_ok !== 1) return redirectWithError('google_bootstrap_required');
+      } else if (stateRow.allow_create !== 1) {
+        return redirectWithError('google_registration_disabled');
+      }
+      const isAdmin = userCount === 0 ? 1 : 0;
+      // Google-only accounts get an unusable random password hash: password
+      // sign-in is impossible for them; only Google sign-in works.
+      const shadowHash = hashPassword(crypto.randomBytes(32).toString('hex'));
+      const result = db
+        .prepare('INSERT INTO users (email, password_hash, is_admin, google_sub) VALUES (?, ?, ?, ?)')
+        .run(normalized, shadowHash, isAdmin, identity.sub);
+      const userId = Number(result.lastInsertRowid);
+      // The first account adopts pre-authentication projects, like email sign-up.
+      if (isAdmin) claimUnclaimedProjects(db, userId);
+      return finish(userId);
+    } catch (error) {
+      console.error('[auth] Google callback failed:', redactSecrets(String(error?.message || error)));
+      return redirectWithError('google_identity_invalid');
+    }
   });
 
   router.post('/login', (req, res) => {
@@ -142,7 +273,7 @@ export function createAuthRouter({ db }) {
       return res.status(400).json({ ok: false, error: 'Email and password are required.' });
     }
 
-    const user = db.prepare('SELECT id, email, password_hash FROM users WHERE email = ?').get(email);
+    const user = db.prepare('SELECT id, email, password_hash, is_admin FROM users WHERE email = ?').get(email);
     if (!user) {
       burnPasswordCheck(password);
       return res.status(401).json({ ok: false, error: 'Invalid email or password.' });

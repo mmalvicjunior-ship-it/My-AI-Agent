@@ -91,6 +91,8 @@ kbd { padding: 2px 5px; color: var(--subtle); background: var(--surface); border
 .profile-plan { margin-left: auto; padding: 3px 6px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; font-size: 9px; }
 .profile-logout { margin-left: auto; padding: 4px 7px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; font-size: 9px; font-weight: 600; }
 .profile-logout:hover { color: var(--text); background: var(--surface-hover); }
+.profile-role { padding: 2px 6px; color: var(--muted); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 99px; font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.profile-role.is-admin { color: var(--accent); border-color: rgba(181, 162, 255, .3); }
 
 .main-panel { display: flex; min-width: 0; flex: 1; flex-direction: column; position: relative; }
 .topbar { z-index: 2; display: flex; height: 64px; flex: 0 0 64px; align-items: center; justify-content: space-between; padding: 0 31px; border-bottom: 1px solid var(--line-soft); }
@@ -362,11 +364,20 @@ kbd { padding: 2px 5px; color: var(--subtle); background: var(--surface); border
 .auth-tabs { display: flex; gap: 4px; margin-bottom: 18px; padding: 4px; background: var(--surface-raised); border: 1px solid var(--line); border-radius: 9px; }
 .auth-tabs button { flex: 1; padding: 8px; color: var(--muted); background: transparent; border: 0; border-radius: 6px; cursor: pointer; font: 600 12px 'DM Sans', sans-serif; }
 .auth-tabs button.active { color: var(--text-strong); background: var(--surface-hover); }
+.auth-google { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; margin-bottom: 14px; padding: 10px; color: var(--text-strong); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; font: 600 13px 'DM Sans', sans-serif; transition: background .15s, border-color .15s; }
+.auth-google:hover:not(:disabled) { background: var(--surface-hover); border-color: #44434d; }
+.auth-google:disabled { cursor: progress; opacity: .65; }
+.auth-google-mark { width: 18px; height: 18px; flex: 0 0 18px; }
+.auth-google-spinner { width: 16px; height: 16px; flex: 0 0 16px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: auth-spin .7s linear infinite; }
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+.auth-divider { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; color: var(--subtle); font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+.auth-divider::before, .auth-divider::after { flex: 1; height: 1px; content: ''; background: var(--line-soft); }
 .auth-form { display: flex; flex-direction: column; gap: 13px; }
 .auth-form label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 600; }
 .auth-form input { width: 100%; padding: 10px 11px; color: var(--text); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 7px; outline: 0; font: 400 13px 'DM Sans', sans-serif; }
 .auth-form input:focus { border-color: var(--accent); }
 .auth-error { padding: 9px 10px; color: var(--red); background: rgba(251, 128, 137, .08); border: 1px solid rgba(251, 128, 137, .25); border-radius: 7px; font-size: 12px; }
+.auth-bootstrap-hint { padding: 9px 10px; color: var(--accent); background: var(--accent-soft); border: 1px solid rgba(181, 162, 255, .22); border-radius: 7px; font-size: 12px; }
 .auth-submit { margin-top: 3px; padding: 11px; color: #201a30; background: #c5b5ff; border: 0; border-radius: 8px; cursor: pointer; font: 700 13px 'DM Sans', sans-serif; }
 .auth-submit:hover { background: var(--accent); }
 .auth-submit:disabled { cursor: progress; opacity: .65; }

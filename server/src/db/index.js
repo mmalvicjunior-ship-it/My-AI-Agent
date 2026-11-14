@@ -44,7 +44,63 @@ export function openDb() {
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       email         TEXT NOT NULL UNIQUE COLLATE NOCASE,
       password_hash TEXT NOT NULL,
-      created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      is_admin      INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))
+    );
+  `);
+  // Migration for databases created before roles existed. Both steps run in
+  // one transaction and the promotion is idempotent, so re-running on every
+  // boot is safe:
+  //   1. add the is_admin column if it is missing (existing rows stay 0);
+  //   2. promote the earliest account (MIN(id)) to administrator exactly
+  //      once, and only while no administrator exists.
+  // The promotion deliberately runs on every boot, not only when the column
+  // was just added: if a previous boot crashed between the ALTER TABLE and
+  // the promotion UPDATE, the next boot completes it instead of leaving a
+  // database with no administrator. The promotion never reassigns an account
+  // that is already an administrator. SQLite cannot add a CHECK constraint
+  // via ALTER TABLE on an existing column; values are only ever written as
+  // 0/1 by the server, so the migrated column is safe without one.
+  // NOTE: on a legacy database with several accounts, "earliest" is MIN(id),
+  // which may not be the intended administrator. Verify after deploying and
+  // correct out of band if needed (see docs/FIRST-ACCOUNT-BOOTSTRAP.md).
+  const userColumns = db.prepare('PRAGMA table_info(users)').all();
+  const hasAdminColumn = userColumns.some((column) => column.name === 'is_admin');
+  db.exec('BEGIN');
+  try {
+    if (!hasAdminColumn) {
+      db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
+    }
+    db.exec(`UPDATE users SET is_admin = 1
+             WHERE id = (SELECT MIN(id) FROM users)
+               AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)`);
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* best effort: the transaction rolls back on close */ }
+    throw error;
+  }
+
+  // Google sign-in: link the stable Google "sub" to the account that uses it.
+  // SQLite unique indexes treat NULLs as distinct, so password-only accounts
+  // (google_sub unset) never collide.
+  const userColumnsFinal = db.prepare('PRAGMA table_info(users)').all();
+  if (!userColumnsFinal.some((column) => column.name === 'google_sub')) {
+    db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT');
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users (google_sub)');
+
+  // One-time OAuth state values for the Google sign-in flow. Only the
+  // SHA-256 hash of each state is stored, and rows are consumed (deleted)
+  // on use. `allow_create` captures the outcome of the server-side checks
+  // made when the flow was started, so the callback never re-trusts a
+  // browser-supplied verdict.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      state_hash   TEXT PRIMARY KEY,
+      bootstrap_ok INTEGER NOT NULL DEFAULT 0 CHECK (bootstrap_ok IN (0, 1)),
+      allow_create INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
+      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at   TEXT NOT NULL
     );
   `);
 

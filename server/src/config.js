@@ -57,6 +57,34 @@ function importRootFromEnv() {
   return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(serverDir, raw);
 }
 
+/**
+ * Validates APP_ORIGIN: an absolute https origin (http allowed only for
+ * localhost development), without credentials, path, query or fragment.
+ * Empty string means same-origin relative redirects. Throws on anything else
+ * so a misconfiguration fails closed at startup instead of later redirecting
+ * session tokens to an attacker-controlled origin.
+ */
+export function validateAppOrigin(raw) {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return '';
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`APP_ORIGIN must be a valid absolute URL, got: ${value}`);
+  }
+  const isHttps = url.protocol === 'https:';
+  const isLocalHttp = url.protocol === 'http:'
+    && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname.endsWith('.localhost'));
+  if (!isHttps && !isLocalHttp) {
+    throw new Error('APP_ORIGIN must use https: (http: is allowed only for localhost development).');
+  }
+  if (url.username || url.password) throw new Error('APP_ORIGIN must not contain credentials.');
+  if (url.pathname && url.pathname !== '/') throw new Error('APP_ORIGIN must not contain a path.');
+  if (url.search || url.hash) throw new Error('APP_ORIGIN must not contain a query string or fragment.');
+  return url.origin;
+}
+
 export const config = {
   // Empty string = listen on all interfaces (lets a phone on the same Wi-Fi connect).
   // Set HOST=127.0.0.1 in .env to restrict access to this computer only.
@@ -85,6 +113,19 @@ export const config = {
   authSessionDays: sessionDaysFromEnv(),
   allowRegistration: process.env.ALLOW_REGISTRATION !== 'false',
   bootstrapToken: (process.env.BOOTSTRAP_TOKEN || '').trim(),
+  // Optional Google sign-in (authorization-code flow, server-side only).
+  // Leave all three Google values empty to disable the "Continue with Google"
+  // button. The client secret never leaves this server.
+  googleClientId: (process.env.GOOGLE_CLIENT_ID || '').trim(),
+  googleClientSecret: (process.env.GOOGLE_CLIENT_SECRET || '').trim(),
+  googleRedirectUri: (process.env.GOOGLE_OAUTH_REDIRECT_URI || '').trim(),
+  // Base URL the OAuth callback redirects back to after login. Empty = same-
+  // origin relative redirect (works behind the Vercel rewrite and the Vite dev
+  // proxy). Set it only when the callback is reached on a different origin
+  // than the frontend. Validated: absolute https origin (http only on
+  // localhost), no credentials/path/query/fragment; invalid values fail
+  // closed at startup.
+  appOrigin: validateAppOrigin(process.env.APP_ORIGIN || ''),
   // See trustProxyFromEnv: one trusted proxy hop by default.
   trustProxy: trustProxyFromEnv(),
   // Empty = importing existing server paths is disabled (see importRootFromEnv).
@@ -114,6 +155,10 @@ export function safeSummary() {
     allowRegistration: config.allowRegistration,
     authSessionDays: config.authSessionDays,
     bootstrapToken: mask(config.bootstrapToken),
+    googleClientId: mask(config.googleClientId),
+    googleClientSecret: mask(config.googleClientSecret),
+    googleRedirectUri: config.googleRedirectUri || '(not set)',
+    appOrigin: config.appOrigin || '(same origin)',
     trustProxy: config.trustProxy,
     projectImportRoot: config.projectImportRoot || '(imports disabled)',
   };
@@ -123,8 +168,8 @@ export function safeSummary() {
 export function redactSecrets(text) {
   if (typeof text !== 'string' || !text) return text;
   let safe = text;
-  // Replace known configured secrets exactly, for both providers.
-  for (const secret of [config.aiApiKey, config.geminiApiKey]) {
+  // Replace known configured secrets exactly, for both providers and Google.
+  for (const secret of [config.aiApiKey, config.geminiApiKey, config.googleClientSecret]) {
     if (secret) safe = safe.split(secret).join('[redacted]');
   }
   // Redact standard secret patterns: Bearer tokens, OpenAI/Anthropic/Google keys, GitHub PATs

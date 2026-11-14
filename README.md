@@ -48,9 +48,9 @@ restart it manually after backend code changes.
 ### Accounts and sessions
 
 The web app and API require an account. On first load the browser shows a
-sign-in/registration screen; register with an email and a password of at least
-8 characters, then use the **Sign out** control in the sidebar to end the
-session. Accounts are stored locally in SQLite.
+Sign in screen; open the **Create Account** tab to register with an email and
+a password of at least 8 characters, then use the **Sign out** control in the
+sidebar to end the session. Accounts are stored locally in SQLite.
 
 - Passwords are hashed with Node's built-in `scrypt`; the raw password is never
   stored or logged. Session tokens are random 256-bit values, and only their
@@ -71,6 +71,15 @@ session. Accounts are stored locally in SQLite.
   existing accounts can always log in. The first account adopts projects that
   predate accounts (`owner_id IS NULL`) so existing local data stays reachable;
   later accounts inherit nothing. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
+- Optional Google sign-in (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_OAUTH_REDIRECT_URI`)
+  uses Google's authorization-code flow entirely server-side: the browser is
+  redirected to Google, Google calls back `/api/auth/google/callback`, and the
+  server exchanges the code and validates the identity against Google's
+  tokeninfo endpoint (verified email required) before issuing a normal session
+  token. Google users are never administrators (the first account can be
+  created through Google only via the bootstrap token), existing
+  email/password accounts are never auto-linked, and no client secret reaches
+  the browser. Setup: `docs/GOOGLE-OAUTH.md`.
 - Register/login are throttled in memory (10 attempts per 15 minutes per IP,
   with a per-IP registration limit and a login spray backstop; `TRUST_PROXY`
   controls how many proxy hops are trusted for client IPs). The counters reset
@@ -370,6 +379,10 @@ prompts). Never commit real values.
 | `AUTH_SESSION_DAYS` | No | Session lifetime in days (1-365). Defaults to `30`. |
 | `BOOTSTRAP_TOKEN` | Yes before first account | Shared secret required to create the FIRST account only. Set in the Render dashboard; never commit it. Ignored once an account exists. |
 | `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after creating your account to close public registration. Does not affect the first account. |
+| `GOOGLE_CLIENT_ID` | No | Google OAuth 2.0 client ID (Web application). Enables the "Continue with Google" button. Render only; never the frontend. |
+| `GOOGLE_CLIENT_SECRET` | No | Google OAuth 2.0 client secret. Server-side only, never exposed to the browser. |
+| `GOOGLE_OAUTH_REDIRECT_URI` | No | Exact authorized redirect URI, e.g. `https://<your-vercel-app>/api/auth/google/callback`. |
+| `APP_ORIGIN` | No | Base URL the browser returns to after the Google callback. Empty = same-origin relative redirect. Must be an absolute https origin (http only on localhost) with no credentials, path, query or fragment; invalid values fail startup closed. |
 | `PROJECT_IMPORT_ROOT` | No | Leave unset to disable importing existing server directories. When set, imports must resolve inside this directory; paths inside `WORKSPACE_ROOT` are always rejected. |
 | `NODE_VERSION` | Recommended | `22`. |
 | `PORT` | No | Render injects it; do not set it. |
@@ -434,7 +447,7 @@ the service publicly:
 
 - Generate a strong `BOOTSTRAP_TOKEN` and set it in the Render dashboard
   BEFORE the first deploy; the first account can only be registered by
-  entering that token on the sign-up form (see
+  opening the app with `#bootstrap=<token>` in the URL (see
   `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
 - Keep `PROJECT_IMPORT_ROOT` unset unless you deliberately need directory
   imports; if set, point it at a dedicated folder, never the filesystem root or

@@ -1113,7 +1113,7 @@ function App() {
     return (
       <AuthScreen
         apiBase={API_BASE}
-        onAuthenticated={(token, user) => applyAuth({ token, user })}
+        onAuthenticated={(token, user, expiresAt) => applyAuth({ token, user, expiresAt })}
       />
     );
   }
@@ -1161,6 +1161,7 @@ function App() {
             <div className="profile-row">
               <span className="avatar">{(auth.user?.email || '?').charAt(0).toUpperCase()}</span>
               <span className="profile-name" title={auth.user?.email || ''}>{auth.user?.email || 'Signed in'}</span>
+              <span className={`profile-role${auth.user?.isAdmin ? ' is-admin' : ''}`}>{auth.user?.isAdmin ? 'Admin' : 'User'}</span>
               <button type="button" className="profile-logout" onClick={signOut} title="Sign out">Sign out</button>
             </div>
           </div>

@@ -15,7 +15,7 @@ import { createWorkspaceTools } from './ai/tools.js';
 import { createTaskRunner } from './tasks/runner.js';
 import { createTaskExecutor } from './tasks/executor.js';
 import { ensureDir, projectDir, isPathInside } from './workspace/files.js';
-import { requireAuth, bypassAuth, isBypassUser } from './auth/index.js';
+import { requireAuth, bypassAuth, isBypassUser, deleteExpiredSessions } from './auth/index.js';
 
 function realOrResolved(value) {
   try {
@@ -62,6 +62,33 @@ export function createApp(options = {}) {
   // this with createApp({ trustProxy }).
   const trustProxy = 'trustProxy' in options ? options.trustProxy : config.trustProxy;
   app.set('trust proxy', trustProxy);
+
+  // Security headers on every response (the static frontend served by Vercel
+  // carries the same policy via vercel.json; these cover /api JSON and any
+  // directly served assets). Deliberately identical values, so the two paths
+  // never disagree. CSP: the production bundle loads its script/style/font
+  // assets from 'self' plus the Google Fonts stylesheet used by styles.css,
+  // and inline style attributes require 'unsafe-inline' in style-src.
+  const contentSecurityPolicy = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+  ].join('; ');
+  app.use((req, res, next) => {
+    res.set('Content-Security-Policy', contentSecurityPolicy);
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('X-Frame-Options', 'DENY');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+  });
 
   // AI provider: injected by tests, otherwise resolved from AI_PROVIDER in .env.
   // Background tasks keep using this startup provider; chat requests may pick a
@@ -260,6 +287,18 @@ export function createApp(options = {}) {
 // (allows tests to import createApp without binding a port).
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { app, db, tools: workspaceTools, provider } = createApp();
+  // Purge expired sessions once at boot, then hourly. Only rows whose
+  // expiry has already passed are touched, so active sessions are never
+  // affected. unref() keeps the timer from holding the process open.
+  deleteExpiredSessions(db);
+  const sessionCleanup = setInterval(() => {
+    try {
+      deleteExpiredSessions(db);
+    } catch (error) {
+      console.error('[server] session cleanup failed:', redactSecrets(String(error?.message || error)));
+    }
+  }, 60 * 60 * 1000);
+  sessionCleanup.unref();
   // Background queue: runs outside any HTTP request and is not started by
   // createApp(), so importing the app in tests never spawns a worker.
   const taskRunner = createTaskRunner({

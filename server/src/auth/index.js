@@ -110,7 +110,7 @@ export function findSessionUser(db, token) {
   if (typeof token !== 'string' || token.length < 20) return null;
   const tokenHash = hashToken(token);
   const row = db.prepare(`
-    SELECT s.token_hash, s.expires_at, u.id, u.email, u.created_at
+    SELECT s.token_hash, s.expires_at, u.id, u.email, u.created_at, u.is_admin
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ?
@@ -122,7 +122,7 @@ export function findSessionUser(db, token) {
   }
   db.prepare('UPDATE sessions SET last_used_at = ? WHERE token_hash = ?')
     .run(new Date().toISOString(), tokenHash);
-  return { id: row.id, email: row.email, createdAt: row.created_at };
+  return { id: row.id, email: row.email, createdAt: row.created_at, isAdmin: Boolean(row.is_admin) };
 }
 
 export function deleteSession(db, token) {

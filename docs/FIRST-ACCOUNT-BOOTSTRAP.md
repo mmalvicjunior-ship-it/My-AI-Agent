@@ -43,26 +43,83 @@ protected, and only by the token.
    `sync: false` (the blueprint carries no value -- you set it in the
    dashboard).
 
-2. **Deploy, then register the first account.**
-   Open the service URL -> sign-up form -> fill in administrator email and a
-   strong unique password, and paste the bootstrap token into the
-   "Bootstrap token (first account only)" field. The token is sent only
-   with this request and is not persisted anywhere.
+2. **Back up the database before deploying this version.**
+   This release adds an `is_admin` column to `users` and runs an idempotent
+   migration at startup. On a deployment that already has accounts, snapshot
+   `/var/data/app.db` first (Render -> Disks -> download a snapshot, or copy
+   the file) so the migration can be replayed or rolled back safely.
 
-3. **Disable public registration.**
+3. **Deploy, then register the first account.**
+   Treat the setup URL below as a **secret link**: on a fresh deployment,
+   anyone who holds it can create the first (administrator) account, so send
+   it only to the administrator and never commit it, paste it into chat, or
+   log it.
+
+   Open the service URL with the token appended as a URL fragment:
+   `https://<your-service-url>/#bootstrap=<token>`
+
+   Fill in the administrator email and a strong unique password on the
+   Create Account tab and submit. The fragment never travels to any server,
+   proxy, CDN, or log, and never appears in a Referer header; the browser
+   passes the token only into the registration request body, and it is
+   removed from the address bar as soon as the page loads. The first account
+   is created as the administrator; every later account is an ordinary user.
+
+4. **Disable public registration.**
    In the Render dashboard -> Environment, set `ALLOW_REGISTRATION=false` and
    save (the service restarts). Existing sessions and future logins are
    unaffected. Registration now returns 403 for anyone else.
 
-4. **(Optional) Remove the token.**
-   After the first account exists, the token is never read again. You may
-   delete `BOOTSTRAP_TOKEN` from the environment entirely. Leaving it set is
-   also safe -- it is unused once an account exists.
-
 5. **Verify.**
    - Administrator sign-in -> works.
+   - The sidebar shows the administrator account with an "Admin" badge.
+   - On an upgraded database, confirm the intended account is the
+     administrator (see "Upgrading a database that already has accounts"
+     below) before closing registration.
    - New registration -> `403 "Registration is disabled on this server."`
    - `POST /api/auth/login` and `GET /api/auth/me` -> unaffected throughout.
+
+6. **Remove the token and discard the setup URL.**
+   After the first account exists, the token is never read again. Delete
+   `BOOTSTRAP_TOKEN` from the Render environment entirely (leaving it set is
+   also safe -- it is unused once an account exists), and stop sharing the
+   setup URL; treat it as a secret for as long as the deployment stays fresh.
+
+## Upgrading a database that already has accounts
+
+This release adds an `is_admin` column to `users` and runs an idempotent
+migration at startup, inside a single transaction:
+
+1. If the column is missing, it is added (`ALTER TABLE users ADD COLUMN`);
+   existing rows keep `is_admin = 0`.
+2. The earliest account (`MIN(id)`) is promoted to administrator exactly
+   once, and only while no administrator exists. If a previous boot was
+   interrupted between the column add and the promotion, the next boot
+   completes it instead of leaving a database with no administrator. An
+   account that is already an administrator is never reassigned.
+
+Two things operators must know:
+
+- **"Earliest account" is a guess.** On a database that already held several
+  accounts, the first row by `id` may not be the person who should be admin.
+  The migration does not ask, and it never switches the admin to a different
+  account once one is promoted.
+- **Plan the fix out of band.** Before deploying, back up `/var/data/app.db`.
+  After deploying, check the result:
+
+  ```sql
+  SELECT id, email, is_admin FROM users ORDER BY id;
+  ```
+
+  If the wrong account was promoted, correct it directly (it is read per
+  request, so no restart is needed):
+
+  ```sql
+  UPDATE users SET is_admin = 0 WHERE id = <wrong-account-id>;
+  UPDATE users SET is_admin = 1 WHERE id = <intended-account-id>;
+  ```
+
+  Keep the change minimal and do not add, delete, or reassign anything else.
 
 ## Emergency access
 

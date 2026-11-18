@@ -303,7 +303,11 @@ export function createAuthRouter({ db }) {
     const token = bearerToken(req);
     const user = token ? findSessionUser(db, token) : null;
     if (!user) {
-      return res.status(401).json({ ok: false, error: 'Authentication required.' });
+      return res.status(401).json({
+        ok: false,
+        code: 'AUTH_REQUIRED',
+        error: 'Authentication required.',
+      });
     }
     return res.json({ ok: true, user: publicUser(user) });
   });

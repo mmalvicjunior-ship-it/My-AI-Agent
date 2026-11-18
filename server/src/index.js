@@ -252,6 +252,84 @@ export function createApp(options = {}) {
     res.status(201).json({ ok: true, project: { id, name } });
   });
 
+  // --- Allowed import folders (read-only picker for project creation) ------
+  // Lists directories only, and only inside PROJECT_IMPORT_ROOT. This keeps
+  // the folder picker useful without exposing the rest of the filesystem.
+  app.get('/api/projects/browse', (req, res) => {
+    const configuredRoot = typeof rawImportRoot === 'string' ? rawImportRoot.trim() : '';
+    if (!configuredRoot) {
+      return res.status(403).json({
+        ok: false,
+        code: 'IMPORT_DISABLED',
+        error: 'Importing existing folders is disabled. Set PROJECT_IMPORT_ROOT on the server to an allowed parent folder, then restart the server.',
+      });
+    }
+
+    const importRoot = realOrResolved(configuredRoot);
+    const workspaceRootReal = realOrResolved(config.workspaceRoot);
+    const databaseDirReal = path.dirname(realOrResolved(config.databasePath));
+    // The picker must never expose the managed workspaces or server secrets,
+    // and must not be the parent of either.
+    if (isPathInside(importRoot, workspaceRootReal)
+      || isPathInside(workspaceRootReal, importRoot)
+      || isPathInside(importRoot, databaseDirReal)
+      || isPathInside(databaseDirReal, importRoot)) {
+      return res.status(403).json({
+        ok: false,
+        code: 'IMPORT_UNSAFE',
+        error: 'PROJECT_IMPORT_ROOT must be a dedicated folder outside the managed workspace and database directories.',
+      });
+    }
+
+    let target = importRoot;
+    if (req.query.path !== undefined) {
+      if (typeof req.query.path !== 'string' || !path.isAbsolute(req.query.path)) {
+        return res.status(400).json({ ok: false, error: 'Folder path must be an absolute directory path.' });
+      }
+      try {
+        target = fs.realpathSync(req.query.path);
+      } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+          return res.status(404).json({ ok: false, error: 'Folder was not found.' });
+        }
+        return res.status(400).json({ ok: false, error: 'Folder could not be opened.' });
+      }
+    }
+
+    if (!isPathInside(importRoot, target)) {
+      return res.status(403).json({ ok: false, error: 'Folder is outside the allowed import root.' });
+    }
+    try {
+      if (!fs.statSync(target).isDirectory()) {
+        return res.status(400).json({ ok: false, error: 'Selected path is not a folder.' });
+      }
+      const directories = fs.readdirSync(target, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .slice(0, 300)
+        .map((entry) => {
+          const absolute = path.join(target, entry.name);
+          let inside = false;
+          try {
+            inside = isPathInside(importRoot, fs.realpathSync(absolute));
+          } catch {
+            inside = false;
+          }
+          return { name: entry.name, path: absolute, selectable: inside };
+        })
+        .filter((entry) => entry.selectable);
+      return res.json({
+        ok: true,
+        root: importRoot,
+        path: target,
+        parent: target === importRoot ? null : path.dirname(target),
+        directories,
+      });
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: 'Folder could not be read.' });
+    }
+  });
+
   // --- Project files (path-safe; confined to the project workspace) --------
   app.use('/api/projects', createFilesRouter({ db, tools: workspaceTools }));
 

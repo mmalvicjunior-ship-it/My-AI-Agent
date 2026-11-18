@@ -15,10 +15,13 @@ import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createTaskRunner } from '../src/tasks/runner.js';
 import { createTaskExecutor } from '../src/tasks/executor.js';
 import {
+  appendStep,
   createTask,
   getTask,
   listSteps,
+  loadPlan,
   requestCancel,
+  savePlan,
 } from '../src/tasks/store.js';
 
 const db = openDb();
@@ -43,6 +46,21 @@ function makeProvider(chat, overrides = {}) {
     chat,
     ...overrides,
   };
+}
+
+function makePlanProvider(plan) {
+  let calls = 0;
+  return makeProvider(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        text: JSON.stringify({ summary: 'Inspected workspace.', needsChanges: true }),
+        provider: 'fake',
+        model: 'fake-1',
+      };
+    }
+    return { text: JSON.stringify(plan), provider: 'fake', model: 'fake-1' };
+  });
 }
 
 function makeExecutor(provider, options = {}) {
@@ -411,4 +429,298 @@ test('a model-supplied projectId cannot read another project', async () => {
   assert.equal(fs.existsSync(path.join(owner.root, 'foreign.txt')), false);
   const steps = listSteps(db, task.id);
   assert.ok(steps.every((step) => !String(step.detail || '').includes('FOREIGN_SECRET_CONTENT')));
+});
+
+test('refreshes saved plan progress during finalize without a ReferenceError', async () => {
+  const project = makeProject('plan-progress');
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Continue planned work.',
+    autonomy: 'propose',
+  });
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Continue a three-step plan',
+    steps: [
+      { tool: 'read_file', path: 'one.js', goal: 'one' },
+      { tool: 'read_file', path: 'two.js', goal: 'two' },
+      { tool: 'read_file', path: 'three.js', goal: 'three' },
+    ],
+    currentStep: 0,
+    repairAttempt: 0,
+    proposals: [],
+  });
+
+  let providerCalls = 0;
+  const provider = makeProvider(async () => {
+    providerCalls += 1;
+    return { text: 'The provider should not be called during finalize.' };
+  });
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => appendStep(db, task.id, step),
+    phase: 'finalize',
+  });
+
+  assert.equal(providerCalls, 0);
+  assert.equal(result.status, 'waiting_approval');
+
+  const saved = loadPlan(db, task.id);
+  assert.equal(saved.currentStep, 1);
+  assert.equal(saved.repairAttempt, 0);
+  assert.equal(saved.summary, 'Continue a three-step plan');
+  assert.equal(saved.steps.length, 3);
+
+  const steps = listSteps(db, task.id);
+  assert.equal(steps.some((step) => step.title === 'Run failed'), false);
+  const continuation = steps.find((step) => step.title === 'Continuation');
+  assert.ok(continuation);
+  assert.equal(continuation.status, 'done');
+  assert.match(continuation.detail, /Plan step 2 of 3/);
+  const resultStep = steps.find((step) => step.kind === 'result');
+  assert.ok(resultStep);
+  assert.equal(resultStep.status, 'done');
+});
+
+test('finalizes a completed plan when no steps or repair attempts remain', async () => {
+  const project = makeProject('plan-complete');
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Finish planned work.',
+    autonomy: 'propose',
+  });
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Completed plan',
+    steps: [{ tool: 'read_file', path: 'only.js', goal: 'only' }],
+    currentStep: 0,
+    repairAttempt: 3,
+    proposals: [],
+  });
+
+  let providerCalls = 0;
+  const provider = makeProvider(async () => {
+    providerCalls += 1;
+    return { text: 'The provider should not be called during finalize.' };
+  });
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => appendStep(db, task.id, step),
+    phase: 'finalize',
+  });
+
+  assert.equal(providerCalls, 0);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.error, null);
+
+  const saved = loadPlan(db, task.id);
+  assert.equal(saved.currentStep, 0);
+  assert.equal(saved.repairAttempt, 3);
+
+  const steps = listSteps(db, task.id);
+  assert.ok(steps.some((step) => step.kind === 'result' && step.title === 'Result ready'));
+  assert.equal(steps.some((step) => step.title === 'Continuation'), false);
+});
+
+test('reports finalize failures honestly without claiming completion', async () => {
+  const project = makeProject('plan-failure');
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Finish planned work with a staging failure.',
+    autonomy: 'propose',
+  });
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Plan with a staging failure',
+    steps: [{ tool: 'read_file', path: 'only.js', goal: 'only' }],
+    currentStep: 0,
+    repairAttempt: 3,
+    proposals: [],
+    stagingFailures: ['File change src/missing.js could not be staged: blocked by guard'],
+  });
+
+  let providerCalls = 0;
+  const provider = makeProvider(async () => {
+    providerCalls += 1;
+    return { text: 'The provider should not be called during finalize.' };
+  });
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => appendStep(db, task.id, step),
+    phase: 'finalize',
+  });
+
+  assert.equal(providerCalls, 0);
+  assert.equal(result.status, 'failed');
+  assert.match(result.error, /One or more proposed steps were rejected, failed, or had an unknown outcome/);
+
+  const steps = listSteps(db, task.id);
+  const resultStep = steps.find((step) => step.kind === 'result');
+  assert.ok(resultStep);
+  assert.match(resultStep.detail, /^Task incomplete\./);
+  assert.match(resultStep.detail, /blocked by guard/);
+  assert.equal(steps.some((step) => step.title === 'Continuation'), false);
+});
+
+test('autonomous task leaves a staged file create pending and unapplied', async () => {
+  const project = makeProject('phase2-create');
+  const provider = makePlanProvider({
+    summary: 'Create a new file',
+    changes: [{
+      kind: 'create',
+      path: 'created-by-task.js',
+      content: 'export const value = 1;\n',
+      goal: 'create file',
+    }],
+    commands: [],
+  });
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Create created-by-task.js.',
+    autonomy: 'approved_autonomous',
+    autonomous: true,
+  });
+  const steps = [];
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => steps.push(step),
+    phase: 'plan',
+  });
+
+  assert.equal(result.status, 'waiting_approval');
+  assert.equal(proposalCount(project.id), 1);
+  const proposal = db
+    .prepare('SELECT kind, status, path FROM proposals WHERE project_id = ?')
+    .get(project.id);
+  assert.equal(proposal.kind, 'create');
+  assert.equal(proposal.status, 'pending');
+  assert.equal(proposal.path, 'created-by-task.js');
+  assert.equal(fs.existsSync(path.join(project.root, 'created-by-task.js')), false);
+  assert.equal(steps.some((step) => step.title === 'Auto-applied proposal'), false);
+  assert.ok(steps.some((step) => step.title === 'Waiting for approval'));
+});
+
+test('autonomous task leaves a staged file edit pending and does not modify the file', async () => {
+  const project = makeProject('phase2-edit');
+  const original = 'export const value = 0;\n';
+  fs.writeFileSync(path.join(project.root, 'existing.js'), original);
+  const provider = makePlanProvider({
+    summary: 'Edit an existing file',
+    changes: [{
+      kind: 'update',
+      path: 'existing.js',
+      content: 'export const value = 1;\n',
+      goal: 'update value',
+    }],
+    commands: [],
+  });
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Update existing.js.',
+    autonomy: 'allow_writes_and_commands',
+    autonomous: true,
+  });
+  const steps = [];
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => steps.push(step),
+    phase: 'plan',
+  });
+
+  assert.equal(result.status, 'waiting_approval');
+  const proposal = db
+    .prepare('SELECT kind, status FROM proposals WHERE project_id = ?')
+    .get(project.id);
+  assert.equal(proposal.kind, 'update');
+  assert.equal(proposal.status, 'pending');
+  assert.equal(fs.readFileSync(path.join(project.root, 'existing.js'), 'utf8'), original);
+  assert.equal(steps.some((step) => step.title === 'Auto-applied proposal'), false);
+});
+
+test('autonomous task leaves a staged command pending and does not execute it', async () => {
+  const project = makeProject('phase2-command');
+  fs.writeFileSync(path.join(project.root, 'marker.js'), "require('fs').writeFileSync('WAS_EXECUTED', 'yes');\n");
+  fs.writeFileSync(
+    path.join(project.root, 'package.json'),
+    `${JSON.stringify({ scripts: { test: 'node marker.js' } }, null, 2)}\n`,
+  );
+  const provider = makePlanProvider({
+    summary: 'Run the project tests',
+    changes: [],
+    commands: [{ command: 'npm_test', goal: 'verify the change' }],
+  });
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Run the tests.',
+    autonomy: 'approved_autonomous',
+    autonomous: true,
+  });
+  const steps = [];
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => steps.push(step),
+    phase: 'plan',
+  });
+
+  assert.equal(result.status, 'waiting_approval');
+  const proposal = db
+    .prepare('SELECT kind, status, result_json FROM proposals WHERE project_id = ?')
+    .get(project.id);
+  assert.equal(proposal.kind, 'command');
+  assert.equal(proposal.status, 'pending');
+  assert.equal(proposal.result_json, null);
+  assert.equal(fs.existsSync(path.join(project.root, 'WAS_EXECUTED')), false);
+  assert.equal(steps.some((step) => step.title === 'Auto-applied proposal'), false);
+});
+
+test('autonomous tasks still receive only the read-only provider tool surface', async () => {
+  const project = makeProject('phase2-readonly');
+  fs.writeFileSync(path.join(project.root, 'file.js'), 'export const value = 1;\n');
+  let declarationNames = [];
+  let refusedError = null;
+  const provider = makeProvider(async ({ tools, projectId }) => {
+    declarationNames = tools.declarations
+      .flatMap((group) => group.functionDeclarations.map((declaration) => declaration.name))
+      .sort();
+    try {
+      await tools.execute('create_file', {
+        projectId,
+        path: 'blocked.js',
+        content: 'This must never be staged by a direct tool call.',
+      });
+    } catch (error) {
+      refusedError = error;
+    }
+    return {
+      text: 'Read-only inspection complete.',
+      provider: 'fake',
+      model: 'fake-1',
+    };
+  });
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Inspect the project.',
+    autonomy: 'approved_autonomous',
+    autonomous: true,
+  });
+  const steps = [];
+
+  const result = await makeExecutor(provider)({
+    task,
+    addStep: (step) => steps.push(step),
+    phase: 'plan',
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(declarationNames, ['list_files', 'read_file', 'search_files']);
+  assert.equal(refusedError?.status, 403);
+  assert.equal(fs.existsSync(path.join(project.root, 'blocked.js')), false);
+  assert.equal(proposalCount(project.id), 0);
+  assert.ok(steps.some((step) => step.title === 'Refused create_file'));
 });

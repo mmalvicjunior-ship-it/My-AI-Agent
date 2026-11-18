@@ -13,12 +13,11 @@
 // Retry policy: at most three provider attempts (two retries) for transient
 // failures only (HTTP 429, 502, 504). Auth/configuration errors, malformed
 // responses, tool-support failures, and cancellation are never retried.
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { redactSecrets } from '../config.js';
 import { supportsWorkspaceTools } from '../ai/index.js';
-import { WorkspaceError, isSensitiveFile, isProtectedDeploymentConfig } from '../workspace/files.js';
-import { loadPlan, savePlan } from './store.js';
+import { WorkspaceError } from '../workspace/files.js';
+import { loadPlan, refreshPlanProgress, savePlan } from './store.js';
 import { describePlan, sanitizePlan, buildPlanMetadata, parseJsonReply } from './plan.js';
 
 const READ_ONLY_TOOLS = new Set(['read_file', 'list_files', 'search_files']);
@@ -386,10 +385,13 @@ export function createTaskExecutor({
     addStep({
       kind: 'note',
       title: 'Agent started',
-      detail: `${providerLabel} (${provider.model || 'unknown model'}); ${isAutonomous ? 'autonomous mode — edits and commands enabled within workspace limits' : 'read-only inspection'}. Autonomy "${task.autonomy}" is recorded.`,
+      detail: `${providerLabel} (${provider.model || 'unknown model'}); ${isAutonomous ? 'autonomous planning — research may continue, proposals still require approval' : 'read-only inspection'}. Autonomy "${task.autonomy}" is recorded.`,
     });
 
-    const activeTools = isAutonomous ? tools : createReadOnlyTools({
+    // Autonomy may extend planning and research, but it never grants the
+    // provider direct write or command tools. The provider always receives the
+    // read-only surface; structured plans still stage proposals separately.
+    const activeTools = createReadOnlyTools({
       tools,
       projectId: project.id,
       addStep,
@@ -880,86 +882,10 @@ export function createTaskExecutor({
     }
     savePlan(db, task.id, planMeta);
 
-    // If proposals were staged, the task must wait for approval.
-    // The runner will observe the waiting_approval status and resume only
-    // once the linked proposals reach a terminal outcome.
-    // If proposals were staged, the task must wait for approval (approval mode)
-    // or apply them automatically (autonomous mode). The isAutonomous flag from
-    // above (line ~385) is reused so the function scope stays consistent.
+    // Staged proposals always require an explicit user decision. Autonomy may
+    // allow the agent to keep researching and preparing proposals, but it never
+    // authorizes applying files or executing commands on its own.
     if (proposalIds.length > 0) {
-      if (isAutonomous) {
-        // Autonomous mode: apply staged proposals automatically (bounded loop)
-        let anyApprovalRequired = false;
-        for (const entry of proposalIds) {
-          const proposalId = typeof entry === 'object' ? entry.id : entry;
-          if (!proposalId) continue;
-          try {
-            const proposal = db.prepare('SELECT id, kind, project_id, path, command, status FROM proposals WHERE id = ?').get(proposalId);
-            if (proposal && proposal.status === 'pending' && proposal.project_id === Number(project.id)) {
-              if (proposal.kind === 'command' && !['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check'].includes(proposal.command)) {
-                anyApprovalRequired = true;
-                addStep({
-                  kind: 'note',
-                  title: 'Approval required for command',
-                  detail: `Command "${proposal.command}" requires explicit user approval.`,
-                  status: 'pending',
-                });
-                continue;
-              }
-              if (proposal.kind !== 'command' && (isSensitiveFile(path.basename(proposal.path)) || isProtectedDeploymentConfig(proposal.path))) {
-                anyApprovalRequired = true;
-                addStep({
-                  kind: 'note',
-                  title: 'Approval required for sensitive file',
-                  detail: `File "${proposal.path}" modifies credentials or deployment settings and requires explicit user approval.`,
-                  status: 'pending',
-                });
-                continue;
-              }
-              if (proposal.kind === 'command') {
-                await tools.runApprovedCommand(project.id, proposalId);
-              } else {
-                await tools.applyProposal(project.id, proposalId);
-              }
-              addStep({ kind: 'note', title: 'Auto-applied proposal', detail: `Applied proposal ${proposalId} (${proposal.kind}).`, status: 'done' });
-            }
-          } catch (applyErr) {
-            addStep({ kind: 'note', title: 'Auto-apply failed', detail: clip(redactSecrets(applyErr?.message || String(applyErr)), MAX_STEP_DETAIL_CHARS), status: 'failed' });
-          }
-        }
-        if (anyApprovalRequired) {
-          addStep({
-            kind: 'note',
-            title: 'Waiting for approval',
-            detail: 'Actions outside the low-risk autonomous scope were staged and require explicit user review.',
-          });
-          return { status: 'waiting_approval' };
-        }
-        // After autonomous application, finalize based on proposal outcomes
-        const terminalIds = proposalIds.map((entry) => (typeof entry === 'object' ? entry.id : entry)).filter(Boolean);
-        const appliedCount = terminalIds.filter((pid) => {
-          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
-          return row && row.status === 'applied';
-        }).length;
-        const failedCount = terminalIds.filter((pid) => {
-          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
-          return row && row.status === 'failed';
-        }).length;
-        const interruptedCount = terminalIds.filter((pid) => {
-          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
-          return row && row.status === 'interrupted';
-        }).length;
-        const rejectedCount = terminalIds.filter((pid) => {
-          const row = db.prepare('SELECT status FROM proposals WHERE id = ?').get(pid);
-          return row && row.status === 'rejected';
-        }).length;
-        const incomplete = failedCount > 0 || interruptedCount > 0 || rejectedCount > 0 || appliedCount < terminalIds.length;
-        const failureMessage = incomplete ? clip(
-          `Autonomous execution: applied=${appliedCount}, failed=${failedCount}, interrupted=${interruptedCount}, rejected=${rejectedCount}, total=${terminalIds.length}.`,
-          MAX_RESULT_CHARS
-        ) : null;
-        return { status: incomplete ? 'failed' : 'completed', error: failureMessage, outcome: { applied: appliedCount, total: terminalIds.length } };
-      }
       addStep({
         kind: 'note',
         title: 'Waiting for approval',

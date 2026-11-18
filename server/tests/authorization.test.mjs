@@ -10,7 +10,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
-import { createTask } from '../src/tasks/store.js';
+import { createTask, savePlan } from '../src/tasks/store.js';
 
 const tempDirs = [];
 let server;
@@ -94,6 +94,13 @@ before(async () => {
     kind: 'create',
     path: 'private.js',
     content: 'export const secret = true;\n',
+  });
+  savePlan(db, bobTask.id, {
+    version: 1,
+    summary: 'Waiting for approval',
+    proposals: [{ id: bobProposal.id }],
+    currentStep: 0,
+    repairAttempt: 0,
   });
 });
 
@@ -198,6 +205,19 @@ test('a user cannot create, list, inspect, or cancel another user tasks', async 
   const owned = await request('GET', `/api/tasks/${bobTask.id}`, { token: bob.token });
   assert.equal(owned.status, 200);
   assert.equal(owned.data.task.id, bobTask.id);
+});
+
+test("a user cannot read another user's task proposal projection", async () => {
+  const foreign = await request('GET', `/api/tasks/${bobTask.id}`, { token: alice.token });
+  assert.equal(foreign.status, 404);
+  assert.equal(foreign.data.ok, false);
+  assert.equal('proposals' in foreign.data, false);
+
+  const owned = await request('GET', `/api/tasks/${bobTask.id}`, { token: bob.token });
+  assert.equal(owned.status, 200);
+  assert.equal(owned.data.proposals.length, 1);
+  assert.equal(owned.data.proposals[0].proposalId, bobProposal.id);
+  assert.equal(owned.data.proposals[0].status, 'pending');
 });
 
 test('chat does not arm workspace tools for another user project', async () => {

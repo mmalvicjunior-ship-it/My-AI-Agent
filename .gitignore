@@ -52,3 +52,6 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Python virtual environments (local tooling only)
+.venv/

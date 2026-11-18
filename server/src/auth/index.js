@@ -151,7 +151,13 @@ export function requireAuth(db) {
     const token = bearerToken(req);
     const user = token ? findSessionUser(db, token) : null;
     if (!user) {
-      return res.status(401).json({ ok: false, error: 'Authentication required.' });
+      // `code` lets the web client tell a real session failure apart from an
+      // upstream AI provider that also answers 401 (see /api/chat).
+      return res.status(401).json({
+        ok: false,
+        code: 'AUTH_REQUIRED',
+        error: 'Authentication required.',
+      });
     }
     req.user = user;
     req.authToken = token;

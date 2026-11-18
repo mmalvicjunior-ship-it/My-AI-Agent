@@ -90,3 +90,63 @@ test('.env.example documents both independent provider credential pairs', () => 
     assert.match(example, new RegExp(`^${key}=`, 'm'), `${key} is missing from .env.example`);
   }
 });
+
+test('backend auth router registers the documented email/password and Google routes', () => {
+  const auth = read('server/src/routes/auth.js');
+  const routes = [...auth.matchAll(/router\.(?:get|post|put|patch|delete)\('([^']+)'/g)]
+    .map((match) => match[1])
+    .sort();
+  assert.deepEqual(routes, ['/google/callback', '/google/start', '/login', '/logout', '/me', '/register']);
+});
+
+test('frontend exposes email/password and Google authentication', () => {
+  const authScreen = read('apps/web/src/AuthScreen.jsx');
+  const app = read('apps/web/src/App.jsx');
+
+  assert.match(authScreen, /\/api\/auth\/\$\{mode\}/);
+  assert.match(authScreen, /useState\('login'\)/);
+  assert.match(authScreen, /const isRegister = mode === 'register'/);
+  assert.match(authScreen, /type="email"/);
+  assert.match(authScreen, /type=\{showPassword \? 'text' : 'password'\}/);
+  assert.match(authScreen, /\/api\/auth\/google\/start/);
+  assert.match(authScreen, /Continue with Google/);
+
+  assert.match(app, /\/api\/auth\/me/);
+  assert.match(app, /\/api\/auth\/logout/);
+});
+
+test('frontend and backend authentication endpoints agree', () => {
+  const sources = ['apps/web/src/App.jsx', 'apps/web/src/AuthScreen.jsx'].map(read).join('\n');
+  const endpoints = [...sources.matchAll(/\/api\/auth\/([a-z][a-z0-9-]*)/gi)]
+    .map((match) => match[1].toLowerCase());
+  const allowed = new Set(['register', 'login', 'logout', 'me', 'google']);
+
+  for (const endpoint of endpoints) {
+    assert.ok(allowed.has(endpoint), `unexpected frontend auth endpoint: ${endpoint}`);
+  }
+  assert.ok(endpoints.includes('me'));
+  assert.ok(endpoints.includes('logout'));
+
+  const auth = read('server/src/routes/auth.js');
+  for (const route of ['/register', '/login', '/logout', '/me']) {
+    assert.match(auth, new RegExp(`router\\.(?:get|post)\\('${route.replace('/', '\\/')}'`));
+  }
+});
+
+test('deployment configuration keeps Google OAuth optional and secret-free', () => {
+  const example = read('.env.example');
+  for (const key of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_OAUTH_REDIRECT_URI', 'APP_ORIGIN']) {
+    assert.match(example, new RegExp(`^${key}=$`, 'm'), `${key} must be documented with an empty default in .env.example`);
+  }
+  assert.doesNotMatch(example, /GOOGLE_CLIENT_SECRET=\S+/, '.env.example must not contain a real Google client secret');
+});
+
+test('generated frontend assets contain no credential patterns', () => {
+  const assetsDir = path.join(projectRoot, 'apps', 'web', 'dist', 'assets');
+  if (!fs.existsSync(assetsDir)) return;
+
+  for (const name of fs.readdirSync(assetsDir).filter((entry) => entry.endsWith('.js'))) {
+    const bundle = fs.readFileSync(path.join(assetsDir, name), 'utf8');
+    assert.doesNotMatch(bundle, /AIza[0-9A-Za-z_-]{20,}|\bsk-[A-Za-z0-9_-]{8,}/, `${name} must not contain credential patterns`);
+  }
+});

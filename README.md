@@ -261,19 +261,21 @@ A coding task can be queued through the API and runs in the backend process,
 independently of the browser tab that created it:
 
 ```text
-POST /api/tasks                     { projectId, instruction, autonomy? }
+POST /api/tasks                     { projectId, instruction }
 GET  /api/tasks?projectId=1         list, newest first (optionally &status=&limit=)
 GET  /api/tasks/:id                 task plus its ordered execution steps
 POST /api/tasks/:id/cancel          stop a queued, running, or waiting task
 ```
 
-Statuses are `queued`, `running`, `waiting_approval`, `completed`, `failed`, and
-`cancelled`; the default autonomy is `allow_writes_and_commands` (see
-`server/src/tasks/store.js` for the three levels). Workspace inspection tools
-remain read-only; file changes and allowlisted commands are staged as proposals
-and always require the existing explicit approval workflow. The autonomy level
-does not bypass that approval. Tasks and steps are stored in SQLite, so status and
-history survive a restart. A task that was `running` when the server stopped is
+`POST /api/tasks` always uses the server-controlled `propose` default; any
+`autonomy` or `autonomous` fields in the request body are ignored for execution
+privileges. Statuses are `queued`, `running`, `waiting_approval`,
+`provider_paused`, `completed`, `failed`, and `cancelled`. Autonomy may let a
+background task continue planning, research, and reading, but it never grants
+write or command privileges. All AI-proposed file changes and commands are
+staged as proposals and require explicit user approval. Tasks and steps are
+stored in SQLite, so status and history survive a restart. A task that was
+`running` when the server stopped is
 marked `failed` with an "interrupted" reason and is never resumed
 automatically: the last step may not have completed, so re-running it could
 apply the same change twice. A queued task is cancelled immediately; a running

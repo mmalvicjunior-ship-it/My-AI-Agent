@@ -48,6 +48,37 @@ test('waiting_approval tasks survive recoverInterrupted unchanged', () => {
   assert.deepEqual(JSON.parse(row.plan_json || '{}'), { currentStep: 0, repairAttempt: 1 });
 });
 
+test('a waiting task with a pending proposal stays unapplied after recovery', () => {
+  const proj = makeProject('recovery-pending-proposal');
+  const db = openDb();
+  const task = createTask(db, { projectId: proj.id, instruction: 'wait for proposal approval' });
+  const proposalId = 'phase2-pending-proposal';
+  const target = path.join(proj.root, 'pending.js');
+  const original = 'export const value = 0;\n';
+  fs.writeFileSync(target, original);
+
+  db.prepare(`
+    INSERT INTO proposals
+      (id, project_id, kind, path, content, original_content, diff, status)
+    VALUES (?, ?, 'update', ?, ?, ?, ?, 'pending')
+  `).run(proposalId, proj.id, 'pending.js', 'export const value = 1;\n', original, 'review diff');
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Waiting for user approval',
+    proposals: [{ id: proposalId }],
+    currentStep: 0,
+    repairAttempt: 0,
+  });
+  db.prepare("UPDATE tasks SET status = 'waiting_approval' WHERE id = ?").run(task.id);
+
+  const runner = createTaskRunner({ db, logger: silentLogger });
+  assert.equal(runner.recoverInterrupted(), 0);
+  assert.equal(getTask(db, task.id).status, 'waiting_approval');
+  const proposal = db.prepare('SELECT status FROM proposals WHERE id = ?').get(proposalId);
+  assert.equal(proposal.status, 'pending');
+  assert.equal(fs.readFileSync(target, 'utf8'), original);
+});
+
 test('bounded repair caps repairAttempt at 3', async () => {
   const { advancePlanProgress } = await import('../src/tasks/store.js');
   const proj = makeProject('recovery-cap');

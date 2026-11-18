@@ -1,17 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
-import hljs from 'highlight.js/lib/core';
-import javascript from 'highlight.js/lib/languages/javascript';
-import typescript from 'highlight.js/lib/languages/typescript';
-import python from 'highlight.js/lib/languages/python';
-import json from 'highlight.js/lib/languages/json';
-import bash from 'highlight.js/lib/languages/bash';
-import css from 'highlight.js/lib/languages/css';
-import xml from 'highlight.js/lib/languages/xml';
-import sql from 'highlight.js/lib/languages/sql';
+import hljs from './highlight';
 import TaskCenter from './TaskCenter';
 import AuthScreen from './AuthScreen';
+import ProjectDialog from './ProjectDialog';
+import WorkspaceFiles from './WorkspaceFiles';
+import { isSessionExpiredResponse } from './authResponse';
 
 const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
 const AUTH_KEY = 'myai.auth.v1';
@@ -68,17 +63,6 @@ function stepStatusClass(status) {
   return map[status] || 'step-unknown';
 }
 
-[
-  ['javascript', javascript],
-  ['typescript', typescript],
-  ['python', python],
-  ['json', json],
-  ['bash', bash],
-  ['css', css],
-  ['xml', xml],
-  ['sql', sql],
-].forEach(([name, language]) => hljs.registerLanguage(name, language));
-
 // Chat history is namespaced per authenticated account so two accounts that
 // share a browser never see each other's conversations. The legacy global
 // key is migrated into the signed-in account's namespace on first load.
@@ -91,6 +75,31 @@ const PROVIDER_KEY = 'myai.provider';
 const MAX_CHARS = 20_000;
 const CHAT_PROVIDER_IDS = new Set(['openai', 'gemini']);
 const PROVIDER_LABELS = { openai: 'OpenRouter', gemini: 'Google Gemini' };
+const ACTIVE_PROJECT_KEY = 'myai.active-project.v1';
+
+function activeProjectStorageKey(userId) {
+  return userId === null || userId === undefined
+    ? `${ACTIVE_PROJECT_KEY}.anonymous`
+    : `${ACTIVE_PROJECT_KEY}.${userId}`;
+}
+
+function readActiveProjectId(userId) {
+  try {
+    return localStorage.getItem(activeProjectStorageKey(userId)) || '';
+  } catch {
+    return '';
+  }
+}
+
+function persistActiveProjectId(userId, projectId) {
+  try {
+    const key = activeProjectStorageKey(userId);
+    if (projectId) localStorage.setItem(key, String(projectId));
+    else localStorage.removeItem(key);
+  } catch {
+    /* The selection still works for this page even if storage is unavailable. */
+  }
+}
 
 function readProvider() {
   try {
@@ -103,10 +112,10 @@ function readProvider() {
 }
 
 const starters = [
-  { icon: '⚡', title: 'Generate code', prompt: 'Write a small, well-documented utility function for a common programming task.' },
-  { icon: '⌕', title: 'Debug & fix', prompt: 'I’m seeing an unexpected bug. Help me identify the likely cause and suggest a practical fix.' },
-  { icon: '▤', title: 'Explain a concept', prompt: 'Explain a technical concept clearly, with a practical example.' },
-  { icon: '✳', title: 'Brainstorm ideas', prompt: 'Help me brainstorm a few creative ideas for a project I’m working on.' },
+  { icon: '⌕', title: 'Explore this project', hint: 'Structure, entry points and how to run it', prompt: 'Inspect this project. Summarize its structure, main entry points, and how to run it. Then suggest the most useful next step.' },
+  { icon: '◈', title: 'Plan a feature', hint: 'Files to change and the steps to get there', prompt: 'Help me plan a small feature for this project. Inspect the relevant files first, then outline the files to change and the steps to implement it.' },
+  { icon: '⚒', title: 'Fix a bug', hint: 'Find the cause, then propose a focused fix', prompt: 'I have a bug in this project. Inspect the code, identify the likely cause, and propose a focused fix. Do not change files until I approve.' },
+  { icon: '✓', title: 'Add tests', hint: 'Cover important behaviour, approval first', prompt: 'Inspect this project and propose tests for its most important behavior. Explain what each test covers and wait for approval before writing files.' },
 ];
 
 const initialSession = () => ({
@@ -183,28 +192,6 @@ function formatMarkdown(content) {
     USE_PROFILES: { html: true },
     ADD_ATTR: ['class', 'aria-label'],
   });
-}
-
-function CodeViewer({ content, filePath }) {
-  const extension = filePath?.split('.').pop()?.toLowerCase();
-  const language = ({
-    js: 'javascript',
-    jsx: 'javascript',
-    mjs: 'javascript',
-    cjs: 'javascript',
-    ts: 'typescript',
-    tsx: 'typescript',
-    py: 'python',
-    json: 'json',
-    html: 'xml',
-    htm: 'xml',
-    css: 'css',
-    sql: 'sql',
-  })[extension];
-  const highlighted = language
-    ? hljs.highlight(content, { language, ignoreIllegals: true }).value
-    : hljs.highlightAuto(content).value;
-  return <pre><code className={language ? `language-${language}` : undefined} dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>;
 }
 
 function diffPreviewLines(originalContent = '', proposedContent = '') {
@@ -367,24 +354,45 @@ function App() {
   const [retryRequest, setRetryRequest] = useState(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileContent, setFileContent] = useState('');
   const [fileSearch, setFileSearch] = useState('');
   const [codeSearchResults, setCodeSearchResults] = useState([]);
-  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(() => window.matchMedia('(min-width: 1101px)').matches);
+  const [workspaceTab, setWorkspaceTab] = useState('files');
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectBusy, setProjectBusy] = useState(false);
+  const [projectError, setProjectError] = useState(null);
+  const [focusTaskId, setFocusTaskId] = useState(null);
   const [taskInput, setTaskInput] = useState('');
   const [tasks, setTasks] = useState([]);
+  const [projectProposals, setProjectProposals] = useState([]);
+  const [taskStatusFilter, setTaskStatusFilter] = useState(null);
   const [tasksError, setTasksError] = useState(null);
   const [taskLoading, setTaskLoading] = useState(false);
   const [taskSubmitting, setTaskSubmitting] = useState(false);
   const [taskDetail, setTaskDetail] = useState(null);
   const [taskDetailError, setTaskDetailError] = useState(null);
-  const [taskPollInterval, setTaskPollInterval] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [diffPreview, setDiffPreview] = useState(false);
   const [auth, setAuth] = useState(() => readStoredAuth());
   const [authChecking, setAuthChecking] = useState(() => Boolean(readStoredAuth()));
   const authRef = useRef(auth);
+  const authUserId = auth?.user?.id ?? null;
+  const activeProject = projects.find((project) => String(project.id) === String(projectId)) || null;
+  const waitingTaskCount = tasks.filter((task) => task.status === 'waiting_approval').length;
+  // Keep the latest task query inputs available to the stable loadTasks
+  // callback so automatic loads do not re-run when only the filter changes.
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
+  const taskStatusFilterRef = useRef(taskStatusFilter);
+  taskStatusFilterRef.current = taskStatusFilter;
+  const taskLoadScopeRef = useRef(null);
+  const taskLoadGenerationRef = useRef(0);
+  const workspaceRequestRef = useRef(0);
+  const searchRequestRef = useRef(0);
+  const taskDetailRequestRef = useRef(0);
   const messageListRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
@@ -411,24 +419,44 @@ function App() {
       }
     }
     applyAuth(null);
+    persistActiveProjectId(current?.user?.id ?? null, '');
     setProjects([]);
     setProjectId('');
     setWorkspaceFiles([]);
     setSelectedFile(null);
     setFileContent('');
+    setFileSearch('');
+    setCodeSearchResults([]);
+    setProjectDialogOpen(false);
+    setProjectError(null);
     setTasks([]);
+    setProjectProposals([]);
+    setTaskStatusFilter(null);
     setTaskDetail(null);
-    setTaskCenterOpen(false);
+    setFocusTaskId(null);
   }, [applyAuth]);
 
   // Every API call goes through here so the bearer token is attached in one
-  // place. A 401 (expired or revoked session) returns to the sign-in screen.
+  // place. Only a genuine session 401 returns to the sign-in screen: /api/chat
+  // also relays the AI provider's 401 when its own key is rejected, and that
+  // must surface as an error in the conversation instead of signing the user
+  // out. Non-JSON 401 bodies still count as session failures off /api/chat.
   const apiFetch = useCallback(async (input, init = {}) => {
     const headers = new Headers(init.headers || {});
     const current = authRef.current;
     if (current?.token) headers.set('Authorization', `Bearer ${current.token}`);
     const response = await globalThis.fetch(input, { ...init, headers });
-    if (response.status === 401 && current) applyAuth(null);
+    if (response.status === 401 && current) {
+      let code = null;
+      try {
+        code = (await response.clone().json())?.code ?? null;
+      } catch {
+        /* Body was not JSON; fall back to the request path. */
+      }
+      if (isSessionExpiredResponse({ status: response.status, code, url: String(input) })) {
+        applyAuth(null);
+      }
+    }
     return response;
   }, [applyAuth]);
 
@@ -437,6 +465,9 @@ function App() {
   }, [auth]);
 
   // Verify a stored token once on load instead of trusting localStorage blindly.
+  // Only an explicit 401 ends the session. A network failure or a 5xx while the
+  // server restarts keeps the stored token so a refresh does not log the user
+  // out; the next authenticated request will confirm the session.
   useEffect(() => {
     const current = readStoredAuth();
     if (!current?.token) {
@@ -450,10 +481,15 @@ function App() {
           headers: { Authorization: `Bearer ${current.token}` },
         });
         const data = await response.json().catch(() => null);
-        if (!response.ok || !data?.ok || !data.user) throw new Error('Session expired.');
-        if (!cancelled) applyAuth({ ...current, user: data.user });
+        if (cancelled) return;
+        if (response.status === 401) {
+          applyAuth(null);
+        } else if (response.ok && data?.ok && data.user) {
+          applyAuth({ ...current, user: data.user });
+        }
+        // Otherwise keep the stored session and retry implicitly later.
       } catch {
-        if (!cancelled) applyAuth(null);
+        /* Server unreachable: keep the stored session. */
       } finally {
         if (!cancelled) setAuthChecking(false);
       }
@@ -491,7 +527,6 @@ function App() {
   // account can never reveal the previous account's conversations. The
   // legacy global key is migrated into this account's namespace exactly
   // once (kept on first account for continuity) and then removed.
-  const authUserId = auth?.user?.id ?? null;
   useEffect(() => {
     const namespace = sessionsStorageKey(authUserId);
     sessionsNamespaceRef.current = namespace;
@@ -523,6 +558,36 @@ function App() {
       console.warn('Could not save conversations in this browser.', error);
     }
   }, [sessions]);
+
+  // Restore the active project for this account and fall back to the first
+  // available project. A stale id (deleted project) is ignored, and the
+  // selection is remembered per account so a refresh keeps the same workspace.
+  useEffect(() => {
+    if (!auth) return;
+    if (projects.length === 0) {
+      if (projectId) setProjectId('');
+      return;
+    }
+    if (projects.some((project) => String(project.id) === String(projectId))) return;
+    const stored = readActiveProjectId(authUserId);
+    const next = projects.some((project) => String(project.id) === String(stored))
+      ? stored
+      : String(projects[0].id);
+    setProjectId(next);
+  }, [auth, authUserId, projects, projectId]);
+
+  useEffect(() => {
+    if (!auth || !projectId) return;
+    persistActiveProjectId(authUserId, projectId);
+  }, [auth, authUserId, projectId]);
+
+  // Never leave one project's file or search results on screen after switching.
+  useEffect(() => {
+    setSelectedFile(null);
+    setFileContent('');
+    setFileSearch('');
+    setCodeSearchResults([]);
+  }, [projectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -772,82 +837,172 @@ function App() {
     setInput('');
   };
 
-  const createProject = async () => {
-    const name = window.prompt('Name your workspace');
-    if (!name?.trim()) return;
-    const existingPath = window.prompt('Optional: enter the full path of an existing project folder on this PC. Leave blank to create a new workspace.');
-    if (existingPath === null) return;
+  const openProjectDialog = () => {
+    setProjectError(null);
+    setProjectDialogOpen(true);
+  };
+
+  const createProject = async ({ name, path: existingPath } = {}) => {
+    const trimmedName = typeof name === 'string' ? name.trim() : '';
+    if (!trimmedName) {
+      setProjectError('Project name is required.');
+      return;
+    }
+    setProjectBusy(true);
+    setProjectError(null);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: name.trim(),
-          ...(existingPath.trim() ? { path: existingPath.trim() } : {}),
+          name: trimmedName,
+          ...(existingPath ? { path: existingPath } : {}),
         }),
       });
       const result = await response.json();
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not create workspace.');
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not add the project.');
       setProjects((current) => [result.project, ...current]);
       setProjectId(String(result.project.id));
+      persistActiveProjectId(authUserId, String(result.project.id));
+      setProjectDialogOpen(false);
+      setWorkspaceTab('files');
+      setWorkspaceOpen(true);
       await loadWorkspaceFiles(String(result.project.id));
-      setToast({ message: `Workspace “${result.project.name}” created.` });
+      setToast({ message: `Project “${result.project.name}” is ready.` });
     } catch (error) {
-      setToast({ message: error.message });
+      setProjectError(error.message);
+    } finally {
+      setProjectBusy(false);
     }
   };
 
-  const loadTasks = useCallback(async () => {
+  const selectProject = (id) => {
+    setProjectId(String(id));
+    setWorkspaceTab('files');
+    setCodeSearchResults([]);
+  };
+
+  const resumeTask = (taskId) => {
+    setFocusTaskId(taskId);
+    setWorkspaceTab('tasks');
+    setWorkspaceOpen(true);
+  };
+
+  const loadTasks = useCallback(async (statusFilter = taskStatusFilterRef.current, scopeProjectId = projectIdRef.current) => {
+    const currentScope = () => `${authRef.current?.user?.id ?? 'anonymous'}:${projectIdRef.current || ''}`;
+    const scope = `${authRef.current?.user?.id ?? 'anonymous'}:${scopeProjectId || ''}`;
+    if (taskLoadScopeRef.current !== scope) {
+      // A different account or workspace must never keep the previous list on
+      // screen while the new request is in flight.
+      taskLoadScopeRef.current = scope;
+      setTasks([]);
+      setProjectProposals([]);
+      setTaskDetail(null);
+    }
+    const generation = ++taskLoadGenerationRef.current;
+    const isCurrent = () => generation === taskLoadGenerationRef.current && taskLoadScopeRef.current === currentScope();
+
     setTaskLoading(true);
     try {
-      const url = `/api/tasks${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`;
-      const response = await apiFetch(`${API_BASE}${url}`);
+      const params = new URLSearchParams();
+      if (scopeProjectId) params.set('projectId', String(scopeProjectId));
+      if (statusFilter) params.set('status', statusFilter);
+      const query = params.toString();
+      const response = await apiFetch(`${API_BASE}/api/tasks${query ? `?${query}` : ''}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load tasks.');
+      if (!isCurrent()) return;
       setTasks(Array.isArray(result.tasks) ? result.tasks : []);
-      setTasksError(null);
+
+      let proposalError = null;
+      if (scopeProjectId) {
+        try {
+          const proposalsResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(scopeProjectId)}/proposals`);
+          const proposalsResult = await proposalsResponse.json();
+          if (!proposalsResponse.ok || !proposalsResult.ok) {
+            throw new Error(proposalsResult.error || 'Could not load pending proposals.');
+          }
+          if (isCurrent()) {
+            setProjectProposals(Array.isArray(proposalsResult.proposals) ? proposalsResult.proposals : []);
+          }
+        } catch (error) {
+          proposalError = error.message;
+        }
+      } else {
+        setProjectProposals([]);
+      }
+      if (!isCurrent()) return;
+      setTasksError(proposalError);
     } catch (error) {
-      setTasksError(error.message);
+      if (isCurrent()) setTasksError(error.message);
     } finally {
-      setTaskLoading(false);
+      if (isCurrent()) setTaskLoading(false);
     }
-  }, [projectId]);
+  }, [apiFetch]);
+
+  // Load the authenticated workspace's tasks immediately after session
+  // verification, on page reload, and whenever the selected workspace changes.
+  // loadTasks is stable and ignores filter changes, so this does not duplicate
+  // the explicit loads performed by the filter, Refresh, create, and decision
+  // handlers.
+  useEffect(() => {
+    if (authChecking || !auth) return;
+    loadTasks();
+  }, [authChecking, auth?.token, projectId, loadTasks]);
 
   const loadTaskDetail = useCallback(async (taskId) => {
+    const requestId = ++taskDetailRequestRef.current;
+    const scope = projectIdRef.current;
     try {
       const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load task.');
-      setTaskDetail({ task: result.task, steps: Array.isArray(result.steps) ? result.steps : [] });
+      // Ignore a response for a task the user already navigated away from, or
+      // for a project that is no longer active.
+      if (requestId !== taskDetailRequestRef.current || scope !== projectIdRef.current) return;
+      setTaskDetail({
+        task: result.task,
+        steps: Array.isArray(result.steps) ? result.steps : [],
+        proposals: Array.isArray(result.proposals) ? result.proposals : [],
+      });
       setTaskDetailError(null);
     } catch (error) {
-      setTaskDetailError(error.message);
+      if (requestId === taskDetailRequestRef.current) setTaskDetailError(error.message);
     }
-  }, []);
+  }, [apiFetch]);
 
   const loadWorkspaceFiles = async (id = projectId) => {
+    const requestId = ++workspaceRequestRef.current;
     if (!id) {
       setWorkspaceFiles([]);
       setSelectedFile(null);
       setFileContent('');
+      setWorkspaceLoading(false);
       return;
     }
+    setWorkspaceLoading(true);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not scan the project.');
-      setWorkspaceFiles(result.files);
+      if (requestId !== workspaceRequestRef.current) return;
+      setWorkspaceFiles(Array.isArray(result.files) ? result.files : []);
     } catch (error) {
-      setToast({ message: error.message });
+      if (requestId === workspaceRequestRef.current) setToast({ message: error.message });
+    } finally {
+      if (requestId === workspaceRequestRef.current) setWorkspaceLoading(false);
     }
   };
 
   const openWorkspaceFile = async (filePath) => {
     if (!projectId) return;
+    const openedProject = projectId;
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(openedProject)}/file?path=${encodeURIComponent(filePath)}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not open file.');
+      // Ignore a slow response if the user already switched projects.
+      if (String(openedProject) !== String(projectIdRef.current)) return;
       setSelectedFile(result.path);
       setFileContent(result.content);
     } catch (error) {
@@ -857,13 +1012,17 @@ function App() {
 
   const searchWorkspaceCode = async () => {
     if (!projectId || fileSearch.trim().length < 2) return;
+    const requestId = ++searchRequestRef.current;
+    const searchedProject = projectId;
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(searchedProject)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not search project code.');
-      setCodeSearchResults(result.results);
+      // Drop a response that arrived after a project switch or newer search.
+      if (requestId !== searchRequestRef.current || String(searchedProject) !== String(projectIdRef.current)) return;
+      setCodeSearchResults(Array.isArray(result.results) ? result.results : []);
     } catch (error) {
-      setToast({ message: error.message });
+      if (requestId === searchRequestRef.current) setToast({ message: error.message });
     }
   };
 
@@ -1053,6 +1212,10 @@ function App() {
 
   const createTask = useCallback(async () => {
     const prompt = taskInput.trim();
+    if (!projectId) {
+      setToast({ message: 'Select or create a project before starting a task.' });
+      return;
+    }
     if (!prompt) {
       setToast({ message: 'Describe a coding task before creating it.' });
       return;
@@ -1074,14 +1237,16 @@ function App() {
       setTaskSubmitting(false);
       setTasks((current) => [result.task, ...current]);
       await loadTaskDetail(result.task.id);
-      setTaskDetail({ task: result.task, steps: [] });
-      setTaskCenterOpen(true);
-      setToast({ message: 'Task created.' });
+      setTaskDetail({ task: result.task, steps: [], proposals: [] });
+      setFocusTaskId(result.task.id);
+      setWorkspaceTab('tasks');
+      setWorkspaceOpen(true);
+      setToast({ message: `Task created in ${activeProject?.name || 'this project'}.` });
     } catch (error) {
       setTaskSubmitting(false);
       setToast({ message: error.message });
     }
-  }, [projectId, taskInput, loadTasks, loadTaskDetail]);
+  }, [projectId, taskInput, loadTasks, loadTaskDetail, activeProject?.name]);
 
   const cancelTask = useCallback(async (taskId) => {
     try {
@@ -1096,6 +1261,73 @@ function App() {
     }
   }, [loadTasks]);
 
+  const postTaskProposalDecision = useCallback(async (task, proposal, decision) => {
+    const ownedProjectId = String(task?.project_id ?? projectId ?? '');
+    if (!ownedProjectId || !proposal?.proposalId) throw new Error('Proposal information is unavailable.');
+
+    const encodedProject = encodeURIComponent(ownedProjectId);
+    const encodedProposal = encodeURIComponent(proposal.proposalId);
+    let endpoint;
+    if (decision === 'reject') {
+      endpoint = `/api/projects/${encodedProject}/proposals/${encodedProposal}/reject`;
+    } else if (proposal.type === 'command') {
+      endpoint = `/api/projects/${encodedProject}/commands/${encodedProposal}/run`;
+    } else {
+      endpoint = `/api/projects/${encodedProject}/proposals/${encodedProposal}/apply`;
+    }
+
+    const response = await apiFetch(`${API_BASE}${endpoint}`, { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      const error = new Error(result.error || `Could not ${decision} the proposal.`);
+      error.status = response.status;
+      throw error;
+    }
+    return result;
+  }, [apiFetch, projectId]);
+
+  const refreshAfterProposalDecision = useCallback(async (task) => {
+    await Promise.all([loadTaskDetail(task.id), loadTasks()]);
+    const workspaceId = String(task.project_id ?? projectId ?? '');
+    if (workspaceId) await loadWorkspaceFiles(workspaceId);
+  }, [loadTaskDetail, loadTasks, projectId]);
+
+  const applyTaskProposal = useCallback(async (task, proposal) => {
+    try {
+      const result = await postTaskProposalDecision(task, proposal, 'apply');
+      setToast({ message: `Applied changes to ${result.file?.path || proposal.path || 'the proposed file'}.` });
+      await refreshAfterProposalDecision(task);
+    } catch (error) {
+      setToast({ message: error.message });
+      throw error;
+    }
+  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+
+  const rejectTaskProposal = useCallback(async (task, proposal) => {
+    try {
+      await postTaskProposalDecision(task, proposal, 'reject');
+      setToast({ message: 'Proposal rejected. Nothing was applied or run.' });
+      await refreshAfterProposalDecision(task);
+    } catch (error) {
+      setToast({ message: error.message });
+      throw error;
+    }
+  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+
+  const runTaskProposal = useCallback(async (task, proposal) => {
+    try {
+      const result = await postTaskProposalDecision(task, proposal, 'run');
+      const exitCode = result.result?.exitCode;
+      setToast({
+        message: `Command completed${Number.isFinite(exitCode) ? ` with exit code ${exitCode}` : ''}.`,
+      });
+      await refreshAfterProposalDecision(task);
+    } catch (error) {
+      setToast({ message: error.message });
+      throw error;
+    }
+  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+
   const sortedSessions = useMemo(
     () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
     [sessions],
@@ -1103,7 +1335,7 @@ function App() {
 
   if (authChecking) {
     return (
-      <div className="auth-shell">
+      <div className="auth-shell auth-loading-shell">
         <div className="auth-card auth-loading">Checking your session…</div>
       </div>
     );
@@ -1132,8 +1364,49 @@ function App() {
           <button className="new-chat-button" onClick={createSession}>
             <Icon name="plus" size={17} /> <span>New chat</span> <kbd>⌘ K</kbd>
           </button>
+
           <div className="sidebar-section-heading">
-            <span>Recent</span>
+            <span>Projects</span>
+            <button className="text-icon-button" onClick={openProjectDialog} title="Add project" aria-label="Add project"><Icon name="plus" size={15} /></button>
+          </div>
+          <div className="project-list">
+            {projects.length === 0 ? (
+              <button type="button" className="project-empty" onClick={openProjectDialog}>
+                <span className="project-empty-icon"><Icon name="folder" size={16} /></span>
+                <span>
+                  <strong>Add your first project</strong>
+                  <small>Create a workspace or choose a folder</small>
+                </span>
+              </button>
+            ) : projects.map((project) => {
+              const isActive = String(project.id) === String(projectId);
+              return (
+                <button
+                  type="button"
+                  key={project.id}
+                  className={`project-item ${isActive ? 'active' : ''}`}
+                  onClick={() => selectProject(project.id)}
+                  title={project.name}
+                  aria-pressed={isActive}
+                >
+                  <span className="project-avatar">{(project.name || '?').charAt(0).toUpperCase()}</span>
+                  <span className="project-copy">
+                    <strong>{project.name}</strong>
+                    <small>{isActive ? 'Active project' : 'Switch project'}</small>
+                  </span>
+                  {isActive && <span className="project-active-dot" aria-label="Active" />}
+                </button>
+              );
+            })}
+            {projects.length > 0 && (
+              <button type="button" className="project-add" onClick={openProjectDialog}>
+                <Icon name="plus" size={14} /> Add project
+              </button>
+            )}
+          </div>
+
+          <div className="sidebar-section-heading">
+            <span>Conversations</span>
             <button className="text-icon-button" onClick={clearHistory} title="Clear history" aria-label="Clear history"><Icon name="trash" size={15} /></button>
           </div>
           <nav className="history-list" aria-label="Conversation history">
@@ -1149,18 +1422,14 @@ function App() {
               </div>
             ))}
           </nav>
+
           <div className="sidebar-bottom">
-            <div className="workspace-label"><Icon name="folder" size={15} /><span>Workspace</span></div>
-            <div className="workspace-controls">
-              <select value={projectId} onChange={(event) => setProjectId(event.target.value)} aria-label="Select project workspace">
-                <option value="">Personal workspace</option>
-                {projects.map((project) => <option key={project.id} value={String(project.id)}>{project.name}</option>)}
-              </select>
-              <button className="icon-button workspace-add" onClick={createProject} title="Create workspace" aria-label="Create workspace"><Icon name="plus" size={16} /></button>
-            </div>
             <div className="profile-row">
               <span className="avatar">{(auth.user?.email || '?').charAt(0).toUpperCase()}</span>
-              <span className="profile-name" title={auth.user?.email || ''}>{auth.user?.email || 'Signed in'}</span>
+              <span className="profile-copy">
+                <span className="profile-name" title={auth.user?.email || ''}>{auth.user?.email || 'Signed in'}</span>
+                <span className="profile-plan">{activeProject ? activeProject.name : 'No project selected'}</span>
+              </span>
               <span className={`profile-role${auth.user?.isAdmin ? ' is-admin' : ''}`}>{auth.user?.isAdmin ? 'Admin' : 'User'}</span>
               <button type="button" className="profile-logout" onClick={signOut} title="Sign out">Sign out</button>
             </div>
@@ -1170,197 +1439,336 @@ function App() {
 
       <main className="main-panel">
         <div className="chat-pane">
-        <header className="topbar">
-          <div className="topbar-left">
-            {!sidebarOpen && <button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="Show sidebar"><Icon name="panel" /></button>}
-            <div className="model-select-wrap">
-              <select
-                className="model-select"
-                value={selectedProvider}
-                onChange={(event) => setSelectedProvider(event.target.value)}
-                aria-label="Select AI provider"
-                title="Choose the provider used for chat"
+          <header className="topbar">
+            <div className="topbar-left">
+              {!sidebarOpen && <button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="Show sidebar"><Icon name="panel" /></button>}
+              <button
+                type="button"
+                className="topbar-project"
+                onClick={() => { setWorkspaceTab('files'); setWorkspaceOpen(true); }}
+                title={activeProject ? `Open ${activeProject.name}` : 'Add a project'}
               >
-                {!selectedProvider && <option value="" disabled>Backend default</option>}
-                <option value="openai">OpenRouter</option>
-                <option value="gemini">Google Gemini</option>
-              </select>
+                <span className="topbar-project-icon"><Icon name="folder" size={15} /></span>
+                <span className="topbar-project-copy">
+                  <small>Active project</small>
+                  <strong>{activeProject?.name || 'No project selected'}</strong>
+                </span>
+                <Icon name="chevron" size={14} />
+              </button>
             </div>
-          </div>
-          <div className="topbar-right">
-            <span className={`connection-status ${health.online ? 'online' : 'offline'}`}>
-              <span className="status-dot" />{health.online ? 'Online' : 'Offline'}
-            </span>
-            <span className="topbar-divider" />
-            <button className="icon-button theme-toggle" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
-              <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
-            </button>
-            <button className="topbar-new-chat" onClick={createSession}><Icon name="plus" size={16} /><span>New chat</span></button>
-          </div>
-        </header>
-
-        {warningText && (
-          <div className="ai-warning" role="alert">
-            <span className="ai-warning-icon">!</span>
-            <div className="ai-warning-content">
-              <strong>{warningTitle}</strong>
-              <span>{warningText}</span>
-            </div>
-          </div>
-        )}
-
-        <section className="conversation" ref={messageListRef} onScroll={onMessageScroll} aria-label="Conversation">
-          {messages.length === 0 ? (
-            <div className="welcome">
-              <div className="welcome-eyebrow"><span className="eyebrow-line" /> YOUR AI WORKSPACE <span className="eyebrow-line" /></div>
-              <div className="welcome-orb"><Icon name="spark" size={26} /></div>
-              <h1>What can I help you<br /><span>work through?</span></h1>
-              <p className="welcome-description">A thoughtful space to build, explore, and figure things out.</p>
-              <div className="starter-grid">
-                {starters.map((starter) => (
-                  <button key={starter.title} className="starter-card" onClick={() => sendMessage(starter.prompt)}>
-                    <span className="starter-icon">{starter.icon}</span>
-                    <span className="starter-title">{starter.title}</span>
-                    <span className="starter-prompt">{starter.prompt.replace(/: ?$/, '')}</span>
-                    <span className="starter-arrow"><Icon name="chevron" size={15} /></span>
-                  </button>
-                ))}
+            <div className="topbar-right">
+              <div className="model-select-wrap">
+                <select
+                  className="model-select"
+                  value={selectedProvider}
+                  onChange={(event) => setSelectedProvider(event.target.value)}
+                  aria-label="Select AI provider"
+                  title="Choose the provider used for chat"
+                >
+                  {!selectedProvider && <option value="" disabled>Backend default</option>}
+                  <option value="openai">OpenRouter</option>
+                  <option value="gemini">Google Gemini</option>
+                </select>
               </div>
+              <span className={`connection-status ${health.online ? 'online' : 'offline'}`}>
+                <span className="status-dot" />{health.online ? 'Online' : 'Offline'}
+              </span>
+              <span className="topbar-divider" />
+              <button
+                className="icon-button"
+                onClick={() => setWorkspaceOpen((value) => !value)}
+                aria-label={workspaceOpen ? 'Hide files and tasks' : 'Show files and tasks'}
+                title={workspaceOpen ? 'Hide files and tasks' : 'Show files and tasks'}
+              >
+                <Icon name="panel" />
+              </button>
+              <button className="icon-button theme-toggle" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
+                <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+              </button>
+              <button className="topbar-new-chat" onClick={createSession}><Icon name="plus" size={16} /><span>New chat</span></button>
             </div>
-          ) : (
-            <div className="message-thread">
-              {messages.map((message, index) => (
-                <Message
-                  key={`${activeId}-${index}`}
-                  message={message}
-                  index={index}
-                  sessionId={activeId}
-                  onCopy={copyMessage}
-                  onRegenerate={regenerate}
-                  onFeedback={setFeedback}
-                  onApplyProposal={applyFileProposal}
-                  onDiscardProposal={discardFileProposal}
-                  onRunCommand={runApprovedWorkspaceCommand}
-                />
-              ))}
-              {generating && (
-                <div className="message-row assistant-row thinking-row">
-                  <div className="assistant-mark"><Icon name="spark" size={15} /></div>
-                  <div className="thinking-indicator" aria-label="Assistant is thinking"><span /><span /><span /></div>
-                </div>
-              )}
+          </header>
+
+          {warningText && (
+            <div className="ai-warning" role="alert">
+              <span className="ai-warning-icon">!</span>
+              <div className="ai-warning-content">
+                <strong>{warningTitle}</strong>
+                <span>{warningText}</span>
+              </div>
             </div>
           )}
-          <div ref={bottomRef} className="scroll-anchor" />
-        </section>
 
-        {showScrollButton && (
-          <button
-            className="scroll-bottom-button"
-            onClick={() => {
-              wasAtBottomRef.current = true;
-              bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-            }}
-          >
-            <Icon name="arrowDown" size={15} /> Scroll to bottom
-          </button>
-        )}
+          <section className="conversation" ref={messageListRef} onScroll={onMessageScroll} aria-label="Conversation">
+            {messages.length === 0 ? (
+              <div className="welcome">
+                <div className="welcome-eyebrow"><span className="eyebrow-line" /> AI CODING WORKSPACE <span className="eyebrow-line" /></div>
+                <div className="welcome-orb"><Icon name="spark" size={26} /></div>
+                <h1>
+                  {activeProject
+                    ? <>Build in <span>{activeProject.name}</span></>
+                    : <>What are we <span>building?</span></>}
+                </h1>
+                <p className="welcome-description">
+                  {activeProject
+                    ? 'Describe a change in plain language. The agent can inspect this project, plan the work, and ask for approval before writing or running anything.'
+                    : 'Add a project to give the agent a workspace, or ask a general question below. Files stay isolated to the project you choose.'}
+                </p>
 
-        <div className="composer-dock">
-          {toast && (
-            <div className="toast" role="status">
-              <span className="toast-message">{toast.message}</span>
-              {retryRequest && <button onClick={() => requestReply(retryRequest)}>Retry</button>}
-              <button className="toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification">×</button>
-            </div>
-          )}
-          <form
-            className="composer"
-            onSubmit={(event) => {
-              event.preventDefault();
-              sendMessage();
-            }}
-          >
-            {attachment && (
-              <div className="attachment-chip">
-                <span>📎 {attachment.name}</span>
-                <button type="button" onClick={() => { setAttachment(null); setDiffPreview(false); }} aria-label="Remove attachment">×</button>
-                <button type="button" onClick={() => setDiffPreview((current) => !current)} aria-label="Toggle attached code preview">
-                  {diffPreview ? 'Hide preview' : 'Preview'}
-                </button>
-              </div>
-            )}
-            {diffPreview && attachment && (
-              <div className="attachment-preview">
-                <strong>Attached source preview</strong>
-                <pre><code>{attachment.content}</code></pre>
-              </div>
-            )}
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  sendMessage();
-                }
-              }}
-              placeholder="Message MyAI…"
-              rows={1}
-              aria-label="Message"
-            />
-            <input
-              ref={attachmentInputRef}
-              className="visually-hidden"
-              type="file"
-              accept=".js,.tsx,.py,.html,.json,text/javascript,application/json,text/html,text/x-python"
-              onChange={attachCodeFile}
-              aria-label="Attach source file"
-            />
-            <div className="composer-bottom">
-              <div className="composer-actions">
-                <button type="button" className="composer-tool-button" onClick={() => attachmentInputRef.current?.click()} aria-label="Attach file or code">📎 Attach</button>
-                <button type="button" className="composer-tool-button voice-button" onClick={startVoiceInput} aria-label="Start voice dictation">🎙 Voice</button>
-              </div>
-              <span className="composer-hint"><kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span>
-              <div className="composer-tools">
-                <span className={`token-counter ${input.length > MAX_CHARS * 0.9 ? 'near-limit' : ''}`}>{input.length.toLocaleString()} / {MAX_CHARS.toLocaleString()} <span className="token-estimate">· ~{tokenEstimate} tokens</span></span>
-                {generating ? (
-                  <button className="send-button stop-button" type="button" onClick={stopGeneration} aria-label="Stop generating" title="Stop generating"><Icon name="stop" size={15} /><span>Stop generating</span></button>
+                {activeProject ? (
+                  <div className="welcome-project">
+                    <span className="welcome-project-icon"><Icon name="folder" size={16} /></span>
+                    <div>
+                      <small>Agent is working in</small>
+                      <strong>{activeProject.name}</strong>
+                    </div>
+                    <button type="button" onClick={() => { setWorkspaceTab('files'); setWorkspaceOpen(true); }}>View files</button>
+                  </div>
                 ) : (
-                  <button className="send-button" type="submit" disabled={!input.trim() || input.length > MAX_CHARS || !health.online} aria-label="Send message" title="Send message"><Icon name="send" size={16} /></button>
+                  <div className="welcome-actions">
+                    <button type="button" className="primary-button" onClick={openProjectDialog}><Icon name="plus" size={15} /> Add a project</button>
+                    <span>or ask a general question below</span>
+                  </div>
+                )}
+
+                <div className="starter-grid">
+                  {starters.map((starter) => (
+                    <button key={starter.title} className="starter-card" onClick={() => sendMessage(starter.prompt)}>
+                      <span className="starter-icon">{starter.icon}</span>
+                      <span className="starter-title">{starter.title}</span>
+                      <span className="starter-prompt">{starter.hint}</span>
+                      <span className="starter-arrow"><Icon name="chevron" size={15} /></span>
+                    </button>
+                  ))}
+                </div>
+
+                {tasks.length > 0 && (
+                  <div className="recent-tasks">
+                    <div className="recent-tasks-head">
+                      <span>Recent tasks</span>
+                      <button type="button" onClick={() => { setWorkspaceTab('tasks'); setWorkspaceOpen(true); }}>View all</button>
+                    </div>
+                    {tasks.slice(0, 3).map((task) => (
+                      <button type="button" key={task.id} className="recent-task" onClick={() => resumeTask(task.id)}>
+                        <span className={`recent-task-dot ${statusBadgeClass(task.status)}`} />
+                        <span className="recent-task-title">{task.instruction}</span>
+                        <span className="recent-task-status">{String(task.status || '').replaceAll('_', ' ')}</span>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
-            </div>
-          </form>
-          <div className="quick-actions" aria-label="Quick actions">
-            {['Run Tests', 'Format Code', 'Explain Code'].map((action) => (
-              <button key={action} type="button" onClick={() => runQuickAction(action)}>{action}</button>
-            ))}
+            ) : (
+              <div className="message-thread">
+                {messages.map((message, index) => (
+                  <Message
+                    key={`${activeId}-${index}`}
+                    message={message}
+                    index={index}
+                    sessionId={activeId}
+                    onCopy={copyMessage}
+                    onRegenerate={regenerate}
+                    onFeedback={setFeedback}
+                    onApplyProposal={applyFileProposal}
+                    onDiscardProposal={discardFileProposal}
+                    onRunCommand={runApprovedWorkspaceCommand}
+                  />
+                ))}
+                {generating && (
+                  <div className="message-row assistant-row thinking-row">
+                    <div className="assistant-mark"><Icon name="spark" size={15} /></div>
+                    <div className="thinking-indicator" aria-label="Assistant is thinking"><span /><span /><span /></div>
+                  </div>
+                )}
+              </div>
+            )}
+            <div ref={bottomRef} className="scroll-anchor" />
+          </section>
+
+          {showScrollButton && (
+            <button
+              className="scroll-bottom-button"
+              onClick={() => {
+                wasAtBottomRef.current = true;
+                bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+              }}
+            >
+              <Icon name="arrowDown" size={15} /> Scroll to bottom
+            </button>
+          )}
+
+          <div className="composer-dock">
+            {toast && (
+              <div className="toast" role="status">
+                <span className="toast-message">{toast.message}</span>
+                {retryRequest && <button onClick={() => requestReply(retryRequest)}>Retry</button>}
+                <button className="toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification">×</button>
+              </div>
+            )}
+            <form
+              className="composer"
+              onSubmit={(event) => {
+                event.preventDefault();
+                sendMessage();
+              }}
+            >
+              {attachment && (
+                <div className="attachment-chip">
+                  <span>📎 {attachment.name}</span>
+                  <button type="button" onClick={() => { setAttachment(null); setDiffPreview(false); }} aria-label="Remove attachment">×</button>
+                  <button type="button" onClick={() => setDiffPreview((current) => !current)} aria-label="Toggle attached code preview">
+                    {diffPreview ? 'Hide preview' : 'Preview'}
+                  </button>
+                </div>
+              )}
+              {diffPreview && attachment && (
+                <div className="attachment-preview">
+                  <strong>Attached source preview</strong>
+                  <pre><code>{attachment.content}</code></pre>
+                </div>
+              )}
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    sendMessage();
+                  }
+                }}
+                placeholder={activeProject
+                  ? `Describe what to build or change in ${activeProject.name}…`
+                  : 'Ask anything, or add a project to start coding…'}
+                rows={1}
+                aria-label="Message"
+              />
+              <input
+                ref={attachmentInputRef}
+                className="visually-hidden"
+                type="file"
+                accept=".js,.tsx,.py,.html,.json,text/javascript,application/json,text/html,text/x-python"
+                onChange={attachCodeFile}
+                aria-label="Attach source file"
+              />
+              <div className="composer-bottom">
+                <div className="composer-actions">
+                  <button type="button" className="composer-tool-button" onClick={() => attachmentInputRef.current?.click()} aria-label="Attach file or code">📎 Attach</button>
+                  <button type="button" className="composer-tool-button voice-button" onClick={startVoiceInput} aria-label="Start voice dictation">🎙 Voice</button>
+                </div>
+                <span className="composer-hint"><kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span>
+                <div className="composer-tools">
+                  <span className={`token-counter ${input.length > MAX_CHARS * 0.9 ? 'near-limit' : ''}`}>{input.length.toLocaleString()} / {MAX_CHARS.toLocaleString()} <span className="token-estimate">· ~{tokenEstimate} tokens</span></span>
+                  {generating ? (
+                    <button className="send-button stop-button" type="button" onClick={stopGeneration} aria-label="Stop generating" title="Stop generating"><Icon name="stop" size={15} /><span>Stop generating</span></button>
+                  ) : (
+                    <button className="send-button" type="submit" disabled={!input.trim() || input.length > MAX_CHARS || !health.online} aria-label="Send message" title="Send message"><Icon name="send" size={16} /></button>
+                  )}
+                </div>
+              </div>
+            </form>
+            {activeProject && (
+              <div className="quick-actions" aria-label="Quick actions">
+                {['Run Tests', 'Format Code', 'Explain Code'].map((action) => (
+                  <button key={action} type="button" onClick={() => runQuickAction(action)}>{action}</button>
+                ))}
+              </div>
+            )}
+            <p className="disclaimer">MyAI can make mistakes. Review changes before approving them.</p>
           </div>
-          <p className="disclaimer">MyAI can make mistakes. Check important information.</p>
         </div>
-        <TaskCenter
-          projectId={projectId}
-          taskInput={taskInput}
-          setTaskInput={setTaskInput}
-          taskSubmitting={taskSubmitting}
-          createTask={createTask}
-          tasks={tasks}
-          setTasks={setTasks}
-          tasksError={tasksError}
-          taskLoading={taskLoading}
-          loadTasks={loadTasks}
-          loadTaskDetail={loadTaskDetail}
-          setTaskDetail={setTaskDetail}
-          taskDetail={taskDetail}
-          taskDetailError={taskDetailError}
-          cancelTask={cancelTask}
-          refreshTasks={refreshTasks}
-        />
-        </div>
+
+        {workspaceOpen && (
+          <button type="button" className="dock-backdrop" onClick={() => setWorkspaceOpen(false)} aria-label="Close workspace panel" />
+        )}
+        <aside className={`workspace-dock ${workspaceOpen ? '' : 'closed'}`} aria-label="Workspace panel">
+          <header className="workspace-dock-head">
+            <div className="workspace-tabs" role="tablist" aria-label="Workspace view">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={workspaceTab === 'files'}
+                className={workspaceTab === 'files' ? 'active' : ''}
+                onClick={() => setWorkspaceTab('files')}
+              >
+                Files
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={workspaceTab === 'tasks'}
+                className={workspaceTab === 'tasks' ? 'active' : ''}
+                onClick={() => setWorkspaceTab('tasks')}
+              >
+                Tasks
+                {waitingTaskCount > 0 && <span className="tab-badge">{waitingTaskCount}</span>}
+              </button>
+            </div>
+            <button type="button" className="icon-button" onClick={() => setWorkspaceOpen(false)} aria-label="Close workspace panel" title="Close panel">×</button>
+          </header>
+          <div className="workspace-dock-body">
+            {workspaceTab === 'files' ? (
+              <WorkspaceFiles
+                project={activeProject}
+                files={workspaceFiles}
+                selectedFile={selectedFile}
+                content={fileContent}
+                search={fileSearch}
+                onSearchChange={setFileSearch}
+                onSearch={searchWorkspaceCode}
+                results={codeSearchResults}
+                onOpenFile={openWorkspaceFile}
+                onRefresh={() => loadWorkspaceFiles()}
+                onNewProject={openProjectDialog}
+                loading={workspaceLoading}
+              />
+            ) : (
+              <TaskCenter
+                projectId={projectId}
+                activeProjectName={activeProject?.name || ''}
+                taskInput={taskInput}
+                setTaskInput={setTaskInput}
+                taskSubmitting={taskSubmitting}
+                createTask={createTask}
+                tasks={tasks}
+                setTasks={setTasks}
+                projectProposals={projectProposals}
+                taskStatusFilter={taskStatusFilter}
+                setTaskStatusFilter={setTaskStatusFilter}
+                tasksError={tasksError}
+                taskLoading={taskLoading}
+                loadTasks={loadTasks}
+                loadTaskDetail={loadTaskDetail}
+                setTaskDetail={setTaskDetail}
+                taskDetail={taskDetail}
+                taskDetailError={taskDetailError}
+                cancelTask={cancelTask}
+                refreshTasks={refreshTasks}
+                applyTaskProposal={applyTaskProposal}
+                rejectTaskProposal={rejectTaskProposal}
+                runTaskProposal={runTaskProposal}
+                focusTaskId={focusTaskId}
+                onFocusTask={() => setFocusTaskId(null)}
+                onNewProject={openProjectDialog}
+              />
+            )}
+          </div>
+        </aside>
       </main>
+
+      <ProjectDialog
+        open={projectDialogOpen}
+        onClose={() => {
+          if (projectBusy) return;
+          setProjectDialogOpen(false);
+          setProjectError(null);
+        }}
+        onCreate={createProject}
+        apiFetch={apiFetch}
+        apiBase={API_BASE}
+        busy={projectBusy}
+        error={projectError}
+      />
     </div>
   );
 }

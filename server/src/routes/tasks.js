@@ -12,8 +12,12 @@ import {
   getTask,
   listSteps,
   listTasks,
+  loadPlan,
   requestCancel,
 } from '../tasks/store.js';
+import { getProposal } from '../proposals/store.js';
+import { isProposalExpired } from '../ai/tools.js';
+import { unifiedDiff } from '../workspace/diff.js';
 import { findOwnedProject, isBypassUser } from '../auth/index.js';
 
 function parseTaskId(raw) {
@@ -26,11 +30,80 @@ function sendError(res, err, label) {
   return res.status(500).json({ ok: false, error: 'Unexpected server error.' });
 }
 
+function linkedProposalIds(plan) {
+  if (!plan || !Array.isArray(plan.proposals)) return [];
+  const ids = [];
+  for (const entry of plan.proposals) {
+    const id = entry && typeof entry === 'object' ? entry.id : entry;
+    if (typeof id === 'string' && id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function parseProposalResult(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a read-only, task-scoped proposal view from the proposal IDs recorded
+ * in the task plan. Never returns stored file contents, and never performs an
+ * apply, reject, or command run.
+ */
+function projectTaskProposals(db, task) {
+  const ids = linkedProposalIds(loadPlan(db, task.id));
+  if (ids.length === 0) return [];
+
+  const projected = [];
+  for (const proposalId of ids) {
+    const row = getProposal(db, proposalId);
+    if (!row || Number(row.project_id) !== Number(task.project_id)) continue;
+
+    const common = {
+      proposalId: row.id,
+      status: row.status,
+      expired: row.status === 'pending' && isProposalExpired(row),
+      error: row.error ?? null,
+      finished_at: row.finished_at ?? null,
+    };
+
+    if (row.kind === 'command') {
+      projected.push({
+        ...common,
+        type: 'command',
+        command: row.command ?? null,
+        path: row.command_path ?? null,
+        result: parseProposalResult(row.result_json),
+      });
+      continue;
+    }
+
+    const diff = row.diff ?? (row.kind === 'update'
+      ? unifiedDiff(row.original_content ?? '', row.content ?? '', { oldPath: row.path, newPath: row.path })
+      : unifiedDiff('', row.content ?? '', { oldPath: row.path, newPath: row.path }));
+    projected.push({
+      ...common,
+      type: 'file',
+      action: row.kind,
+      path: row.path ?? null,
+      diff,
+    });
+  }
+  return projected;
+}
+
 export function createTasksRouter({ db }) {
   const router = express.Router();
 
   // Create a task: POST /api/tasks
-  //   { projectId, instruction, autonomy? }  -> 201, task stays 'queued'
+  //   { projectId, instruction } -> 201, task stays 'queued'
+  // Autonomy is server-controlled; client-supplied values are validated only
+  // for backward-compatible error messages and never grant execution privileges.
   router.post('/', (req, res) => {
     const project = findOwnedProject(db, req.user, req.body?.projectId);
     if (!project) return res.status(404).json({ ok: false, error: 'Project not found.' });
@@ -48,15 +121,17 @@ export function createTasksRouter({ db }) {
       });
     }
 
-    const autonomy = req.body?.autonomy ?? DEFAULT_AUTONOMY;
-    if (!AUTONOMY_LEVELS.includes(autonomy)) {
+    const requestedAutonomy = req.body?.autonomy;
+    if (requestedAutonomy !== undefined
+      && requestedAutonomy !== null
+      && !AUTONOMY_LEVELS.includes(requestedAutonomy)) {
       return res.status(400).json({
         ok: false,
         error: `Autonomy must be one of: ${AUTONOMY_LEVELS.join(', ')}.`,
       });
     }
-
-    const autonomous = req.body?.autonomous ?? false;
+    const autonomy = DEFAULT_AUTONOMY;
+    const autonomous = false;
 
     try {
       const task = createTask(db, { projectId: project.id, instruction, autonomy, autonomous });
@@ -113,7 +188,12 @@ export function createTasksRouter({ db }) {
       if (!task || !findOwnedProject(db, req.user, task.project_id)) {
         return res.status(404).json({ ok: false, error: 'Task not found.' });
       }
-      return res.json({ ok: true, task, steps: listSteps(db, id) });
+      return res.json({
+        ok: true,
+        task,
+        steps: listSteps(db, id),
+        proposals: projectTaskProposals(db, task),
+      });
     } catch (err) {
       return sendError(res, err, 'detail');
     }

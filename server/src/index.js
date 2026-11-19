@@ -15,6 +15,7 @@ import { createWorkspaceTools } from './ai/tools.js';
 import { createTaskRunner } from './tasks/runner.js';
 import { createTaskExecutor } from './tasks/executor.js';
 import { ensureDir, projectDir, isPathInside } from './workspace/files.js';
+import { getWorkspaceDriver } from './workspace/storage-driver.js';
 import { requireAuth, bypassAuth, isBypassUser, deleteExpiredSessions } from './auth/index.js';
 
 function realOrResolved(value) {
@@ -111,7 +112,10 @@ export function createApp(options = {}) {
   // Workspace tools: injectable by tests, otherwise the real path-safe toolset.
   // In multi-user (auth) deployments project npm scripts are disabled to avoid
   // running user-writable package.json scripts as the server user.
-  const workspaceTools = 'tools' in options ? options.tools : createWorkspaceTools({ db, allowProjectCommands: !authEnabled });
+  const projectCommandsEnabled = 'allowProjectCommands' in options
+    ? Boolean(options.allowProjectCommands)
+    : !authEnabled;
+  const workspaceTools = 'tools' in options ? options.tools : createWorkspaceTools({ db, allowProjectCommands: projectCommandsEnabled });
 
   app.use(express.json({ limit: '1mb' }));
 
@@ -150,6 +154,9 @@ export function createApp(options = {}) {
         || (activeProvider === 'gemini' ? 'Google Gemini' : null),
       aiConfigured: activeProvider === 'mock' || activeProvider === 'ollama' || keyConfigured,
       aiWarning,
+      // Lets the UI avoid offering npm_* quick actions in multi-user mode,
+      // where project scripts are disabled for security. Never a secret.
+      npmScriptsEnabled: projectCommandsEnabled,
       // Safe per-provider status for the chat selector; never includes keys.
       providers: {
         openai: {
@@ -188,6 +195,13 @@ export function createApp(options = {}) {
       return res.status(400).json({ ok: false, error: 'Project name is required.' });
     }
     let rootPath = null;
+    const workspaceDriver = getWorkspaceDriver();
+    if (req.body?.path !== undefined && workspaceDriver.mode !== 'local') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Importing existing directories is not supported while object storage is enabled.',
+      });
+    }
     if (req.body?.path !== undefined) {
       if (typeof req.body.path !== 'string' || !path.isAbsolute(req.body.path)) {
         return res.status(400).json({ ok: false, error: 'Existing project path must be an absolute directory path on the server.' });
@@ -248,7 +262,18 @@ export function createApp(options = {}) {
       .prepare('INSERT INTO projects (name, root_path, owner_id) VALUES (?, ?, ?)')
       .run(name, rootPath, ownerId);
     const id = Number(result.lastInsertRowid);
-    if (!rootPath) ensureDir(projectDir(config.workspaceRoot, id));
+    try {
+      if (!rootPath) {
+        if (workspaceDriver.mode === 'local') ensureDir(projectDir(config.workspaceRoot, id));
+        else workspaceDriver.prepare(id);
+      }
+    } catch (error) {
+      // Workspace preparation can fail after the project row commits (for
+      // example an object-store outage). Roll the row back so a client retry
+      // cannot create a duplicate project with no usable workspace.
+      db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+      throw error;
+    }
     res.status(201).json({ ok: true, project: { id, name } });
   });
 

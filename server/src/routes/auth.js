@@ -54,6 +54,11 @@ function tokensEqual(provided, expected) {
   return crypto.timingSafeEqual(providedHash, expectedHash);
 }
 
+/** PostgreSQL reports unique violations as SQLSTATE 23505, not "UNIQUE". */
+export function isDuplicateEmailError(error) {
+  return error?.code === '23505' || /unique constraint/i.test(String(error?.message || ''));
+}
+
 /** 429 responder: always carries a Retry-After header (seconds) and body field. */
 function rejectRateLimited(res, limit, message) {
   const retryAfterSeconds = Math.max(1, Math.ceil((limit.retryAfterMs ?? 15 * 60 * 1000) / 1000));
@@ -113,7 +118,7 @@ export function createAuthRouter({ db }) {
       return res.status(400).json({ ok: false, error: passwordError });
     }
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    const existing = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
     if (existing) {
       return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
     }
@@ -129,7 +134,7 @@ export function createAuthRouter({ db }) {
       userId = Number(result.lastInsertRowid);
     } catch (error) {
       // Unique constraint race with another registration for the same email.
-      if (String(error?.message || '').includes('UNIQUE')) {
+      if (isDuplicateEmailError(error)) {
         return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
       }
       throw error;
@@ -228,7 +233,7 @@ export function createAuthRouter({ db }) {
       const bySub = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
       if (bySub) return finish(bySub.id);
 
-      const existing = db.prepare('SELECT id, google_sub FROM users WHERE email = ?').get(normalized);
+      const existing = db.prepare('SELECT id, google_sub FROM users WHERE lower(email) = ?').get(normalized);
       if (existing) {
         // Never silently link a password account to a Google identity.
         return redirectWithError(existing.google_sub ? 'google_identity_conflict' : 'google_account_exists');
@@ -273,7 +278,7 @@ export function createAuthRouter({ db }) {
       return res.status(400).json({ ok: false, error: 'Email and password are required.' });
     }
 
-    const user = db.prepare('SELECT id, email, password_hash, is_admin FROM users WHERE email = ?').get(email);
+    const user = db.prepare('SELECT id, email, password_hash, is_admin FROM users WHERE lower(email) = ?').get(email);
     if (!user) {
       burnPasswordCheck(password);
       return res.status(401).json({ ok: false, error: 'Invalid email or password.' });

@@ -27,6 +27,13 @@ function sessionDaysFromEnv() {
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 365 ? Math.floor(parsed) : 30;
 }
 
+function positiveIntFromEnv(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = process.env[name];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
+}
+
 /**
  * How many proxy hops to trust when Express derives the client IP from
  * X-Forwarded-For (used by the login/register rate limiter). Default is 1:
@@ -105,6 +112,46 @@ export const config = {
   databasePath: resolveServerPath(process.env.DATABASE_PATH, './data/app.db'),
   workspaceRoot: resolveServerPath(process.env.WORKSPACE_ROOT, './workspaces'),
 
+  // Optional persistent storage backends. Both remain disabled by default:
+  // local SQLite + local workspace files are still the development/test path.
+  // DATABASE_BACKEND=postgres uses Neon (or any PostgreSQL) over DATABASE_URL.
+  // DATABASE_BACKEND=pglite is a local in-process Postgres-compatible test backend.
+  databaseBackend: ['sqlite', 'postgres', 'pglite'].includes((process.env.DATABASE_BACKEND || '').toLowerCase())
+    ? (process.env.DATABASE_BACKEND || '').toLowerCase()
+    : 'sqlite',
+  databaseUrl: (process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || '').trim(),
+  databaseSsl: process.env.DATABASE_SSL !== 'false',
+  databaseRejectUnauthorized: process.env.DATABASE_REJECT_UNAUTHORIZED !== 'false',
+  // Local Postgres-compatible tests may reuse a file-backed PGlite directory.
+  pgliteDataDir: (process.env.PGLITE_DATA_DIR || '').trim(),
+  storageBridgeTimeoutMs: Number.isFinite(Number(process.env.STORAGE_BRIDGE_TIMEOUT_MS))
+    && Number(process.env.STORAGE_BRIDGE_TIMEOUT_MS) > 0
+    ? Number(process.env.STORAGE_BRIDGE_TIMEOUT_MS)
+    : 60_000,
+
+  // Workspace object storage. WORKSPACE_STORAGE=s3 uses an S3-compatible
+  // endpoint (Neon Object Storage); "memory" is a local test-only stand-in.
+  workspaceStorage: ['local', 's3', 'memory'].includes((process.env.WORKSPACE_STORAGE || '').toLowerCase())
+    ? (process.env.WORKSPACE_STORAGE || '').toLowerCase()
+    : 'local',
+  workspaceS3Endpoint: (process.env.WORKSPACE_S3_ENDPOINT || '').trim(),
+  workspaceS3Bucket: (process.env.WORKSPACE_S3_BUCKET || '').trim(),
+  workspaceS3Region: (process.env.WORKSPACE_S3_REGION || 'auto').trim() || 'auto',
+  workspaceS3AccessKey: (process.env.WORKSPACE_S3_ACCESS_KEY || '').trim(),
+  workspaceS3SecretKey: (process.env.WORKSPACE_S3_SECRET_KEY || '').trim(),
+  workspaceS3Prefix: (process.env.WORKSPACE_S3_PREFIX || 'workspaces').trim() || 'workspaces',
+
+  // Optional Python 3 executable for python_check/python_run. The default is
+  // `python` on Windows and `python3` elsewhere; no project code is executed
+  // unless the user explicitly approves a python_run proposal.
+  pythonBin: (process.env.PYTHON_BIN || '').trim()
+    || (process.platform === 'win32' ? 'python' : 'python3'),
+  // Hard limits for the backend-owned Python subprocess runner. These are not
+  // sandbox controls: generated Python still runs with the server account's OS
+  // privileges. They only bound wall-clock time and captured output.
+  pythonRunTimeoutMs: positiveIntFromEnv('PYTHON_RUN_TIMEOUT_MS', 30_000, { min: 100, max: 600_000 }),
+  pythonRunMaxOutputBytes: positiveIntFromEnv('PYTHON_RUN_MAX_OUTPUT_BYTES', 16_000, { min: 1, max: 1_048_576 }),
+
   // Authentication defaults. Registration stays enabled so a fresh deployment
   // can create accounts after bootstrap; the FIRST account always requires
   // BOOTSTRAP_TOKEN (a server-side shared secret), so an unknown visitor can
@@ -151,7 +198,16 @@ export function safeSummary() {
     geminiApiKey: mask(config.geminiApiKey),
     geminiModel: config.geminiModel || '(not set)',
     databasePath: config.databasePath,
+    databaseBackend: config.databaseBackend,
+    databaseUrl: mask(config.databaseUrl),
     workspaceRoot: config.workspaceRoot,
+    workspaceStorage: config.workspaceStorage,
+    workspaceS3Endpoint: config.workspaceS3Endpoint || '(not set)',
+    workspaceS3Bucket: config.workspaceS3Bucket || '(not set)',
+    workspaceS3Prefix: config.workspaceS3Prefix,
+    pythonBin: config.pythonBin,
+    pythonRunTimeoutMs: config.pythonRunTimeoutMs,
+    pythonRunMaxOutputBytes: config.pythonRunMaxOutputBytes,
     allowRegistration: config.allowRegistration,
     authSessionDays: config.authSessionDays,
     bootstrapToken: mask(config.bootstrapToken),
@@ -169,7 +225,13 @@ export function redactSecrets(text) {
   if (typeof text !== 'string' || !text) return text;
   let safe = text;
   // Replace known configured secrets exactly, for both providers and Google.
-  for (const secret of [config.aiApiKey, config.geminiApiKey, config.googleClientSecret]) {
+  for (const secret of [
+    config.aiApiKey,
+    config.geminiApiKey,
+    config.googleClientSecret,
+    config.databaseUrl,
+    config.workspaceS3SecretKey,
+  ]) {
     if (secret) safe = safe.split(secret).join('[redacted]');
   }
   // Redact standard secret patterns: Bearer tokens, OpenAI/Anthropic/Google keys, GitHub PATs
@@ -178,6 +240,6 @@ export function redactSecrets(text) {
     // Google AI Studio keys start with "AIza".
     .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, '[redacted credential]')
     .replace(/\bBearer\s+[A-Za-z0-9_.-]+/gi, 'Bearer [redacted]')
-    .replace(/((?:AI_API_KEY|GEMINI_API_KEY|OPENROUTER_API_KEY|API_KEY|SECRET|PASSWORD|TOKEN))=["']?[^"'\s]+["']?/gi, '$1=[redacted]');
+    .replace(/((?:AI_API_KEY|GEMINI_API_KEY|OPENROUTER_API_KEY|API_KEY|DATABASE_URL|NEON_DATABASE_URL|WORKSPACE_S3_SECRET_KEY|SECRET|PASSWORD|TOKEN))=["']?[^"'\s]+["']?/gi, '$1=[redacted]');
   return safe;
 }

@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
-import { config } from '../config.js';
+import { config, redactSecrets } from '../config.js';
 import {
   createTextFile,
   ensureDir,
@@ -26,6 +25,7 @@ import {
   findPendingProposal,
 } from '../proposals/store.js';
 import { recoverInterruptedProposals } from '../proposals/recovery.js';
+import { pinPythonFile, runPythonCheck, runPythonFile } from '../python/executor.js';
 
 export const PROPOSAL_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -37,20 +37,23 @@ export function isProposalExpired(proposal) {
 }
 
 const MAX_COMMAND_OUTPUT = 16_000;
-const commandNames = new Set(['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check']);
+const commandNames = new Set([
+  'npm_test', 'npm_build', 'npm_lint', 'npm_format',
+  'node_check', 'python_check', 'python_run',
+]);
 // In a multi-user deployment every project's package.json is user-writable, so
 // an allowlisted `npm run <script>` would execute arbitrary code as the server
 // user (database, every workspace, environment secrets). Until a real sandbox
-// exists, multi-user mode only permits node_check, which parses a file without
-// executing it. Approval prompts and project ownership are not a boundary.
-const multiuserCommandNames = new Set(['node_check']);
+// exists, multi-user mode only permits non-executing syntax checks. Approval
+// prompts and project ownership are not an OS sandbox boundary.
+const multiuserCommandNames = new Set(['node_check', 'python_check']);
 
 function assertCommandAllowed(command, allowedCommands) {
   if (!commandNames.has(command)) {
     throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
   }
   if (!allowedCommands.has(command)) {
-    throw new WorkspaceError(403, 'Project npm scripts are disabled in multi-user deployments; only node_check is available.');
+    throw new WorkspaceError(403, 'Project scripts and python_run are disabled in multi-user deployments; only node_check and python_check are available.');
   }
 }
 
@@ -142,16 +145,16 @@ export const geminiToolDeclarations = [{
     },
     {
       name: 'run_command',
-      description: 'Stage one safe predefined project check for user approval. This does not run arbitrary shell commands, and nothing is run until the user approves it.',
+      description: 'Stage one safe predefined project check for user approval. This does not run arbitrary shell commands, and nothing is run until the user approves it. python_run executes a project .py file and is available only in trusted single-user mode.',
       parameters: {
         type: 'OBJECT',
         properties: {
           projectId: { type: 'INTEGER' },
           command: {
             type: 'STRING',
-            enum: ['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check'],
+            enum: ['npm_test', 'npm_build', 'npm_lint', 'npm_format', 'node_check', 'python_check', 'python_run'],
           },
-          path: { type: 'STRING', description: 'Required for node_check: source file path relative to project root.' },
+          path: { type: 'STRING', description: 'Required for node_check, python_check, and python_run: source file path relative to project root.' },
         },
         required: ['projectId', 'command'],
       },
@@ -175,10 +178,23 @@ function truncateOutput(value) {
     : text;
 }
 
-function runSafeCommand(root, command, relativePath, allowedCommands) {
+function runSafeCommand(
+  root,
+  command,
+  relativePath,
+  allowedCommands,
+  {
+    expectedDigest = null,
+    pythonBin = config.pythonBin,
+    pythonRunTimeoutMs = config.pythonRunTimeoutMs,
+    pythonRunMaxOutputBytes = config.pythonRunMaxOutputBytes,
+  } = {},
+) {
   if (!allowedCommands.has(command)) throw new WorkspaceError(400, 'Command is not in the safe command allowlist.');
   let executable;
   let args;
+  let result;
+  let cwd = root;
   if (command === 'node_check') {
     if (typeof relativePath !== 'string' || !/\.(?:js|mjs|cjs)$/i.test(relativePath)) {
       throw new WorkspaceError(400, 'node_check requires a relative .js, .mjs, or .cjs file path.');
@@ -186,6 +202,13 @@ function runSafeCommand(root, command, relativePath, allowedCommands) {
     const file = readTextFile(root, relativePath);
     args = ['--check', path.resolve(root, file.path)];
     executable = process.execPath;
+  } else if (command === 'python_check' || command === 'python_run') {
+    // The backend runner revalidates the canonical path and the SHA-256 digest
+    // pinned in the approved proposal immediately before spawning Python.
+    const limits = { pythonBin, timeoutMs: pythonRunTimeoutMs, maxOutputBytes: pythonRunMaxOutputBytes };
+    result = command === 'python_check'
+      ? runPythonCheck(root, relativePath, limits)
+      : runPythonFile(root, relativePath, { ...limits, expectedDigest });
   } else {
     const scriptKey = {
       npm_test: 'test',
@@ -193,12 +216,13 @@ function runSafeCommand(root, command, relativePath, allowedCommands) {
       npm_lint: 'lint',
       npm_format: 'format',
     }[command];
-    const packageJsonPath = path.join(root, 'package.json');
     let packageJson;
     try {
-      packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+      packageJson = JSON.parse(readTextFile(root, 'package.json').content);
     } catch (error) {
-      if (error.code === 'ENOENT') throw new WorkspaceError(400, 'This workspace has no package.json.');
+      if (error.code === 'ENOENT' || (error instanceof WorkspaceError && error.status === 404)) {
+        throw new WorkspaceError(400, 'This workspace has no package.json.');
+      }
       if (error instanceof SyntaxError) throw new WorkspaceError(400, 'The workspace package.json is invalid JSON.');
       throw error;
     }
@@ -209,14 +233,16 @@ function runSafeCommand(root, command, relativePath, allowedCommands) {
     executable = 'npm';
   }
 
-  const result = spawnSync(executable, args, {
-    cwd: root,
-    encoding: 'utf8',
-    timeout: 30_000,
-    maxBuffer: MAX_COMMAND_OUTPUT * 2,
-    shell: process.platform === 'win32' && executable === 'npm',
-    windowsHide: true,
-  });
+  if (!result) {
+    result = spawnSync(executable, args, {
+      cwd,
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: MAX_COMMAND_OUTPUT * 2,
+      shell: process.platform === 'win32' && executable === 'npm',
+      windowsHide: true,
+    });
+  }
   if (result.error) {
     const error = new Error(result.error.code === 'ETIMEDOUT'
       ? 'Safe project command timed out after 30 seconds.'
@@ -226,23 +252,31 @@ function runSafeCommand(root, command, relativePath, allowedCommands) {
   }
   return {
     command,
-    exitCode: result.status,
-    stdout: truncateOutput(result.stdout),
-    stderr: truncateOutput(result.stderr),
+    exitCode: result.exitCode ?? result.status,
+    // The same redaction is applied to the stored copy in completeProposal,
+    // but the HTTP response also needs it before it reaches the browser.
+    stdout: redactSecrets(truncateOutput(result.stdout || '')),
+    stderr: redactSecrets(truncateOutput(result.stderr || '')),
   };
 }
 
-export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
+export function createWorkspaceTools({
+  db,
+  allowProjectCommands = true,
+  pythonBin = config.pythonBin,
+  pythonRunTimeoutMs = config.pythonRunTimeoutMs,
+  pythonRunMaxOutputBytes = config.pythonRunMaxOutputBytes,
+} = {}) {
   // Finish or fail proposals left mid-application by a previous process before
   // any request can see them. This is read-only for the workspace.
   recoverInterruptedProposals({ db, workspaceRoot: config.workspaceRoot });
 
-  // Multi-user deployments disable npm_* scripts: project package.json is
-  // user-writable, so `npm run <script>` would execute arbitrary code as the
-  // server user (database, every workspace, environment secrets). Until a real
-  // sandbox exists, only node_check (a non-executing syntax check) is allowed.
-  // The same restricted set is enforced here, so the background task executor
-  // and the HTTP approval flow can never bypass it.
+  // Multi-user deployments disable npm_* scripts and python_run: project files
+  // are user-writable, so they would execute arbitrary code as the server user
+  // (database, every workspace, environment secrets). Until a real sandbox
+  // exists, only non-executing node_check/python_check syntax checks are
+  // allowed. The same restricted set is enforced here, so the background task
+  // executor and the HTTP approval flow can never bypass it.
   const allowedCommands = allowProjectCommands ? commandNames : multiuserCommandNames;
 
   /**
@@ -270,7 +304,7 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
     if (kind === 'update') {
       const original = readTextFile(root, path);
       const diff = unifiedDiff(original.content, content, { oldPath: original.path, newPath: original.path });
-      const existing = findPendingProposal(db, projectId, 'update', original.path, content, null);
+      const existing = findPendingProposal(db, projectId, 'update', original.path, content, null, null);
       if (existing) return existing;
       return stageProposal(db, {
         projectId,
@@ -283,7 +317,7 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
     }
 
     const diff = unifiedDiff('', content, { oldPath: path, newPath: path });
-    const existing = findPendingProposal(db, projectId, 'create', path, content, null);
+    const existing = findPendingProposal(db, projectId, 'create', path, content, null, null);
     if (existing) return existing;
     return stageProposal(db, {
       projectId,
@@ -300,15 +334,26 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
    * `runApprovedCommand`.
    */
   function stageCommand({ projectId, command, path = null }) {
-    projectRootFor(db, projectId, config.workspaceRoot);
+    const root = projectRootFor(db, projectId, config.workspaceRoot);
     assertCommandAllowed(command, allowedCommands);
-    const existing = findPendingProposal(db, projectId, 'command', null, null, command);
+    let commandPath = typeof path === 'string' ? path : null;
+    // The existing proposal `content` field stores the SHA-256 digest for
+    // Python commands. No schema change, new approval route, or new table is
+    // needed: the user approves the exact file path and content fingerprint.
+    let content = null;
+    if (command === 'python_check' || command === 'python_run') {
+      const pinned = pinPythonFile(root, path);
+      commandPath = pinned.path;
+      content = pinned.digest;
+    }
+    const existing = findPendingProposal(db, projectId, 'command', null, content, command, commandPath);
     if (existing) return existing;
     return stageProposal(db, {
       projectId,
       kind: 'command',
+      content,
       command,
-      commandPath: typeof path === 'string' ? path : null,
+      commandPath,
     });
   }
 
@@ -348,11 +393,16 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
           return searchWorkspace(root, args.query);
         case 'run_command': {
           const proposal = stageCommand({ projectId: args.projectId, command: args.command, path: args.path });
+          const isPython = proposal.command === 'python_check' || proposal.command === 'python_run';
           return {
             proposalId: proposal.id,
-            command: args.command,
+            command: proposal.command,
+            path: proposal.command_path ?? null,
+            ...(isPython && proposal.content ? { contentSha256: proposal.content } : {}),
             status: 'awaiting_user_approval',
-            note: 'NOTHING HAS BEEN RUN. This command is staged only and is waiting for the user to approve it. Tell the user it is awaiting approval; never say it was run or executed.',
+            note: isPython
+              ? 'NOTHING HAS BEEN RUN. This Python operation is staged only and is waiting for the user to approve it. The exact file path and SHA-256 digest are pinned in the approval; never say it was run or executed.'
+              : 'NOTHING HAS BEEN RUN. This command is staged only and is waiting for the user to approve it. Tell the user it is awaiting approval; never say it was run or executed.',
           };
         }
         default:
@@ -420,6 +470,7 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
             type: 'command',
             command: proposal.command,
             path: proposal.command_path ?? null,
+            ...(proposal.kind === 'command' && proposal.content ? { contentSha256: proposal.content } : {}),
             status: 'awaiting_user_approval',
           };
         }
@@ -453,11 +504,16 @@ export function createWorkspaceTools({ db, allowProjectCommands = true } = {}) {
       let result;
       try {
         const root = projectRootFor(db, proposal.project_id, config.workspaceRoot);
-        result = runSafeCommand(root, proposal.command, proposal.command_path, allowedCommands);
+        result = runSafeCommand(root, proposal.command, proposal.command_path, allowedCommands, {
+          expectedDigest: proposal.content,
+          pythonBin,
+          pythonRunTimeoutMs,
+          pythonRunMaxOutputBytes,
+        });
       } catch (error) {
-        if (error instanceof WorkspaceError) {
-          // Pre-flight refusal (missing package.json, bad node_check path,
-          // missing workspace): the command never started, so retry is safe.
+        if (error instanceof WorkspaceError && error.preflight !== false) {
+          // Pre-flight refusal (missing package.json, changed Python digest,
+          // missing interpreter): nothing started, so retry is safe.
           releaseClaim(db, proposalId);
         } else {
           // Timeout or spawn failure: it may have partially run. Never retry.

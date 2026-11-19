@@ -5,13 +5,28 @@ import { ensureResultColumn } from '../proposals/store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
+import { createPostgresDb, POSTGRES_SCHEMA_SQL } from '../storage/postgres-db.js';
+
+function openPersistentDb() {
+  const db = createPostgresDb(config);
+  db.exec(POSTGRES_SCHEMA_SQL);
+  // Idempotent first-account promotion, matching the SQLite migration.
+  db.exec(`UPDATE users SET is_admin = 1
+           WHERE id = (SELECT MIN(id) FROM users)
+             AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)`);
+  ensurePlanColumn(db);
+  ensureAutonomyColumn(db);
+  ensureResultColumn(db);
+  return db;
+}
 
 /**
- * Opens (and initializes, if needed) the local SQLite database.
+ * Opens (and initializes, if needed) the configured database.
  * The path comes from config (DATABASE_PATH in the project-root .env,
  * defaults to server/data/app.db) which lives in a git-ignored folder.
  */
 export function openDb() {
+  if (config.databaseBackend !== 'sqlite') return openPersistentDb();
   fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
   const db = new DatabaseSync(config.databasePath);
 
@@ -88,6 +103,9 @@ export function openDb() {
     db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT');
   }
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users (google_sub)');
+  // Match the Postgres schema and keep case-insensitive email lookups indexed
+  // even for legacy rows that were stored with mixed case.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email))');
 
   // One-time OAuth state values for the Google sign-in flow. Only the
   // SHA-256 hash of each state is stored, and rows are consumed (deleted)

@@ -262,6 +262,30 @@ test('task detail projects linked proposals without applying or running them', a
   assert.equal(db.prepare('SELECT status FROM proposals WHERE id = ?').get(commandProposal.id).status, 'pending');
 });
 
+test('task API omits plan_json and exposes only safe linked proposal ids', async () => {
+  const proposal = proposedFile({
+    path: 'private-plan.js',
+    content: 'TOP_SECRET_PLAN_CONTENT\n',
+  });
+  const task = makeWaitingTask('Hide the saved plan', [proposal.id]);
+
+  const detail = await request('GET', `/api/tasks/${task.id}`);
+  assert.equal(detail.status, 200);
+  assert.equal('plan_json' in detail.data.task, false);
+  assert.equal(JSON.stringify(detail.data.task).includes('TOP_SECRET_PLAN_CONTENT'), false);
+  assert.deepEqual(detail.data.task.linkedProposalIds, [proposal.id]);
+
+  const list = await request('GET', `/api/tasks?projectId=${projectId}`);
+  assert.equal(list.status, 200);
+  assert.equal('plan_json' in list.data.tasks[0], false);
+  assert.deepEqual(list.data.tasks[0].linkedProposalIds, [proposal.id]);
+
+  const created = await postTask({ instruction: 'A brand new task' });
+  assert.equal(created.status, 201);
+  assert.equal('plan_json' in created.data.task, false);
+  assert.deepEqual(created.data.task.linkedProposalIds, []);
+});
+
 test('task detail reflects an applied file proposal after explicit approval', async () => {
   fs.mkdirSync(projectRoot(), { recursive: true });
   const proposal = proposedFile({ path: 'applied.js' });

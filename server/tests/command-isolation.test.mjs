@@ -1,8 +1,9 @@
-// F1 regression tests: project `npm_*` commands are disabled in multi-user
-// (auth-enabled) deployments until a real sandbox exists. Only `node_check`
-// (a non-executing syntax check) survives. The same restriction is enforced
-// by `runSafeCommand` and `stageCommand`, so neither the HTTP approval flow
-// nor the background task executor can run arbitrary project scripts.
+// F1 regression tests: project `npm_*` commands and python_run are disabled in
+// multi-user (auth-enabled) deployments until a real sandbox exists. Only
+// `node_check` and `python_check` (non-executing syntax checks) survive. The same
+// restriction is enforced by `runSafeCommand` and `stageCommand`, so neither the
+// HTTP approval flow nor the background task executor can run arbitrary project
+// code. python_run remains available only in trusted single-user mode.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -89,9 +90,9 @@ after(() => {
   }
 });
 
-test('multi-user tools only expose node_check in run_command declarations', () => {
+test('multi-user tools only expose non-executing checks in run_command declarations', () => {
   const decl = tools.declarations[0].functionDeclarations.find((d) => d.name === 'run_command');
-  assert.deepEqual(decl.parameters.properties.command.enum, ['node_check']);
+  assert.deepEqual(decl.parameters.properties.command.enum, ['node_check', 'python_check']);
 });
 
 test('ordinary account cannot stage npm_test via auth-enabled app', async () => {
@@ -179,4 +180,71 @@ test('background task executor cannot stage or run npm_test under autonomous aut
   const proposals = db.prepare('SELECT id FROM proposals WHERE project_id = ? AND kind = ? AND command = ?').all(projectId, 'command', 'npm_test');
   assert.deepEqual(proposals, [], 'no npm_test proposal may be staged in autonomous multi-user mode');
   assert.equal(fs.existsSync(path.join(root, 'LEAK2.txt')), false, 'autonomous mode must never execute npm scripts');
+});
+
+test('python_check parses a .py file without executing it in multi-user mode', async () => {
+  const alice = await register('alice-pycheck@example.com');
+  const projectId = await createProject(alice.token, 'Python check project');
+  const projectRoot = workspaceDir(projectId);
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(projectRoot, 'side_effect.py'),
+    "from pathlib import Path\nPath('PY_CHECK_RAN').write_text('yes')\n",
+  );
+
+  const staged = await tools.execute('run_command', {
+    projectId,
+    command: 'python_check',
+    path: 'side_effect.py',
+  });
+  assert.equal(staged.status, 'awaiting_user_approval');
+
+  const res = await request('POST', `/api/projects/${projectId}/commands/${staged.proposalId}/run`, {
+    token: alice.token,
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.data));
+  assert.equal(res.data.result.exitCode, 0, 'valid Python should pass ast.parse');
+  assert.equal(fs.existsSync(path.join(projectRoot, 'PY_CHECK_RAN')), false,
+    'python_check must parse, not execute, project code');
+});
+
+test('ordinary account cannot stage python_run via auth-enabled app', async () => {
+  const alice = await register('alice-pyrun@example.com');
+  const projectId = await createProject(alice.token, 'Python run project');
+  const projectRoot = workspaceDir(projectId);
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.writeFileSync(path.join(projectRoot, 'run.py'), "print('must not run')\n");
+
+  await assert.rejects(
+    tools.execute('run_command', { projectId, command: 'python_run', path: 'run.py' }),
+    /multi-user/,
+    'python_run must be refused without a sandbox',
+  );
+  const row = db.prepare(
+    'SELECT id FROM proposals WHERE project_id = ? AND kind = ? AND command = ?',
+  ).get(projectId, 'command', 'python_run');
+  assert.equal(row, undefined, 'no pending python_run proposal after refusal');
+});
+
+test('trusted single-user mode can run an explicitly approved python_run', async () => {
+  const trustedTools = createWorkspaceTools({ db, allowProjectCommands: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-trusted-python-'));
+  tempDirs.push(root);
+  const inserted = db.prepare('INSERT INTO projects (name, root_path) VALUES (?, ?)').run('trusted-python', root);
+  const projectId = Number(inserted.lastInsertRowid);
+  fs.writeFileSync(
+    path.join(root, 'run.py'),
+    "from pathlib import Path\nPath('RAN.txt').write_text('ran')\nprint('python_run ok')\n",
+  );
+
+  const staged = await trustedTools.execute('run_command', {
+    projectId,
+    command: 'python_run',
+    path: 'run.py',
+  });
+  assert.equal(staged.status, 'awaiting_user_approval');
+  const result = trustedTools.runApprovedCommand(projectId, staged.proposalId);
+  assert.equal(result.exitCode, 0, JSON.stringify(result));
+  assert.match(result.stdout, /python_run ok/);
+  assert.equal(fs.readFileSync(path.join(root, 'RAN.txt'), 'utf8'), 'ran');
 });

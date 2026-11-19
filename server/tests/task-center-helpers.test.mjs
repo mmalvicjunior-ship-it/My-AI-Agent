@@ -22,6 +22,15 @@ test('linkedProposalIds handles plan strings, object entries, and malformed plan
   assert.deepEqual(linkedProposalIds({ plan_json: { proposals: null } }), []);
 });
 
+test('linkedProposalIds prefers the safe API list over legacy plan_json', () => {
+  const task = {
+    linkedProposalIds: ['safe-1', '', 'safe-2', 7],
+    plan_json: { proposals: ['legacy-only'] },
+  };
+  assert.deepEqual(linkedProposalIds(task), ['safe-1', 'safe-2']);
+  assert.deepEqual(linkedProposalIds({ linkedProposalIds: [] }), []);
+});
+
 test('pendingCountForTask counts only linked pending proposal ids', () => {
   const task = { plan_json: '{"proposals":["a",{"id":"b"},"c"]}' };
   assert.equal(pendingCountForTask(task, new Set(['a', 'c', 'unrelated'])), 2);
@@ -47,6 +56,13 @@ test('proposal labels describe type, status, and action', () => {
   assert.equal(proposalDecisionLabel(file, 'approve'), 'Apply file');
   assert.equal(proposalDecisionLabel(command, 'approve'), 'Run command');
   assert.equal(proposalDecisionLabel(command, 'reject'), 'Reject');
+
+  const pythonRun = { type: 'command', command: 'python_run', status: 'pending' };
+  const pythonCheck = { type: 'command', command: 'python_check', status: 'pending' };
+  assert.equal(proposalTypeLabel(pythonRun), 'Python · Run');
+  assert.equal(proposalTypeLabel(pythonCheck), 'Python · Check');
+  assert.equal(proposalDecisionLabel(pythonRun, 'approve'), 'Run Python file');
+  assert.equal(proposalDecisionLabel(pythonCheck, 'approve'), 'Run Python check');
 });
 
 test('isProposalActionable blocks terminal, expired, unknown, and busy proposals', () => {

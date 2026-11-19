@@ -724,3 +724,44 @@ test('autonomous tasks still receive only the read-only provider tool surface', 
   assert.equal(proposalCount(project.id), 0);
   assert.ok(steps.some((step) => step.title === 'Refused create_file'));
 });
+
+test('empty recovery-only plan does not strand a paused task in waiting_approval', async () => {
+  const project = makeProject('empty-recovery');
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Resume after the provider quota reset.',
+    autonomy: 'propose',
+  });
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Provider paused before planning',
+    steps: [],
+    currentStep: 0,
+    repairAttempt: 0,
+    proposals: [],
+  });
+  db.prepare("UPDATE tasks SET status = 'provider_paused', error = ? WHERE id = ?")
+    .run('Rate limit exceeded: free-models-per-day.', task.id);
+
+  let providerCalls = 0;
+  const provider = makeProvider(async () => {
+    providerCalls += 1;
+    return {
+      text: JSON.stringify({ summary: 'Nothing to change after recovery.', needsChanges: false }),
+      provider: 'fake',
+      model: 'fake-1',
+    };
+  });
+
+  const result = await makeExecutor(provider)({
+    task: getTask(db, task.id),
+    addStep: (step) => appendStep(db, task.id, step),
+    phase: 'continue',
+  });
+
+  assert.equal(providerCalls, 1, 'recovery should re-plan instead of finalizing empty metadata');
+  assert.equal(result.status, 'completed');
+  assert.notEqual(result.status, 'waiting_approval');
+  const steps = listSteps(db, task.id);
+  assert.equal(steps.some((step) => step.title === 'Continuation'), false);
+});

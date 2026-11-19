@@ -9,6 +9,12 @@ export const TERMINAL_PROPOSAL_STATUSES = new Set([
 ]);
 
 export function linkedProposalIds(task) {
+  // The task API now omits plan_json (it may contain proposed file contents)
+  // and returns only this safe list. Keep the legacy shape readable for older
+  // cached responses.
+  if (Array.isArray(task?.linkedProposalIds)) {
+    return task.linkedProposalIds.filter((id) => typeof id === 'string' && id);
+  }
   let plan = task?.plan_json;
   if (typeof plan === 'string') {
     try {
@@ -32,7 +38,14 @@ export function pendingCountForTask(task, pendingIds) {
   return linkedProposalIds(task).filter((id) => pending.has(id)).length;
 }
 
+function isPythonCommand(proposal) {
+  return proposal?.command === 'python_check' || proposal?.command === 'python_run';
+}
+
 export function proposalTypeLabel(proposal) {
+  if (proposal?.type === 'command' && isPythonCommand(proposal)) {
+    return proposal.command === 'python_run' ? 'Python · Run' : 'Python · Check';
+  }
   if (proposal?.type === 'command') return 'Command';
   if (proposal?.type === 'file') {
     return proposal.action === 'update' ? 'File · Edit' : 'File · Create';
@@ -55,6 +68,9 @@ export function proposalStatusLabel(proposal) {
 
 export function proposalDecisionLabel(proposal, decision) {
   if (decision === 'reject') return 'Reject';
+  if (proposal?.type === 'command' && isPythonCommand(proposal)) {
+    return proposal.command === 'python_run' ? 'Run Python file' : 'Run Python check';
+  }
   if (proposal?.type === 'command') return 'Run command';
   return 'Apply file';
 }

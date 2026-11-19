@@ -600,22 +600,26 @@ export function createTaskExecutor({
     }
 
     // ----- Phase: plan / finalize / continue -----
-    if (phase === 'finalize' || phase === 'continue') {
+    // A paused task whose saved plan only contains recovery metadata has no
+    // usable work to finalize. Treat it like a fresh planning run instead of
+    // moving it to a waiting state that no approval worker can advance.
+    const hasUsablePlan = Boolean(savedPlan && typeof savedPlan === 'object' && (
+      (Array.isArray(savedPlan.proposals) && savedPlan.proposals.length > 0)
+      || (Array.isArray(savedPlan.steps) && savedPlan.steps.length > 0)
+    ));
+    if ((phase === 'finalize' || phase === 'continue') && hasUsablePlan) {
       const result = await finalizeTask(db, task, savedPlan, addStep);
-      // S4-D continuation: if the saved plan has remaining steps or repair
-      // attempts, persist progress and keep working instead of closing.
+      // Only a genuinely remaining ordered step justifies waiting here; a
+      // staged non-terminal proposal was already handled above. A low repair
+      // counter on its own is not work and must not strand the task.
       if (phase === 'continue' || (savedPlan && typeof savedPlan === 'object')) {
         const steps = Array.isArray(savedPlan?.steps) ? savedPlan.steps : [];
         const currentStep = Number(savedPlan?.currentStep ?? 0);
         const repairAttempt = Number(savedPlan?.repairAttempt ?? 0);
         const hasRemaining = currentStep < steps.length - 1;
-        const canRepair = repairAttempt < 3;
-        if (hasRemaining || canRepair) {
+        if (hasRemaining) {
           // Preserve progress; do not claim success if more work remains.
-          const patch = {
-            currentStep: hasRemaining ? currentStep + 1 : currentStep,
-            repairAttempt: canRepair ? repairAttempt : repairAttempt,
-          };
+          const patch = { currentStep: currentStep + 1, repairAttempt };
           const updated = refreshPlanProgress(db, task.id, patch);
           if (updated) {
             addStep({
@@ -728,7 +732,7 @@ export function createTaskExecutor({
     const planMessages = [
       {
         role: 'system',
-        content: `You are assisting a structured planning stage. The user instruction is: ${task.instruction}\nInspection summary: ${clip(inspectionSummary, 1200)}.\nRespond ONLY with a strict JSON object of this shape (no prose outside the JSON): {"summary":"redacted brief summary with no secrets","changes":[{"kind":"create"|"update","path":"relative/path.js","content":"full file content","goal":"brief reason"}],"commands":[{"command":"npm_test"|"npm_build"|"npm_lint"|"npm_format"|"node_check","path":"optional relative file","goal":"brief reason"}]}\nOnly include commands when the instruction asks to verify/test/build the project. Only include changes when the instruction asks for file edits. Never include secrets, API keys, environment values, or unnecessary file contents.`,
+        content: `You are assisting a structured planning stage. The user instruction is: ${task.instruction}\nInspection summary: ${clip(inspectionSummary, 1200)}.\nRespond ONLY with a strict JSON object of this shape (no prose outside the JSON): {"summary":"redacted brief summary with no secrets","changes":[{"kind":"create"|"update","path":"relative/path.js","content":"full file content","goal":"brief reason"}],"commands":[{"command":"npm_test"|"npm_build"|"npm_lint"|"npm_format"|"node_check"|"python_check"|"python_run","path":"optional relative file","goal":"brief reason"}]}\nOnly include commands when the instruction asks to verify/test/build the project. python_check parses a .py file without running it; python_run executes a .py file and is available only in trusted single-user mode. Only include changes when the instruction asks for file edits. Never include secrets, API keys, environment values, or unnecessary file contents.`,
       },
       { role: 'user', content: 'Produce the structured plan JSON for this instruction.' },
     ];

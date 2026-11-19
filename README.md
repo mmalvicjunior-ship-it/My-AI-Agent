@@ -190,8 +190,12 @@ sets `PROJECT_IMPORT_ROOT`, and the requested path must resolve inside that
 root. Paths inside the managed `WORKSPACE_ROOT` are always rejected because that
 tree holds every account's project files. The file scanner skips dependency/build
 folders and credential files. Gemini can inspect/search files and request the
-predefined `npm test`, `npm run build`, `npm run lint`, `npm run format`, and
-`node --check` tools.
+predefined `npm test`, `npm run build`, `npm run lint`, `npm run format`,
+`node --check`, `python_check`, and `python_run` tools. `python_check` parses a
+`.py` file without executing it. `python_run` executes an exact, digest-pinned
+`.py` file only after the same approval used by command proposals; it is refused
+in multi-user deployments. Generated Python is **not sandboxed** and runs with
+the backend account's operating-system privileges.
 
 OpenAI-compatible providers, including OpenRouter, can also use these workspace
 tools when the selected model supports function calling. Workspace tools are
@@ -383,7 +387,7 @@ prompts). Never commit real values.
 | `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after creating your account to close public registration. Does not affect the first account. |
 | `GOOGLE_CLIENT_ID` | No | Google OAuth 2.0 client ID (Web application). Enables the "Continue with Google" button. Render only; never the frontend. |
 | `GOOGLE_CLIENT_SECRET` | No | Google OAuth 2.0 client secret. Server-side only, never exposed to the browser. |
-| `GOOGLE_OAUTH_REDIRECT_URI` | No | Exact authorized redirect URI, e.g. `https://<your-vercel-app>/api/auth/google/callback`. |
+| `GOOGLE_OAUTH_REDIRECT_URI` | No | Exact authorized redirect URI. For the current Vercel app use `https://my-ai-agent-apps.vercel.app/api/auth/google/callback`. |
 | `APP_ORIGIN` | No | Base URL the browser returns to after the Google callback. Empty = same-origin relative redirect. Must be an absolute https origin (http only on localhost) with no credentials, path, query or fragment; invalid values fail startup closed. |
 | `PROJECT_IMPORT_ROOT` | No | Leave unset to disable importing existing server directories. When set, imports must resolve inside this directory; paths inside `WORKSPACE_ROOT` are always rejected. |
 | `NODE_VERSION` | Recommended | `22`. |
@@ -391,10 +395,57 @@ prompts). Never commit real values.
 | `HOST` | No | Leave unset so the server binds all interfaces. |
 | `DEBUG_CHAT_PROMPTS` | No | Keep `false` in production. |
 
+For the current OpenRouter setup keep `AI_PROVIDER=openai`,
+`OPENAI_BASE_URL=https://openrouter.ai/api/v1`, the existing `AI_MODEL` value,
+and the OpenRouter `AI_API_KEY` in Render only. `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`, and optional `APP_ORIGIN`
+also belong in Render only.
+
 `AI_API_KEY`/`AI_MODEL`/`OPENAI_BASE_URL` configure OpenRouter.
 `GEMINI_API_KEY`/`GEMINI_MODEL` configure Gemini independently, so both
 providers can be available at once and the in-app selector can switch chat
 between them. Background tasks keep using the startup `AI_PROVIDER`.
+
+#### Optional persistent-storage and Python variables
+
+The checked-in `render.yaml` intentionally keeps the original SQLite + local
+workspace-disk configuration (`DATABASE_PATH=/var/data/app.db`,
+`WORKSPACE_ROOT=/var/data/workspaces`, 1 GB disk). If you choose a managed
+database or object storage instead, add these variables in the **Render backend
+service** only; none belong in Vercel or in any `VITE_*` variable.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `DATABASE_BACKEND` | `sqlite` | `postgres` enables Neon/PostgreSQL; `pglite` is a local compatibility-test backend, not a production choice. |
+| `DATABASE_URL` | empty | Required for `postgres`; accepts a Neon pooled or direct PostgreSQL URL. Secret. |
+| `NEON_DATABASE_URL` | empty | Alias for `DATABASE_URL`; used only when `DATABASE_URL` is empty. Secret. |
+| `DATABASE_SSL` | `true` | Set `false` only for a controlled local database without TLS. |
+| `DATABASE_REJECT_UNAUTHORIZED` | `true` | Keep `true` for valid TLS certificates; `false` is for controlled local testing only. |
+| `STORAGE_BRIDGE_TIMEOUT_MS` | `60000` | Timeout for the synchronous worker bridge used by the async Postgres/S3 drivers. |
+| `WORKSPACE_STORAGE` | `local` | `s3` enables an S3-compatible endpoint; `memory` is a test-only stand-in. Imports of existing directories are rejected when this is not `local`. |
+| `WORKSPACE_S3_ENDPOINT` | empty | S3-compatible HTTPS endpoint. Required for `s3`. |
+| `WORKSPACE_S3_BUCKET` | empty | Bucket name. Required for `s3`. |
+| `WORKSPACE_S3_REGION` | `auto` | Region for compatible providers that require one. |
+| `WORKSPACE_S3_ACCESS_KEY` | empty | Access key ID. Secret; Render only. |
+| `WORKSPACE_S3_SECRET_KEY` | empty | Secret access key. Secret; Render only. |
+| `WORKSPACE_S3_PREFIX` | `workspaces` | Key prefix under which per-project files are stored. |
+| `PGLITE_DATA_DIR` | empty | Optional local directory for PGlite compatibility tests; unused by `sqlite`/`postgres`. |
+| `PYTHON_BIN` | `python` (Windows), `python3` otherwise | Python 3.12+ executable for `python_check`/`python_run`. `python_run` is refused in multi-user mode. On local Windows 3.12.10 use the absolute path `C:\Users\Malvic\AppData\Local\Python\pythoncore-3.12-64\python.exe`; that path is not valid on Render. |
+| `PYTHON_RUN_TIMEOUT_MS` | `30000` | Backend subprocess timeout (100–600000 ms). On timeout the direct Python process and its process tree are forcibly terminated. |
+| `PYTHON_RUN_MAX_OUTPUT_BYTES` | `16000` | Combined stdout/stderr cap (1–1048576 bytes). Exceeding it fails the proposal rather than returning partial output. |
+
+These limits bound time and captured output; they are not a security sandbox.
+The supplied DeepSeek execution-engine source (`execution_engine/`,
+`engine_cli.py`, `node_integration/`, `tests/`, `pyproject.toml`) was not present
+in the repository or accessible workspace, so no approval-proof signing,
+interpreter-fingerprint protocol, task-document mode, stdin mode, or Windows Job
+Object guarantee is claimed. The backend runner above uses the existing
+persisted proposal claim instead.
+
+Local PGlite and in-memory S3 tests verify driver contracts only; they are
+**not** live Neon/PostgreSQL or real S3 verification. Confirm the managed
+services, credentials, network access, and data migration separately before
+switching a deployment away from the default SQLite/disk mode.
 
 **Migration note:** if the Render service previously used `AI_PROVIDER=gemini`
 with the Gemini key stored in `AI_API_KEY`, move that key to
@@ -459,6 +510,11 @@ the service publicly:
   cross-site scripting bug could read them; keep the frontend dependencies
   patched and the bundle free of untrusted HTML.
 - Treat `/var/data/app.db` as sensitive: it holds password and session hashes.
+- Project files are user-writable, so approval prompts and project ownership are
+  not an OS sandbox. Multi-user deployments allow only `node_check` and
+  `python_check` (parsing, no execution); `npm_*` scripts and `python_run` are
+  refused. `python_run` is available only in trusted single-user mode and still
+  requires explicit approval. Do not describe this as a sandbox.
 
 `createApp({ auth: false })` exists only for the automated tests. The production
 entry point calls `createApp()` with no options, so a deployed server always

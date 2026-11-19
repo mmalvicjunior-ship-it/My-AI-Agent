@@ -7,6 +7,12 @@ import AuthScreen from './AuthScreen';
 import ProjectDialog from './ProjectDialog';
 import WorkspaceFiles from './WorkspaceFiles';
 import { isSessionExpiredResponse } from './authResponse';
+import {
+  TASK_LIST_LIMIT,
+  buildPromptWithAttachment,
+  quickActionsFor,
+  responseScopeKey,
+} from './workspaceUiHelpers.js';
 
 const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
 const AUTH_KEY = 'myai.auth.v1';
@@ -223,7 +229,7 @@ const TOOL_STATUS_VIEW = {
   running: { className: 'running', icon: '…', label: 'running' },
 };
 
-function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, onApplyProposal, onDiscardProposal, onRunCommand }) {
+function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, onApplyProposal, onDiscardProposal, onRunCommand, onRejectCommand }) {
   const articleRef = useRef(null);
 
   useEffect(() => {
@@ -271,6 +277,8 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
           <div className="tool-activity" aria-label="Agent actions">
             {message.toolActivity.map((activity, activityIndex) => {
               const status = TOOL_STATUS_VIEW[activity.status] || TOOL_STATUS_VIEW.running;
+              const approvalCommand = activity.commandApproval?.command;
+              const isPythonApproval = approvalCommand === 'python_check' || approvalCommand === 'python_run';
               return (
               <div key={`${activity.tool}-${activityIndex}`} className="tool-activity-group">
                 <span className={`tool-activity-item ${status.className}`}>
@@ -301,11 +309,26 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
                 )}
                 {activity.commandApproval && (
                   <div className="command-approval">
-                    <span>Command approval required: <code>{activity.commandApproval.command}</code></span>
-                    {!activity.commandResult && (
-                      <button onClick={() => onRunCommand(sessionId, index, activityIndex, activity.projectId, activity.commandApproval.proposalId)}>
-                        Run approved command
-                      </button>
+                    <span>
+                      {isPythonApproval ? 'Python approval required' : 'Command approval required'}:{' '}
+                      <code>{activity.commandApproval.command}</code>
+                      {activity.commandApproval.path && <> · <code>{activity.commandApproval.path}</code></>}
+                      {activity.commandApproval.contentSha256 && (
+                        <> · digest <code>{String(activity.commandApproval.contentSha256).slice(0, 19)}…</code></>
+                      )}
+                    </span>
+                    {!activity.commandResult && !activity.commandState && (
+                      <>
+                        <button onClick={() => onRunCommand(sessionId, index, activityIndex, activity.projectId, activity.commandApproval.proposalId)}>
+                          {isPythonApproval ? 'Run approved Python operation' : 'Run approved command'}
+                        </button>
+                        <button onClick={() => onRejectCommand(sessionId, index, activityIndex, activity.projectId, activity.commandApproval.proposalId)}>
+                          Reject
+                        </button>
+                      </>
+                    )}
+                    {activity.commandState === 'rejected' && (
+                      <span className="proposal-state">Rejected — nothing was run</span>
                     )}
                     {activity.commandResult && (
                       <pre>Exit code: {activity.commandResult.exitCode}{'\n'}{activity.commandResult.stdout}{activity.commandResult.stderr}</pre>
@@ -346,6 +369,7 @@ function App() {
     provider: null,
     providerLabel: null,
     providers: null,
+    npmScriptsEnabled: false,
     warning: 'Checking AI provider configuration…',
   });
   const [projects, setProjects] = useState([]);
@@ -391,8 +415,11 @@ function App() {
   const taskLoadScopeRef = useRef(null);
   const taskLoadGenerationRef = useRef(0);
   const workspaceRequestRef = useRef(0);
+  const workspaceFileRequestRef = useRef(0);
   const searchRequestRef = useRef(0);
   const taskDetailRequestRef = useRef(0);
+  const selectedFileRef = useRef(selectedFile);
+  selectedFileRef.current = selectedFile;
   const messageListRef = useRef(null);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
@@ -612,45 +639,53 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const accountScope = () => responseScopeKey(authRef.current?.user?.id ?? null, null);
     const checkHealth = async () => {
+      const scope = accountScope();
+      const isCurrent = () => !cancelled && accountScope() === scope;
       try {
         const response = await apiFetch(`${API_BASE}/api/health`);
         if (!response.ok) throw new Error(`Health check returned ${response.status}`);
         const data = await response.json();
-        if (!cancelled) {
-          setHealth({
-            online: true,
-            provider: data.aiProvider || 'mock',
-            providerLabel: data.providerLabel || null,
-            providers: data.providers || null,
-            warning: data.aiWarning || null,
-          });
-        }
+        if (!isCurrent()) return;
+        setHealth({
+          online: true,
+          provider: data.aiProvider || 'mock',
+          providerLabel: data.providerLabel || null,
+          providers: data.providers || null,
+          npmScriptsEnabled: data.npmScriptsEnabled !== false,
+          warning: data.aiWarning || null,
+        });
       } catch (error) {
-        if (!cancelled) {
-          setHealth({
-            online: false,
-            provider: null,
-            providerLabel: null,
-            providers: null,
-            warning: 'Cannot reach the AI server. Start or restart the backend and try again.',
-          });
-        }
+        if (!isCurrent()) return;
+        setHealth({
+          online: false,
+          provider: null,
+          providerLabel: null,
+          providers: null,
+          npmScriptsEnabled: false,
+          warning: 'Cannot reach the AI server. Start or restart the backend and try again.',
+        });
       }
     };
     const loadProjects = async () => {
       if (!authRef.current) {
-        setProjects([]);
-        setProjectId('');
+        if (!cancelled) {
+          setProjects([]);
+          setProjectId('');
+        }
         return;
       }
+      const scope = accountScope();
       try {
         const response = await apiFetch(`${API_BASE}/api/projects`);
         if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
         const data = await response.json();
-        if (!cancelled) setProjects(Array.isArray(data.projects) ? data.projects : []);
+        if (!cancelled && accountScope() === scope) {
+          setProjects(Array.isArray(data.projects) ? data.projects : []);
+        }
       } catch (error) {
-        console.warn('Could not load projects.', error);
+        if (!cancelled && accountScope() === scope) console.warn('Could not load projects.', error);
       }
     };
     checkHealth();
@@ -693,15 +728,16 @@ function App() {
     )));
   }, []);
 
-  const requestReply = useCallback(async ({ sessionId, prompt, history }) => {
+  const requestReply = useCallback(async ({ sessionId, prompt, history, attachment: requestAttachment = null }) => {
     if (generating) return;
     if (!health.online) {
-      setRetryRequest({ sessionId, prompt, history });
+      setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
       setToast({ message: 'The API is offline. Check that the server is running, then retry.' });
       return;
     }
     setGenerating(true);
     setToast(null);
+    const apiPrompt = buildPromptWithAttachment(prompt, requestAttachment);
     const controller = new AbortController();
     controllerRef.current = controller;
     const providerForRequest = CHAT_PROVIDER_IDS.has(selectedProvider)
@@ -713,7 +749,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          messages: [...history, { role: 'user', content: prompt }],
+          messages: [...history, { role: 'user', content: apiPrompt }],
           ...(providerForRequest ? { provider: providerForRequest } : {}),
           ...(projectId ? { projectId: Number(projectId) } : {}),
         }),
@@ -739,7 +775,7 @@ function App() {
       setRetryRequest(null);
     } catch (error) {
       if (error.name === 'AbortError') return;
-      setRetryRequest({ sessionId, prompt, history });
+      setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
       setToast({ message: error.message || 'Something went wrong. Please try again.' });
       if (['openai', 'gemini', 'huggingface', 'ollama'].includes(health.provider)
         && [401, 403, 429, 502, 503, 504].includes(error.status)) {
@@ -754,18 +790,21 @@ function App() {
   }, [generating, health.online, health.provider, projectId, selectedProvider, updateSession]);
 
   const sendMessage = useCallback(async (value = input) => {
-    const displayPrompt = attachment ? `${value}\n\n📎 ${attachment.name}` : value;
-    const prompt = attachment
-      ? `${value}\n\nReview the attached source file "${attachment.name}":\n\`\`\`\n${attachment.content}\n\`\`\``
-      : value;
-    if (!prompt.trim() || generating || !activeSession) return;
+    const rawPrompt = typeof value === 'string' ? value : '';
+    const displayPrompt = attachment ? `${rawPrompt}\n\n📎 ${attachment.name}` : rawPrompt;
+    const prompt = buildPromptWithAttachment(rawPrompt, attachment);
+    if (!rawPrompt.trim() || generating || !activeSession) return;
     if (prompt.length > MAX_CHARS) {
       setToast({ message: `Messages must be ${MAX_CHARS.toLocaleString()} characters or fewer.` });
       return;
     }
     const history = activeSession.messages.map(({ role, content }) => ({ role, content }));
     updateSession(activeSession.id, (session) => {
-      const nextMessages = [...session.messages, { role: 'user', content: displayPrompt }];
+      const nextMessages = [...session.messages, {
+        role: 'user',
+        content: displayPrompt,
+        ...(attachment ? { text: rawPrompt, attachment } : {}),
+      }];
       return {
         ...session,
         title: session.messages.length === 0
@@ -779,7 +818,7 @@ function App() {
     setAttachment(null);
     setDiffPreview(false);
     setRetryRequest(null);
-    await requestReply({ sessionId: activeSession.id, prompt, history });
+    await requestReply({ sessionId: activeSession.id, prompt: rawPrompt, history, attachment });
   }, [activeSession, attachment, generating, input, requestReply, updateSession]);
 
   const stopGeneration = () => {
@@ -863,6 +902,8 @@ function App() {
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not add the project.');
       setProjects((current) => [result.project, ...current]);
       setProjectId(String(result.project.id));
+      // The next scoped file load starts before React commits the new project.
+      projectIdRef.current = String(result.project.id);
       persistActiveProjectId(authUserId, String(result.project.id));
       setProjectDialogOpen(false);
       setWorkspaceTab('files');
@@ -889,8 +930,8 @@ function App() {
   };
 
   const loadTasks = useCallback(async (statusFilter = taskStatusFilterRef.current, scopeProjectId = projectIdRef.current) => {
-    const currentScope = () => `${authRef.current?.user?.id ?? 'anonymous'}:${projectIdRef.current || ''}`;
-    const scope = `${authRef.current?.user?.id ?? 'anonymous'}:${scopeProjectId || ''}`;
+    const currentScope = () => responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, scopeProjectId);
     if (taskLoadScopeRef.current !== scope) {
       // A different account or workspace must never keep the previous list on
       // screen while the new request is in flight.
@@ -907,6 +948,7 @@ function App() {
       const params = new URLSearchParams();
       if (scopeProjectId) params.set('projectId', String(scopeProjectId));
       if (statusFilter) params.set('status', statusFilter);
+      params.set('limit', String(TASK_LIST_LIMIT));
       const query = params.toString();
       const response = await apiFetch(`${API_BASE}/api/tasks${query ? `?${query}` : ''}`);
       const result = await response.json();
@@ -952,14 +994,16 @@ function App() {
 
   const loadTaskDetail = useCallback(async (taskId) => {
     const requestId = ++taskDetailRequestRef.current;
-    const scope = projectIdRef.current;
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
+    const isCurrent = () => requestId === taskDetailRequestRef.current
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
     try {
       const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not load task.');
       // Ignore a response for a task the user already navigated away from, or
-      // for a project that is no longer active.
-      if (requestId !== taskDetailRequestRef.current || scope !== projectIdRef.current) return;
+      // for an account/project that is no longer active.
+      if (!isCurrent()) return;
       setTaskDetail({
         task: result.task,
         steps: Array.isArray(result.steps) ? result.steps : [],
@@ -967,12 +1011,15 @@ function App() {
       });
       setTaskDetailError(null);
     } catch (error) {
-      if (requestId === taskDetailRequestRef.current) setTaskDetailError(error.message);
+      if (isCurrent()) setTaskDetailError(error.message);
     }
   }, [apiFetch]);
 
   const loadWorkspaceFiles = async (id = projectId) => {
     const requestId = ++workspaceRequestRef.current;
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, id);
+    const isCurrent = () => requestId === workspaceRequestRef.current
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
     if (!id) {
       setWorkspaceFiles([]);
       setSelectedFile(null);
@@ -985,28 +1032,32 @@ function App() {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not scan the project.');
-      if (requestId !== workspaceRequestRef.current) return;
+      if (!isCurrent()) return;
       setWorkspaceFiles(Array.isArray(result.files) ? result.files : []);
     } catch (error) {
-      if (requestId === workspaceRequestRef.current) setToast({ message: error.message });
+      if (isCurrent()) setToast({ message: error.message });
     } finally {
-      if (requestId === workspaceRequestRef.current) setWorkspaceLoading(false);
+      if (isCurrent()) setWorkspaceLoading(false);
     }
   };
 
   const openWorkspaceFile = async (filePath) => {
     if (!projectId) return;
+    const requestId = ++workspaceFileRequestRef.current;
     const openedProject = projectId;
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, openedProject);
+    const isCurrent = () => requestId === workspaceFileRequestRef.current
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(openedProject)}/file?path=${encodeURIComponent(filePath)}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not open file.');
-      // Ignore a slow response if the user already switched projects.
-      if (String(openedProject) !== String(projectIdRef.current)) return;
+      // Ignore a slow response if the user or project changed meanwhile.
+      if (!isCurrent()) return;
       setSelectedFile(result.path);
       setFileContent(result.content);
     } catch (error) {
-      setToast({ message: error.message });
+      if (isCurrent()) setToast({ message: error.message });
     }
   };
 
@@ -1014,15 +1065,18 @@ function App() {
     if (!projectId || fileSearch.trim().length < 2) return;
     const requestId = ++searchRequestRef.current;
     const searchedProject = projectId;
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, searchedProject);
+    const isCurrent = () => requestId === searchRequestRef.current
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(searchedProject)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not search project code.');
-      // Drop a response that arrived after a project switch or newer search.
-      if (requestId !== searchRequestRef.current || String(searchedProject) !== String(projectIdRef.current)) return;
+      // Drop a response that arrived after an account/project switch or a newer search.
+      if (!isCurrent()) return;
       setCodeSearchResults(Array.isArray(result.results) ? result.results : []);
     } catch (error) {
-      if (requestId === searchRequestRef.current) setToast({ message: error.message });
+      if (isCurrent()) setToast({ message: error.message });
     }
   };
 
@@ -1068,12 +1122,7 @@ function App() {
 
   const runQuickAction = (action) => {
     navigator.vibrate?.(10);
-    const prompt = action === 'Run Tests'
-      ? 'Inspect this project, run its tests using the safe npm test tool, and fix any failing test if appropriate.'
-      : action === 'Explain Code'
-        ? `Explain the selected file ${selectedFile || '(no file selected)'}. Inspect it first if a workspace is selected.`
-        : `Inspect the project formatter and format ${selectedFile || 'the project'} using only the safe npm_format tool if available.`;
-    sendMessage(prompt);
+    sendMessage(action.prompt);
   };
 
   // Records the outcome of a staged file proposal in the chat transcript so the
@@ -1097,6 +1146,12 @@ function App() {
   };
 
   const applyFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    const requestScope = responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
+    const originalFile = selectedFileRef.current;
+    const isCurrentScope = () => responseScopeKey(
+      authRef.current?.user?.id ?? null,
+      projectIdRef.current,
+    ) === requestScope;
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
         method: 'POST',
@@ -1106,12 +1161,17 @@ function App() {
       markProposal(sessionId, messageIndex, activityIndex, 'applied');
       setToast({ message: `Applied changes to ${result.file.path}.` });
       await loadWorkspaceFiles(String(id));
+      if (!isCurrentScope()) return;
       const fileResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
       const fileResult = await fileResponse.json();
       if (!fileResponse.ok || !fileResult.ok) throw new Error(fileResult.error || 'Created file but could not open it.');
-      setProjectId(String(id));
-      setSelectedFile(fileResult.path);
-      setFileContent(fileResult.content);
+      if (!isCurrentScope()) return;
+      // Do not yank the editor away if the user selected another file while
+      // the proposal was being applied. Refresh only the file still in view.
+      if (selectedFileRef.current === originalFile) {
+        setSelectedFile(fileResult.path);
+        setFileContent(fileResult.content);
+      }
     } catch (error) {
       setToast({ message: error.message });
     }
@@ -1126,6 +1186,38 @@ function App() {
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not discard the proposed file.');
       markProposal(sessionId, messageIndex, activityIndex, 'discarded');
       setToast({ message: 'Proposal discarded. Nothing was written.' });
+    } catch (error) {
+      setToast({ message: error.message });
+    }
+  };
+
+  const markCommandState = (sessionId, messageIndex, activityIndex, commandState) => {
+    updateSession(sessionId, (session) => ({
+      ...session,
+      messages: session.messages.map((message, currentIndex) => (
+        currentIndex === messageIndex
+          ? {
+            ...message,
+            toolActivity: message.toolActivity.map((activity, currentActivityIndex) => (
+              currentActivityIndex === activityIndex
+                ? { ...activity, commandState }
+                : activity
+            )),
+          }
+          : message
+      )),
+    }));
+  };
+
+  const rejectWorkspaceCommand = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+        method: 'POST',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Could not reject the command.');
+      markCommandState(sessionId, messageIndex, activityIndex, 'rejected');
+      setToast({ message: 'Command rejected. Nothing was run.' });
     } catch (error) {
       setToast({ message: error.message });
     }
@@ -1178,14 +1270,22 @@ function App() {
       }
     }
     if (lastUserIndex < 0) return;
+    const lastUserMessage = messages[lastUserIndex];
+    const storedAttachment = lastUserMessage.attachment || null;
+    // requestReply rebuilds the attached-file prompt; passing the stored
+    // attachment here is what makes regeneration keep the original context.
+    const rawPrompt = typeof lastUserMessage.text === 'string'
+      ? lastUserMessage.text
+      : lastUserMessage.content;
     updateSession(activeSession.id, (session) => ({
       ...session,
       messages: session.messages.slice(0, lastUserIndex + 1),
     }));
     requestReply({
       sessionId: activeSession.id,
-      prompt: messages[lastUserIndex].content,
+      prompt: rawPrompt,
       history: messages.slice(0, lastUserIndex).map(({ role, content }) => ({ role, content })),
+      attachment: storedAttachment,
     });
   };
 
@@ -1236,8 +1336,9 @@ function App() {
       setTaskInput('');
       setTaskSubmitting(false);
       setTasks((current) => [result.task, ...current]);
+      // loadTaskDetail already sets the detail; do not overwrite it with an
+      // empty shell after the real response arrives.
       await loadTaskDetail(result.task.id);
-      setTaskDetail({ task: result.task, steps: [], proposals: [] });
       setFocusTaskId(result.task.id);
       setWorkspaceTab('tasks');
       setWorkspaceOpen(true);
@@ -1327,6 +1428,12 @@ function App() {
       throw error;
     }
   }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+
+  const quickActions = useMemo(() => quickActionsFor({
+    hasProject: Boolean(activeProject),
+    npmScriptsEnabled: health.npmScriptsEnabled,
+    selectedFile,
+  }), [activeProject, health.npmScriptsEnabled, selectedFile]);
 
   const sortedSessions = useMemo(
     () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
@@ -1572,6 +1679,7 @@ function App() {
                     onApplyProposal={applyFileProposal}
                     onDiscardProposal={discardFileProposal}
                     onRunCommand={runApprovedWorkspaceCommand}
+                    onRejectCommand={rejectWorkspaceCommand}
                   />
                 ))}
                 {generating && (
@@ -1669,8 +1777,8 @@ function App() {
             </form>
             {activeProject && (
               <div className="quick-actions" aria-label="Quick actions">
-                {['Run Tests', 'Format Code', 'Explain Code'].map((action) => (
-                  <button key={action} type="button" onClick={() => runQuickAction(action)}>{action}</button>
+                {quickActions.map((action) => (
+                  <button key={action.label} type="button" onClick={() => runQuickAction(action)}>{action.label}</button>
                 ))}
               </div>
             )}
@@ -1750,6 +1858,7 @@ function App() {
                 focusTaskId={focusTaskId}
                 onFocusTask={() => setFocusTaskId(null)}
                 onNewProject={openProjectDialog}
+                hasProjects={projects.length > 0}
               />
             )}
           </div>

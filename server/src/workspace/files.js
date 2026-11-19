@@ -5,6 +5,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { WorkspaceError } from './errors.js';
+import { getWorkspaceDriver, afterWorkspaceWrite } from './storage-driver.js';
+
+export { WorkspaceError };
 
 export const MAX_READ_BYTES = 1024 * 1024; // 1 MiB per file read
 export const MAX_LIST_ENTRIES = 1000;
@@ -12,14 +16,6 @@ export const IGNORED_DIRECTORIES = new Set(['node_modules', '.git', '.next', 'di
 export const MAX_SCAN_FILES = 5000;
 export const MAX_SCAN_DEPTH = 12;
 const BINARY_SNIFF_BYTES = 8000;
-
-export class WorkspaceError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.name = 'WorkspaceError';
-    this.status = status;
-  }
-}
 
 /** Absolute directory that holds all project workspaces. */
 export function projectDir(workspaceRoot, projectId) {
@@ -29,6 +25,8 @@ export function projectDir(workspaceRoot, projectId) {
 export function getProjectRoot(db, workspaceRoot, projectId) {
   const project = db.prepare('SELECT id, root_path FROM projects WHERE id = ?').get(Number(projectId));
   if (!project) throw new WorkspaceError(404, 'Project not found.');
+  const driver = getWorkspaceDriver();
+  if (driver.mode !== 'local') return driver.prepare(project.id);
   const root = project.root_path || projectDir(workspaceRoot, project.id);
   try {
     const resolved = fs.realpathSync(root);
@@ -264,6 +262,7 @@ export function createTextFile(rootDir, relativePath, content, { allowDeployment
     if (error.code === 'EEXIST') throw new WorkspaceError(409, 'File already exists; create_file will not overwrite it.');
     throw error;
   }
+  afterWorkspaceWrite(rootDir, relative, 'create', null);
   return { path: relative, size: Buffer.byteLength(content, 'utf8') };
 }
 
@@ -360,6 +359,7 @@ export function writeTextFile(rootDir, relativePath, content) {
   // a destination swapped for a link afterwards is never written through.
   assertSafeDestination(root, destination);
   writeFileAtomic(destination, content);
+  afterWorkspaceWrite(rootDir, relative, exists ? 'update' : 'create', previous);
   return { path: relative, created: !exists, size: Buffer.byteLength(content, 'utf8'), previous };
 }
 
@@ -390,6 +390,7 @@ export function deletePath(rootDir, relativePath) {
   const buffer = fs.readFileSync(target.absolute);
   const binary = buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0);
   fs.unlinkSync(target.absolute);
+  afterWorkspaceWrite(rootDir, target.relative, 'delete', buffer);
   return {
     path: target.relative,
     type: 'file',
@@ -415,6 +416,7 @@ export function replaceTextFile(rootDir, relativePath, expectedContent, content,
   // The 409 check above is advisory for content, never a path boundary; the
   // atomic rename is what guarantees no link is written through.
   writeFileAtomic(target.absolute, content);
+  afterWorkspaceWrite(rootDir, target.relative, 'update', current.content);
   return { path: target.relative, size: Buffer.byteLength(content, 'utf8') };
 }
 

@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { createWorkspaceTools } from '../src/ai/tools.js';
 import { openDb } from '../src/db/index.js';
+import { stageProposal } from '../src/proposals/store.js';
 
 // Proposals are persisted now, so these tests use the real (temporary, see
 // tests/setup-test-env.mjs) SQLite database instead of a stub.
@@ -164,6 +165,99 @@ test('existing-file changes require approval and reject stale proposals', async 
       /changed since the proposal/,
     );
     assert.equal(fs.readFileSync(path.join(project.root, 'app.js'), 'utf8'), 'export const value = 3;\n');
+  } finally {
+    fs.rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test('running an npm proposal without package.json reports the original 400 error', async () => {
+  const project = makeProject('myai-no-package');
+  const tools = createWorkspaceTools({ db });
+  try {
+    const staged = await tools.execute('run_command', { projectId: project.id, command: 'npm_test' });
+    assert.throws(
+      () => tools.runApprovedCommand(project.id, staged.proposalId),
+      (error) => error.status === 400 && /no package\.json/i.test(error.message),
+    );
+  } finally {
+    fs.rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test('duplicate detection scans every pending row and compares command paths', async () => {
+  const project = makeProject('myai-dedup');
+  const tools = createWorkspaceTools({ db });
+  try {
+    // The first pending row intentionally does not match either retry. An
+    // earlier implementation stopped at row one and staged duplicates.
+    stageProposal(db, {
+      projectId: project.id,
+      kind: 'create',
+      path: 'first.js',
+      content: 'export const first = true;\n',
+    });
+    const secondFile = stageProposal(db, {
+      projectId: project.id,
+      kind: 'create',
+      path: 'second.js',
+      content: 'export const second = true;\n',
+    });
+    const reusedFile = await tools.execute('create_file', {
+      projectId: project.id,
+      path: 'second.js',
+      content: 'export const second = true;\n',
+    });
+    assert.equal(reusedFile.proposalId, secondFile.id);
+    assert.equal(tools.listProposals(project.id).proposals.length, 2);
+
+    stageProposal(db, {
+      projectId: project.id,
+      kind: 'command',
+      command: 'node_check',
+      commandPath: 'first.js',
+    });
+    const secondCommand = stageProposal(db, {
+      projectId: project.id,
+      kind: 'command',
+      command: 'node_check',
+      commandPath: 'second.js',
+    });
+    const reusedCommand = await tools.execute('run_command', {
+      projectId: project.id,
+      command: 'node_check',
+      path: 'second.js',
+    });
+    assert.equal(reusedCommand.proposalId, secondCommand.id);
+
+    const thirdCommand = await tools.execute('run_command', {
+      projectId: project.id,
+      command: 'node_check',
+      path: 'third.js',
+    });
+    assert.notEqual(thirdCommand.proposalId, secondCommand.id);
+    // Four staged rows plus one genuinely new third command.
+    assert.equal(tools.listProposals(project.id).proposals.length, 5);
+  } finally {
+    fs.rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test('command output is redacted before it is returned or stored', async () => {
+  const secret = 'sk-test-secret-key-1234567890';
+  const project = makeProject('myai-redaction');
+  fs.writeFileSync(path.join(project.root, 'package.json'),
+    JSON.stringify({ scripts: { test: `node -e "console.log('${secret}')"` } }));
+  const tools = createWorkspaceTools({ db });
+  try {
+    const staged = await tools.execute('run_command', { projectId: project.id, command: 'npm_test' });
+    const result = tools.runApprovedCommand(project.id, staged.proposalId);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout.includes(secret), false, 'HTTP result must not contain a credential');
+    assert.match(result.stdout, /\[redacted credential\]/);
+
+    const stored = db.prepare('SELECT result_json FROM proposals WHERE id = ?').get(staged.proposalId);
+    assert.equal(stored.result_json.includes(secret), false, 'stored result must not contain a credential');
+    assert.match(stored.result_json, /\[redacted credential\]/);
   } finally {
     fs.rmSync(project.root, { recursive: true, force: true });
   }

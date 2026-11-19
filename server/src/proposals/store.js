@@ -46,21 +46,34 @@ export function ensureResultColumn(db) {
  * Used to keep a retry or a resumed run from staging the same work twice.
  * Only `pending` rows match: an applied proposal is never repeated.
  */
-export function findPendingProposal(db, projectId, kind, path = null, content = null, command = null) {
-  const row = db
+export function findPendingProposal(
+  db,
+  projectId,
+  kind,
+  path = null,
+  content = null,
+  command = null,
+  commandPath = null,
+) {
+  // Inspect every pending row: the first row for this project/kind may be a
+  // different change, and an earlier version stopped there instead of finding a
+  // later row that actually matched. Commands also compare their path so two
+  // node_check/python_check proposals for different files stay distinct.
+  const rows = db
     .prepare(`
-      SELECT id, path, content, command
+      SELECT id, path, content, command, command_path
       FROM proposals
       WHERE project_id = ? AND kind = ? AND status = 'pending'
       ORDER BY rowid ASC
-      LIMIT 1
     `)
-    .get(Number(projectId), kind);
-  if (!row) return null;
-  if ((row.path ?? null) !== (path ?? null)) return null;
-  if ((row.command ?? null) !== (command ?? null)) return null;
-  if ((row.content ?? null) !== (content ?? null)) return null;
-  return getProposal(db, row.id);
+    .all(Number(projectId), kind);
+  const row = rows.find((candidate) => (
+    (candidate.path ?? null) === (path ?? null)
+    && (candidate.command ?? null) === (command ?? null)
+    && (candidate.content ?? null) === (content ?? null)
+    && (candidate.command_path ?? null) === (commandPath ?? null)
+  ));
+  return row ? getProposal(db, row.id) : null;
 }
 
 export function getProposal(db, id) {

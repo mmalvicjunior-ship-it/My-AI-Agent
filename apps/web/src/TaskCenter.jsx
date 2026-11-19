@@ -80,6 +80,8 @@ function ProposalCard({ proposal, busyProposalId, onDecision }) {
     note = 'The approval window expired. Nothing was applied or run.';
   } else if (proposal.status === 'pending' && proposal.type === 'file') {
     note = 'Nothing has been written. Review the diff, then explicitly approve or reject.';
+  } else if (proposal.status === 'pending' && proposal.type === 'command' && proposal.command === 'python_run') {
+    note = 'Nothing has been run. Approval is required before this exact Python file can execute.';
   } else if (proposal.status === 'pending' && proposal.type === 'command') {
     note = 'Nothing has been run. Approval is required before this command can execute.';
   } else if (proposal.status === 'rejected') {
@@ -119,6 +121,9 @@ function ProposalCard({ proposal, busyProposalId, onDecision }) {
         <div className="task-proposal-command">
           <code>{proposal.command}</code>
           {proposal.path && <span>Path: <code>{proposal.path}</code></span>}
+          {proposal.contentSha256 && (
+            <span>File digest: <code>{String(proposal.contentSha256).slice(0, 19)}…</code></span>
+          )}
         </div>
       )}
 
@@ -189,6 +194,7 @@ export default function TaskCenter({
   focusTaskId = null,
   onFocusTask,
   onNewProject,
+  hasProjects = false,
 }) {
   const timerRef = useRef(null);
   const proposalActionRef = useRef(null);
@@ -317,8 +323,12 @@ export default function TaskCenter({
     return (
       <div className="panel-empty">
         <div className="panel-empty-icon">✓</div>
-        <h3>No project selected</h3>
-        <p>Tasks run against the active project. Add or select a project first.</p>
+        <h3>{hasProjects ? 'No project selected' : 'No projects yet'}</h3>
+        <p>
+          {hasProjects
+            ? 'Tasks run against the active project. Add or select a project first.'
+            : 'Create or import a workspace before starting background tasks.'}
+        </p>
         <button type="button" className="primary-button" onClick={onNewProject}>Add a project</button>
       </div>
     );
@@ -334,7 +344,10 @@ export default function TaskCenter({
           <button
             type="button"
             className="icon-button"
-            onClick={refreshTasks}
+            onClick={() => {
+              if (selectedTaskId) loadTaskDetail(selectedTaskId);
+              loadTasks();
+            }}
             title="Refresh task"
             aria-label="Refresh task"
             disabled={taskLoading}

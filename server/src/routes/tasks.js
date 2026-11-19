@@ -51,6 +51,17 @@ function parseProposalResult(raw) {
 }
 
 /**
+ * Task rows contain the full saved plan, which can include proposed file
+ * contents. Never send it over HTTP: expose only the linked proposal ids the
+ * Task Center needs to match pending proposals.
+ */
+function publicTask(db, task) {
+  if (!task || typeof task !== 'object') return task;
+  const { plan_json: _planJson, ...safe } = task;
+  return { ...safe, linkedProposalIds: linkedProposalIds(loadPlan(db, task.id)) };
+}
+
+/**
  * Build a read-only, task-scoped proposal view from the proposal IDs recorded
  * in the task plan. Never returns stored file contents, and never performs an
  * apply, reject, or command run.
@@ -78,6 +89,7 @@ function projectTaskProposals(db, task) {
         type: 'command',
         command: row.command ?? null,
         path: row.command_path ?? null,
+        ...(row.content ? { contentSha256: row.content } : {}),
         result: parseProposalResult(row.result_json),
       });
       continue;
@@ -135,7 +147,7 @@ export function createTasksRouter({ db }) {
 
     try {
       const task = createTask(db, { projectId: project.id, instruction, autonomy, autonomous });
-      return res.status(201).json({ ok: true, task });
+      return res.status(201).json({ ok: true, task: publicTask(db, task) });
     } catch (err) {
       return sendError(res, err, 'create');
     }
@@ -173,7 +185,7 @@ export function createTasksRouter({ db }) {
         limit,
         ownerId: isBypassUser(req.user) ? null : req.user.id,
       });
-      return res.json({ ok: true, tasks });
+      return res.json({ ok: true, tasks: tasks.map((task) => publicTask(db, task)) });
     } catch (err) {
       return sendError(res, err, 'list');
     }
@@ -190,7 +202,7 @@ export function createTasksRouter({ db }) {
       }
       return res.json({
         ok: true,
-        task,
+        task: publicTask(db, task),
         steps: listSteps(db, id),
         proposals: projectTaskProposals(db, task),
       });
@@ -215,12 +227,12 @@ export function createTasksRouter({ db }) {
         return res.status(409).json({
           ok: false,
           error: `Task is already ${task.status} and cannot be cancelled.`,
-          task,
+          task: publicTask(db, task),
         });
       }
       return res.json({
         ok: true,
-        task: updated,
+        task: publicTask(db, updated),
         // A running task finishes cancelling on the runner's next check.
         cancelling: updated.status === 'running',
       });

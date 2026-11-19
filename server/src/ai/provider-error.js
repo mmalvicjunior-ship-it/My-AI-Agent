@@ -71,7 +71,8 @@ export async function createProviderHttpError(response, provider, apiKey) {
 
   // Structured error classification for recovery logic (never exposes keys).
   const isQuotaDaily = status === 429 && /free-models-per-day/i.test(upstreamMessage || '');
-  const isQuotaBudget = status === 402 || (status === 429 && /insufficient_quota/i.test(upstreamMessage || '') || /quota|budget|credit/i.test(upstreamMessage || ''));
+  const isQuotaBudget = status === 402
+    || (status === 429 && (/insufficient_quota/i.test(upstreamMessage || '') || /quota|budget|credit/i.test(upstreamMessage || '')));
   const isRateLimited = status === 429 && !isQuotaDaily && !isQuotaBudget;
   const isInvalidKey = status === 401 || status === 403;
 

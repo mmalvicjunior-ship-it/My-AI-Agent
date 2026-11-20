@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 
-import { extractBootstrapToken } from '../../apps/web/src/bootstrapToken.js';
+import { extractBootstrapToken, stripBootstrapFromFragment } from '../../apps/web/src/bootstrapToken.js';
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
 
@@ -48,6 +48,14 @@ test('a query-string token is NOT honoured (fragment-only delivery)', () => {
   // to fragment input so a future refactor cannot silently re-accept the
   // query form.
   assert.equal(extractBootstrapToken('?bootstrap=nope'), '');
+});
+
+test('stripping the bootstrap fragment preserves OAuth callback parameters', () => {
+  assert.equal(stripBootstrapFromFragment('#bootstrap=tok'), '');
+  assert.equal(stripBootstrapFromFragment('#auth_token=abc&bootstrap=tok'), '#auth_token=abc');
+  assert.equal(stripBootstrapFromFragment('#bootstrap=tok&auth_token=abc'), '#auth_token=abc');
+  assert.equal(stripBootstrapFromFragment('#other=1'), '#other=1');
+  assert.equal(stripBootstrapFromFragment('?bootstrap=nope'), '');
 });
 
 test('first-account bootstrap error message points at the fragment setup URL', async () => {

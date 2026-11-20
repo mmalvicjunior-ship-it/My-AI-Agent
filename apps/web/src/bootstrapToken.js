@@ -20,3 +20,19 @@ export function extractBootstrapToken(fragment) {
   const token = new URLSearchParams(search).get('bootstrap');
   return token ? token.trim() : '';
 }
+
+/**
+ * Removes only the bootstrap parameter from a URL fragment and preserves any
+ * other fragment parameters (for example an OAuth callback token).
+ * Returns '' when there is nothing left, otherwise a fragment starting with '#'.
+ */
+export function stripBootstrapFromFragment(fragment) {
+  if (typeof fragment !== 'string') return '';
+  const search = fragment.startsWith('#') ? fragment.slice(1) : fragment;
+  if (!search || search.startsWith('?')) return '';
+  const params = new URLSearchParams(search);
+  if (!params.has('bootstrap')) return fragment;
+  params.delete('bootstrap');
+  const remaining = params.toString();
+  return remaining ? `#${remaining}` : '';
+}

@@ -116,6 +116,26 @@ test('frontend exposes email/password and Google authentication', () => {
   assert.match(app, /\/api\/auth\/logout/);
 });
 
+test('the setup fragment token is forwarded to the Google OAuth start contract', () => {
+  const authScreen = read('apps/web/src/AuthScreen.jsx');
+  const auth = read('server/src/routes/auth.js');
+
+  // The setup link is a same-document navigation when pasted into an open tab,
+  // so the token must be re-read on hashchange and at request time, not only on
+  // the component's first mount.
+  assert.match(authScreen, /addEventListener\('hashchange', processFragment\)/);
+  assert.match(authScreen, /function bootstrapTokenFromLocation\(\)/);
+  assert.match(authScreen, /const token = bootstrapTokenFromLocation\(\);/);
+  assert.match(authScreen, /if \(token\) body\.bootstrapToken = token;/);
+  assert.match(authScreen, /clearBootstrapFromLocation\(\);\s*\n\s*window\.location\.assign\(result\.url\)/);
+  assert.doesNotMatch(authScreen, /console\.(log|debug|info)\([^)]*token/i);
+
+  // Backend expects exactly bootstrapToken from config.bootstrapToken and
+  // never accepts a client-supplied role.
+  assert.match(auth, /req\.body\?\.bootstrapToken/);
+  assert.match(auth, /tokensEqual\(provided, config\.bootstrapToken\)/);
+});
+
 test('frontend and backend authentication endpoints agree', () => {
   const sources = ['apps/web/src/App.jsx', 'apps/web/src/AuthScreen.jsx'].map(read).join('\n');
   const endpoints = [...sources.matchAll(/\/api\/auth\/([a-z][a-z0-9-]*)/gi)]

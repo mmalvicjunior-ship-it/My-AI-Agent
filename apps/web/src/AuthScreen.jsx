@@ -1,8 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { extractBootstrapToken } from './bootstrapToken.js';
+import { extractBootstrapToken, stripBootstrapFromFragment } from './bootstrapToken.js';
 
 // Friendly descriptions for the machine-readable error codes the Google
 // callback uses in its redirect fragment (#auth_error=<code>).
+// In-memory only: survives React remounts for the lifetime of the page, but is
+// never written to storage or sent anywhere except the bootstrap request body.
+let pendingBootstrapToken = '';
+
 const GOOGLE_ERRORS = {
   google_not_configured: 'Google sign-in is not configured on this server.',
   google_bootstrap_required: 'Creating the first account requires the server bootstrap token. Open the setup URL (#bootstrap=<token>) first.',
@@ -42,45 +46,82 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
 
   const isRegister = mode === 'register';
 
-  // Read the URL fragment exactly once on mount: it may carry the one-time
-  // bootstrap token (#bootstrap=...) or the result of the Google flow
-  // (#auth_token=... / #auth_error=...). Whatever it holds, strip it from the
-  // address bar as early as possible so it is not kept in browser history or
-  // bookmarks.
+  // The URL fragment may carry the one-time bootstrap token (#bootstrap=...)
+  // or the result of the Google flow (#auth_token=... / #auth_error=...).
+  // The bootstrap value is moved into memory and the fragment is stripped as
+  // soon as it is seen, so it is never kept in the address bar.
   const [urlBootstrapToken, setUrlBootstrapToken] = useState('');
+
+  // A setup link pasted into an already open tab only fires hashchange; it does
+  // not remount this component. Capture the token on mount and on every hash
+  // change, then read it from memory when the setup request is made.
+  function captureBootstrapFragment() {
+    const token = extractBootstrapToken(window.location.hash);
+    if (!token) return;
+    pendingBootstrapToken = token;
+    setUrlBootstrapToken(token);
+
+    const remaining = stripBootstrapFromFragment(window.location.hash);
+    if (remaining !== window.location.hash && window.history?.replaceState) {
+      window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}${remaining}`);
+    }
+  }
+
+  function bootstrapTokenFromLocation() {
+    return pendingBootstrapToken || urlBootstrapToken;
+  }
+
+  function clearBootstrapFromLocation() {
+    pendingBootstrapToken = '';
+    setUrlBootstrapToken('');
+    const remaining = stripBootstrapFromFragment(window.location.hash);
+    if (remaining === window.location.hash || !window.history?.replaceState) return;
+    window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}${remaining}`);
+  }
+
   useEffect(() => {
-    const hash = window.location.hash;
-    if (!hash || hash.length < 2) return undefined;
-    const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
-    const authToken = params.get('auth_token');
-    const authError = params.get('auth_error');
-    const authExpires = params.get('auth_expires') || undefined;
-    const fragmentBootstrapToken = extractBootstrapToken(hash);
-    // Remove the fragment from the address bar now.
-    window.history.replaceState({}, '', window.location.pathname + window.location.search);
-
-    if (fragmentBootstrapToken) setUrlBootstrapToken(fragmentBootstrapToken);
-    if (authError) setError(GOOGLE_ERRORS[authError] || 'Google sign-in failed. Please try again.');
-    if (!authToken) return undefined;
-
-    // Verify the fragment-carried session token against the trusted backend
-    // before accepting it, then hand it to the app exactly like a password
-    // login. No frontend copy of the user record is trusted.
     let cancelled = false;
-    (async () => {
-      try {
-        const response = await fetch(`${apiBase}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        const data = await response.json().catch(() => null);
-        if (!response.ok || !data?.ok || !data.user) throw new Error('Could not verify the Google session.');
-        if (!cancelled) onAuthenticated(authToken, data.user, authExpires);
-      } catch (err) {
-        if (!cancelled) setError(err.message || 'Google sign-in could not be completed.');
-      }
-    })();
+    let handledAuthToken = false;
+
+    const processFragment = () => {
+      const hash = window.location.hash;
+      if (!hash || hash.length < 2) return;
+      const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+      const authToken = params.get('auth_token');
+      const authError = params.get('auth_error');
+      const authExpires = params.get('auth_expires') || undefined;
+
+      captureBootstrapFragment();
+      if (authError) setError(GOOGLE_ERRORS[authError] || 'Google sign-in failed. Please try again.');
+      if (!authToken || handledAuthToken) return;
+
+      // An OAuth callback token is consumed immediately. A bootstrap token was
+      // captured into memory above and already removed from the address bar.
+      handledAuthToken = true;
+      window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
+
+      // Verify the fragment-carried session token against the trusted backend
+      // before accepting it, then hand it to the app exactly like a password
+      // login. No frontend copy of the user record is trusted.
+      (async () => {
+        try {
+          const response = await fetch(`${apiBase}/api/auth/me`, {
+            headers: { Authorization: `Bearer ${authToken}` },
+          });
+          const data = await response.json().catch(() => null);
+          if (!response.ok || !data?.ok || !data.user) throw new Error('Could not verify the Google session.');
+          if (!cancelled) onAuthenticated(authToken, data.user, authExpires);
+        } catch (err) {
+          if (!cancelled) setError(err.message || 'Google sign-in could not be completed.');
+        }
+      })();
+    };
+
+    processFragment();
+    window.addEventListener('hashchange', processFragment);
     return () => {
       cancelled = true;
+      window.removeEventListener('hashchange', processFragment);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -98,7 +139,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
     setGoogleBusy(true);
     try {
       const body = {};
-      const token = urlBootstrapToken.trim();
+      const token = bootstrapTokenFromLocation();
       if (token) body.bootstrapToken = token;
       const response = await fetch(`${apiBase}/api/auth/google/start`, {
         method: 'POST',
@@ -109,6 +150,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
       if (!response.ok || !result.ok || !result.url) {
         throw new Error(result.error || 'Could not start Google sign-in.');
       }
+      clearBootstrapFromLocation();
       window.location.assign(result.url);
     } catch (err) {
       setError(err.message || 'Could not start Google sign-in.');
@@ -128,7 +170,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
       // Build the request body: always include email and password. Only the
       // operator's setup URL may inject the first-account bootstrap token.
       const body = { email: email.trim(), password };
-      const token = urlBootstrapToken.trim();
+      const token = bootstrapTokenFromLocation();
       if (isRegister && token) body.bootstrapToken = token;
 
       const response = await fetch(`${apiBase}/api/auth/${mode}`, {
@@ -140,6 +182,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
       if (!response.ok || !result.ok || !result.token) {
         throw new Error(result.error || `Request failed (${response.status})`);
       }
+      clearBootstrapFromLocation();
       onAuthenticated(result.token, result.user, result.expiresAt);
     } catch (err) {
       setError(err.message || 'Could not sign in.');

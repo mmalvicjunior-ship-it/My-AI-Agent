@@ -1,0 +1,43 @@
+# Git metadata and local tooling output
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Dependencies and build output (recreated in the image)
+**/node_modules
+**/dist
+**/dist-test
+**/build
+**/web-build
+**/.cache
+**/.turbo
+**/.parcel-cache
+**/coverage
+**/*.tsbuildinfo
+
+# Secrets and credential material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.mobileprovision
+
+# Local runtime data (provided by the Render persistent disk at runtime)
+server/data
+server/workspaces
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+
+# Local Python tooling
+.venv
+**/__pycache__
+**/*.pyc

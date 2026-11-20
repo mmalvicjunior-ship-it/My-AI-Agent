@@ -4,12 +4,14 @@ services:
     # https://my-ai-agent-acqy.onrender.com (see README.md). If this Blueprint
     # creates a new service, update the vercel.json rewrite to its URL.
     name: myai-agent-malvic-backend
-    runtime: node
+    # Docker pins Node 22 and Python 3.12+ in the repository Dockerfile.
+    runtime: docker
     plan: starter
     region: ohio
     rootDir: .
-    buildCommand: npm ci --workspace=server --omit=dev
-    startCommand: npm run start --workspace=server
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: "npm run start --workspace=server"
     healthCheckPath: /api/health
     disk:
       name: myai-agent-data
@@ -32,6 +34,7 @@ services:
         sync: false
       - key: GEMINI_MODEL
         sync: false
+      # Retained for compatibility; the actual Node binary is pinned in the Dockerfile.
       - key: NODE_VERSION
         value: "22"
       # Bootstrap procedure: before the first deploy, enter BOOTSTRAP_TOKEN

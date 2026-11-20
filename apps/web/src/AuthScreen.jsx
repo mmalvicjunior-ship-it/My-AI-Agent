@@ -24,7 +24,8 @@ const GOOGLE_ERRORS = {
  * The bootstrap token may be provided via the URL fragment
  * #bootstrap=<token> for initial setup (first account only). Fragments never
  * reach any server, so the token cannot appear in any access log. It is read
- * automatically and can still be entered manually when no setup URL is used.
+ * automatically from the operator's setup URL and is never shown in the form,
+ * so ordinary users are never asked for an administrator secret.
  *
  * The Google sign-in flow starts with POST /api/auth/google/start and returns
  * the user here with the session token in the URL fragment (#auth_token=...),
@@ -34,7 +35,6 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
   const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [bootstrapToken, setBootstrapToken] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -98,7 +98,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
     setGoogleBusy(true);
     try {
       const body = {};
-      const token = bootstrapToken.trim() || urlBootstrapToken.trim();
+      const token = urlBootstrapToken.trim();
       if (token) body.bootstrapToken = token;
       const response = await fetch(`${apiBase}/api/auth/google/start`, {
         method: 'POST',
@@ -125,11 +125,10 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
     }
     setBusy(true);
     try {
-      // Build the request body: always include email and password. If this is
-      // registration and a bootstrap token was provided (manually or via the
-      // setup URL fragment), include it automatically.
+      // Build the request body: always include email and password. Only the
+      // operator's setup URL may inject the first-account bootstrap token.
       const body = { email: email.trim(), password };
-      const token = bootstrapToken.trim() || urlBootstrapToken.trim();
+      const token = urlBootstrapToken.trim();
       if (isRegister && token) body.bootstrapToken = token;
 
       const response = await fetch(`${apiBase}/api/auth/${mode}`, {
@@ -141,7 +140,6 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
       if (!response.ok || !result.ok || !result.token) {
         throw new Error(result.error || `Request failed (${response.status})`);
       }
-      setBootstrapToken('');
       onAuthenticated(result.token, result.user, result.expiresAt);
     } catch (err) {
       setError(err.message || 'Could not sign in.');
@@ -253,23 +251,9 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
                 </button>
               </div>
             </label>
-            {isRegister && (
-              <label>
-                <span>Bootstrap token <em className="auth-optional">(first account only)</em></span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={bootstrapToken}
-                  onChange={(event) => setBootstrapToken(event.target.value)}
-                  placeholder="From the BOOTSTRAP_TOKEN server environment variable"
-                  disabled={busy}
-                />
-              </label>
-            )}
-
             {isRegister && urlBootstrapToken && (
               <div className="auth-bootstrap-hint">
-                <span>Bootstrap token auto-injected from setup URL.</span>
+                <span>First-account setup detected. Your administrator secret will be applied automatically.</span>
               </div>
             )}
 
@@ -282,7 +266,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
 
           <p className="auth-note">
             {isRegister
-              ? 'The very first account requires the server bootstrap token and adopts projects created before accounts were enabled.'
+              ? 'New accounts can use Google or email and password. Projects created before accounts existed are adopted by the first account.'
               : 'Sessions stay signed in across refreshes and can be ended with Sign out.'}
           </p>
         </div>

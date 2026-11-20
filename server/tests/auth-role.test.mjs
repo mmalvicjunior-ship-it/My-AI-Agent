@@ -17,6 +17,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
+import { createUserWithRole } from '../src/routes/auth.js';
 
 const servers = [];
 let base;
@@ -108,6 +109,30 @@ test('login and /me expose the real account role', async () => {
   const meUser = await request('GET', '/api/auth/me', { token: userLogin.data.token });
   assert.equal(meUser.status, 200);
   assert.equal(meUser.data.user.isAdmin, false);
+});
+
+test('only one administrator can exist and a lost first-account race is downgraded', () => {
+  const admins = db.prepare('SELECT id FROM users WHERE is_admin = 1').all();
+  assert.equal(admins.length, 1, 'the database must contain exactly one administrator');
+
+  assert.throws(
+    () => db.prepare('INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, 1)')
+      .run('second-admin@example.com', 'not-a-real-hash'),
+    /UNIQUE constraint failed: users\.is_admin|idx_users_single_admin/i,
+  );
+
+  // Simulates the request that sees an empty table but inserts after another
+  // first-account attempt has already committed.
+  const lostRace = createUserWithRole(db, {
+    email: 'race-loser@example.com',
+    passwordHash: 'not-a-real-hash',
+    googleSub: null,
+    requestAdmin: true,
+  });
+  assert.equal(lostRace.isAdmin, false, 'the losing request must become an ordinary user');
+  const stored = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(lostRace.id);
+  assert.equal(stored.is_admin, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM users WHERE is_admin = 1').get().c, 1);
 });
 
 test('first-account registration still fails without a valid bootstrap token', async () => {

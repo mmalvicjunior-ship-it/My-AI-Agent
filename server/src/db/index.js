@@ -89,6 +89,14 @@ export function openDb() {
     db.exec(`UPDATE users SET is_admin = 1
              WHERE id = (SELECT MIN(id) FROM users)
                AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)`);
+    // Keep exactly one administrator even if an older deployment produced
+    // several admins. The earliest account remains the initial administrator.
+    db.exec(`UPDATE users SET is_admin = 0
+             WHERE is_admin = 1
+               AND id <> (SELECT MIN(id) FROM users WHERE is_admin = 1)`);
+    // Database-level guard for concurrent first-account attempts: a stale
+    // COUNT(*) must never be able to create a second administrator.
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_admin ON users (is_admin) WHERE is_admin = 1');
     db.exec('COMMIT');
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* best effort: the transaction rolls back on close */ }

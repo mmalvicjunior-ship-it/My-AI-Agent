@@ -8,6 +8,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { mockProvider } from '../src/ai/mock.js';
+import { hashPassword, verifyPassword } from '../src/auth/index.js';
 
 let server;
 let db;
@@ -80,6 +81,20 @@ test('registration validates its input', async () => {
   }
 });
 
+test('password hashing is salted, verified, and rejects malformed hashes', () => {
+  const first = hashPassword('correct-horse-battery');
+  const second = hashPassword('correct-horse-battery');
+
+  assert.match(first, /^scrypt\$/);
+  assert.notEqual(first, second, 'the same password must produce different salted hashes');
+  assert.equal(verifyPassword('correct-horse-battery', first), true);
+  assert.equal(verifyPassword('correct-horse-battery', second), true);
+  assert.equal(verifyPassword('wrong-password', first), false);
+  assert.equal(verifyPassword('correct-horse-battery', 'not-a-hash'), false);
+  assert.equal(verifyPassword('', first), false);
+  assert.equal(verifyPassword(null, first), false);
+});
+
 // ---------------------------------------------------------------------------
 // Registration, login, sessions
 // ---------------------------------------------------------------------------
@@ -126,6 +141,15 @@ test('login accepts the right password and rejects the wrong one', async () => {
   assert.equal(good.data.ok, true);
   assert.equal(typeof good.data.token, 'string');
   assert.notEqual(good.data.token, undefined);
+});
+
+test('login requires both email and password', async () => {
+  const { status, data } = await request('POST', '/api/auth/login', {
+    body: { email: 'alice@example.com' },
+  });
+  assert.equal(status, 400);
+  assert.equal(data.ok, false);
+  assert.match(data.error, /email and password/i);
 });
 
 test('session verification accepts a live token and rejects missing or bogus tokens', async () => {

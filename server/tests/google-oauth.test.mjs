@@ -220,6 +220,50 @@ test('the first account can be created through Google with the bootstrap token a
   });
 }, { timeout: 30_000 });
 
+test('two bootstrap-authorized Google starts still create only one administrator', async () => {
+  await withTempDb(async () => {
+    const restore = setGoogleConfig();
+    const originalFetch = globalThis.fetch;
+    mockGoogle({ tokeninfoBody: claimsFor('google-sub-first-admin', 'first-admin@example.com') });
+    try {
+      await withApp(async ({ base, db }) => {
+        // Both flows start while the database is empty and carry a valid token.
+        const start1 = await startGoogle(base, { bootstrapToken: 'test-bootstrap-token' });
+        const start2 = await startGoogle(base, { bootstrapToken: 'test-bootstrap-token' });
+        assert.equal(start1.status, 200);
+        assert.equal(start2.status, 200);
+        const state1 = stateFrom(start1);
+        const state2 = stateFrom(start2);
+
+        const cb1 = await callback(base, { code: 'code-one', state: state1 });
+        assert.ok(authFragment(cb1).get('auth_token'));
+
+        const previousFetch = globalThis.fetch;
+        globalThis.fetch = async (url, options) => {
+          if (String(url).startsWith('https://oauth2.googleapis.com/tokeninfo?')) {
+            return new Response(JSON.stringify(claimsFor('google-sub-second-user', 'second-user@example.com')), {
+              status: 200, headers: { 'content-type': 'application/json' },
+            });
+          }
+          return previousFetch(url, options);
+        };
+
+        const cb2 = await callback(base, { code: 'code-two', state: state2 });
+        assert.ok(authFragment(cb2).get('auth_token'));
+
+        const rows = db.prepare('SELECT email, is_admin FROM users ORDER BY id').all();
+        assert.deepEqual(rows.map((row) => ({ email: row.email, is_admin: row.is_admin })), [
+          { email: 'first-admin@example.com', is_admin: 1 },
+          { email: 'second-user@example.com', is_admin: 0 },
+        ]);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+}, { timeout: 30_000 });
+
 test('a new Google user (after bootstrap) is a normal non-administrator account', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();

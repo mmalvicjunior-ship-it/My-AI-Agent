@@ -59,6 +59,43 @@ export function isDuplicateEmailError(error) {
   return error?.code === '23505' || /unique constraint/i.test(String(error?.message || ''));
 }
 
+const SINGLE_ADMIN_INDEX = 'idx_users_single_admin';
+
+/** True only for the single-admin index, never for email/google_sub collisions. */
+export function isSingleAdminViolation(error) {
+  const message = String(error?.message || '');
+  if (error?.code !== '23505' && !/unique constraint/i.test(message)) return false;
+  return message.includes(SINGLE_ADMIN_INDEX)
+    || /UNIQUE constraint failed:\s*users\.is_admin/i.test(message);
+}
+
+/**
+ * Inserts a user and resolves a lost first-account race as an ordinary user.
+ * The database has a unique partial index on is_admin=1, so only the first
+ * successful insert can become the administrator.
+ */
+export function createUserWithRole(db, { email, passwordHash, googleSub = null, requestAdmin = false }) {
+  const hasGoogleSub = typeof googleSub === 'string' && googleSub.length > 0;
+  const sql = hasGoogleSub
+    ? 'INSERT INTO users (email, password_hash, is_admin, google_sub) VALUES (?, ?, ?, ?)'
+    : 'INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)';
+  const values = hasGoogleSub
+    ? [email, passwordHash, requestAdmin ? 1 : 0, googleSub]
+    : [email, passwordHash, requestAdmin ? 1 : 0];
+  const insert = (params) => Number(db.prepare(sql).run(...params).lastInsertRowid);
+
+  try {
+    return { id: insert(values), isAdmin: Boolean(requestAdmin) };
+  } catch (error) {
+    if (!requestAdmin || !isSingleAdminViolation(error)) throw error;
+    // Another first-account attempt committed first. This request is now a
+    // later account and must never inherit administrator privileges.
+    const retry = [...values];
+    retry[2] = 0;
+    return { id: insert(retry), isAdmin: false };
+  }
+}
+
 /** 429 responder: always carries a Retry-After header (seconds) and body field. */
 function rejectRateLimited(res, limit, message) {
   const retryAfterSeconds = Math.max(1, Math.ceil((limit.retryAfterMs ?? 15 * 60 * 1000) / 1000));
@@ -123,15 +160,16 @@ export function createAuthRouter({ db }) {
       return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
     }
 
-    let userId;
+    let created;
     try {
-      // The first account becomes the administrator; later accounts are
-      // ordinary users and can never self-promote to admin.
-      const isAdmin = userCount === 0;
-      const result = db
-        .prepare('INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, ?)')
-        .run(email, hashPassword(req.body.password), isAdmin ? 1 : 0);
-      userId = Number(result.lastInsertRowid);
+      // Only the first successfully inserted account can become administrator;
+      // createUserWithRole enforces that even if another request wins the race.
+      created = createUserWithRole(db, {
+        email,
+        passwordHash: hashPassword(req.body.password),
+        googleSub: null,
+        requestAdmin: userCount === 0,
+      });
     } catch (error) {
       // Unique constraint race with another registration for the same email.
       if (isDuplicateEmailError(error)) {
@@ -142,14 +180,14 @@ export function createAuthRouter({ db }) {
 
     // The first account adopts pre-authentication projects so existing local
     // data remains reachable. Later accounts never inherit another user's data.
-    if (userCount === 0) claimUnclaimedProjects(db, userId);
+    if (created.isAdmin) claimUnclaimedProjects(db, created.id);
 
-    const session = createSession(db, userId, config.authSessionDays);
+    const session = createSession(db, created.id, config.authSessionDays);
     return res.status(201).json({
       ok: true,
       token: session.token,
       expiresAt: session.expiresAt,
-      user: { id: userId, email, isAdmin: userCount === 0 },
+      user: { id: created.id, email, isAdmin: created.isAdmin },
     });
   });
 
@@ -245,17 +283,33 @@ export function createAuthRouter({ db }) {
       } else if (stateRow.allow_create !== 1) {
         return redirectWithError('google_registration_disabled');
       }
-      const isAdmin = userCount === 0 ? 1 : 0;
       // Google-only accounts get an unusable random password hash: password
       // sign-in is impossible for them; only Google sign-in works.
       const shadowHash = hashPassword(crypto.randomBytes(32).toString('hex'));
-      const result = db
-        .prepare('INSERT INTO users (email, password_hash, is_admin, google_sub) VALUES (?, ?, ?, ?)')
-        .run(normalized, shadowHash, isAdmin, identity.sub);
-      const userId = Number(result.lastInsertRowid);
+      let created;
+      try {
+        created = createUserWithRole(db, {
+          email: normalized,
+          passwordHash: shadowHash,
+          googleSub: identity.sub,
+          requestAdmin: userCount === 0,
+        });
+      } catch (error) {
+        // A concurrent flow may have created the same identity or email between
+        // the lookups and the insert. Re-check instead of trusting stale reads.
+        if (isDuplicateEmailError(error)) {
+          const bySubAfter = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
+          if (bySubAfter) return finish(bySubAfter.id);
+          const byEmailAfter = db.prepare('SELECT google_sub FROM users WHERE lower(email) = ?').get(normalized);
+          if (byEmailAfter) {
+            return redirectWithError(byEmailAfter.google_sub ? 'google_identity_conflict' : 'google_account_exists');
+          }
+        }
+        throw error;
+      }
       // The first account adopts pre-authentication projects, like email sign-up.
-      if (isAdmin) claimUnclaimedProjects(db, userId);
-      return finish(userId);
+      if (created.isAdmin) claimUnclaimedProjects(db, created.id);
+      return finish(created.id);
     } catch (error) {
       console.error('[auth] Google callback failed:', redactSecrets(String(error?.message || error)));
       return redirectWithError('google_identity_invalid');

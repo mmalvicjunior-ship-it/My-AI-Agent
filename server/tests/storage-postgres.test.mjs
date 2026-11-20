@@ -141,6 +141,17 @@ test('authentication sessions and case-insensitive emails work on Postgres', () 
   const userId = Number(created.lastInsertRowid);
   assert.ok(userId > 0);
 
+  const adminIndex = db.prepare(
+    "SELECT indexname FROM pg_indexes WHERE indexname = 'idx_users_single_admin'",
+  ).all();
+  assert.equal(adminIndex.length, 1, 'the single-admin index must exist on Postgres');
+  assert.throws(
+    () => db.prepare('INSERT INTO users (email, password_hash, is_admin) VALUES (?, ?, 1)')
+      .run('postgres-second-admin@example.test', 'x'),
+    /duplicate key|UNIQUE/i,
+    'a second administrator must be rejected by the database',
+  );
+
   assert.throws(
     () => db.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)')
       .run('POSTGRES-USER@example.test', 'x'),

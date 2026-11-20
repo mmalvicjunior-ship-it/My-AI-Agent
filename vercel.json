@@ -21,7 +21,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://my-ai-agent-acqy.onrender.com/api/:path*"
+      "destination": "https://my-ai-agent-staging-auth.onrender.com/api/:path*"
     }
   ]
 }

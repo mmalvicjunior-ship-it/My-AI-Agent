@@ -14,10 +14,11 @@ function read(relativePath) {
   return fs.readFileSync(path.join(projectRoot, relativePath), 'utf8').replace(/\r\n/g, '\n');
 }
 
-// Verified by GET /api/health: this host returns the myai-agent-server service.
-const VERIFIED_BACKEND = 'https://my-ai-agent-acqy.onrender.com';
+// This staging branch rewrites /api to the isolated free Render service, never
+// to the production backend. The production branch keeps its own vercel.json.
+const STAGING_BACKEND = 'https://my-ai-agent-staging-auth.onrender.com';
 
-test('Vercel keeps the same-origin /api rewrite to the verified Render service', () => {
+test('Vercel staging preview uses the isolated Render service', () => {
   const vercel = JSON.parse(read('vercel.json'));
   assert.equal(vercel.framework, 'vite');
   assert.equal(vercel.outputDirectory, 'apps/web/dist');
@@ -25,7 +26,7 @@ test('Vercel keeps the same-origin /api rewrite to the verified Render service',
   const rewrites = Array.isArray(vercel.rewrites) ? vercel.rewrites : [];
   const apiRewrites = rewrites.filter((entry) => entry.source === '/api/:path*');
   assert.equal(apiRewrites.length, 1, 'expected exactly one /api/:path* rewrite');
-  assert.equal(apiRewrites[0].destination, `${VERIFIED_BACKEND}/api/:path*`);
+  assert.equal(apiRewrites[0].destination, `${STAGING_BACKEND}/api/:path*`);
 });
 
 test('Vercel config contains no credentials or direct frontend API base URL', () => {

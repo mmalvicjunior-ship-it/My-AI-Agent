@@ -153,10 +153,12 @@ export function createChatRouter({
       console.info(`[chat] Request succeeded: provider=${result.provider ?? activeProvider.name ?? activeProviderName} status=200`);
       return res.json({
         ok: true,
+        // Always report the provider/model that actually produced the reply.
         provider: result.provider ?? activeProvider.name ?? activeProviderName,
         model: result.model ?? activeProvider.model ?? null,
         reply: result.text,
         toolActivity: result.toolActivity || [],
+        ...(result.fallback ? { fallback: result.fallback } : {}),
       });
     } catch (err) {
       // Log only a redacted one-liner; the client gets a generic message.
@@ -165,12 +167,20 @@ export function createChatRouter({
         `[chat] Request failed: provider=${activeProvider.name ?? activeProviderName} status=${status}:`,
         redactSecrets(`${err.name}: ${err.message}`),
       );
-      return res.status(status).json({
+      const body = {
         ok: false,
         error: typeof err.publicMessage === 'string'
           ? err.publicMessage
           : 'AI provider request failed. Details were logged on the server (secrets redacted).',
-      });
+      };
+      if (err.category || err.errorType) {
+        body.errorCategory = err.category || err.errorType;
+      }
+      if (Number.isFinite(err.retryAfterMs) && err.retryAfterMs > 0) {
+        body.retryAfterSeconds = Math.ceil(err.retryAfterMs / 1000);
+      }
+      if (err.fallbackAttempted) body.fallbackAttempted = true;
+      return res.status(status).json(body);
     }
   });
 

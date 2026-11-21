@@ -105,8 +105,8 @@ Copy `.env.example` to `.env` in the repository root, then configure one provide
 ```dotenv
 AI_PROVIDER=gemini
 GEMINI_API_KEY=your_gemini_api_key_here
-# Optional; defaults to gemini-2.5-flash
-GEMINI_MODEL=gemini-2.5-flash
+# Optional; defaults to gemini-3.8-flash
+GEMINI_MODEL=gemini-3.8-flash
 ```
 
 Gemini can also use the legacy shared `AI_API_KEY`/`AI_MODEL` values when
@@ -147,6 +147,32 @@ configured, use the provider selector in the app's top bar to switch chat betwee
 sent with each chat request. This switch is chat-only: background tasks continue
 using the startup `AI_PROVIDER`. Both API keys stay in the backend `.env`; the
 browser only receives the provider name and whether it is configured.
+
+#### Gemini quota handling and explicit fallback
+
+Gemini can be the startup provider while OpenRouter remains available:
+
+```dotenv
+AI_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.8-flash
+AI_FALLBACK_PROVIDER=openai
+```
+
+`AI_FALLBACK_PROVIDER` is opt-in and only `openai` is supported. When set, a
+Gemini request that fails because of an exhausted quota, rate limit, temporary
+model capacity (`503`), timeout or network error can be answered by OpenRouter.
+The fallback is explicit: the chat response names the actual provider and model,
+and the UI shows a notice on that message. No fallback occurs after a tool has
+run, after cancellation, for invalid credentials, or for malformed requests.
+
+Gemini 429 quota exhaustion is never retried. The adapter briefly cools down so
+repeated user messages do not keep burning quota; `Retry-After` is honoured when
+provided. Temporary `503`, rate-limit and network failures use at most three
+attempts with bounded exponential backoff. `gemini-3.6-flash` is also available
+on current accounts, but it has its own separate free-tier quota and is not used
+unless you explicitly set `GEMINI_MODEL`. This setup never enables billing or
+introduces a paid service.
 
 Or use Hugging Face Inference Providers with a token that has Inference Providers permission:
 
@@ -384,7 +410,8 @@ prompts). Never commit real values.
 | `AI_MODEL` | Yes in practice | An OpenRouter model slug, for example `meta-llama/llama-3.1-8b-instruct:free`. The adapter's built-in `gpt-4o-mini` default is not a valid OpenRouter slug. |
 | `OPENAI_BASE_URL` | Yes for OpenRouter | `https://openrouter.ai/api/v1` (the adapter appends `/chat/completions`). |
 | `GEMINI_API_KEY` | Optional | Required only to use Gemini chat. Secret; backend only. |
-| `GEMINI_MODEL` | Optional | Defaults to `gemini-2.5-flash`. |
+| `GEMINI_MODEL` | Optional | Defaults to `gemini-3.8-flash`. |
+| `AI_FALLBACK_PROVIDER` | No | Set to `openai` to allow explicit fallback for recognised Gemini quota/capacity/network errors. Empty disables fallback. |
 | `DATABASE_PATH` | Yes | `/var/data/app.db` on the mounted disk. |
 | `WORKSPACE_ROOT` | Yes | `/var/data/workspaces` on the mounted disk. |
 | `AUTH_SESSION_DAYS` | No | Session lifetime in days (1-365). Defaults to `30`. |
@@ -400,9 +427,12 @@ prompts). Never commit real values.
 | `HOST` | No | Leave unset so the server binds all interfaces. |
 | `DEBUG_CHAT_PROMPTS` | No | Keep `false` in production. |
 
-For the current OpenRouter setup keep `AI_PROVIDER=openai`,
+For an OpenRouter-only setup keep `AI_PROVIDER=openai`,
 `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, the existing `AI_MODEL` value,
-and the OpenRouter `AI_API_KEY` in Render only. `GOOGLE_CLIENT_ID`,
+and the OpenRouter `AI_API_KEY` in Render only. The Gemini-first staging setup
+uses `AI_PROVIDER=gemini`, `GEMINI_MODEL=gemini-3.8-flash`, and
+`AI_FALLBACK_PROVIDER=openai` while keeping all OpenRouter values unchanged.
+`GOOGLE_CLIENT_ID`,
 `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`, and optional `APP_ORIGIN`
 also belong in Render only.
 

@@ -34,6 +34,13 @@ function positiveIntFromEnv(name, fallback, { min = 1, max = Number.MAX_SAFE_INT
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
 }
 
+// Explicit opt-in for a single alternative provider. Only OpenRouter is
+// supported today; an empty or unknown value keeps fallback disabled.
+function fallbackProviderFromEnv() {
+  const value = (process.env.AI_FALLBACK_PROVIDER || '').trim().toLowerCase();
+  return value === 'openai' ? 'openai' : '';
+}
+
 /**
  * How many proxy hops to trust when Express derives the client IP from
  * X-Forwarded-For (used by the login/register rate limiter). Default is 1:
@@ -99,6 +106,8 @@ export const config = {
   port: portFromEnv(),
 
   aiProvider: process.env.AI_PROVIDER || 'mock',
+  // Optional explicit fallback for recognised Gemini quota/availability errors.
+  aiFallbackProvider: fallbackProviderFromEnv(),
   // OpenRouter / OpenAI-compatible credentials (the active provider is "openai").
   aiApiKey: process.env.AI_API_KEY || '',
   aiModel: process.env.AI_MODEL || '',
@@ -193,6 +202,7 @@ export function safeSummary() {
     host: config.host || '(all interfaces)',
     port: config.port,
     aiProvider: config.aiProvider,
+    aiFallbackProvider: config.aiFallbackProvider || '(not set)',
     aiApiKey: mask(config.aiApiKey),
     aiModel: config.aiModel || '(not set)',
     geminiApiKey: mask(config.geminiApiKey),

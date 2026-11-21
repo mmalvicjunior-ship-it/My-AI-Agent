@@ -10,7 +10,9 @@ test('provider error diagnostics preserve safe fields', async () => {
   const res429 = { status: 429, headers: { get: (k) => (k === 'retry-after' ? '10' : null) }, json: async () => ({ error: { message: 'quota exceeded' } }) };
   const err429 = await createProviderHttpError(res429, 'OpenRouter', 'redacted');
   assert.strictEqual(err429.statusCode, 429);
-  assert.ok(err429.publicMessage?.includes('rate limit'));
+  assert.strictEqual(err429.category, 'QUOTA_EXHAUSTED');
+  assert.strictEqual(err429.retryable, false);
+  assert.ok(err429.publicMessage?.includes('quota'));
   assert.strictEqual(err429.retryAfterMs, 10000);
 
   // HTTP 401

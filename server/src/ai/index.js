@@ -25,6 +25,7 @@
 import { mockProvider } from './mock.js';
 import { config } from '../config.js';
 import { createGeminiProvider } from './gemini.js';
+import { createFallbackProvider } from './fallback.js';
 import { createHuggingFaceProvider } from './huggingface.js';
 import { createOpenAIProvider } from './openai.js';
 import { createOllamaProvider } from './ollama.js';
@@ -65,7 +66,7 @@ export function getProvider(name, settings = config) {
 
   const defaults = {
     openai: 'gpt-4o-mini',
-    gemini: 'gemini-2.5-flash',
+    gemini: 'gemini-3.8-flash',
     huggingface: 'meta-llama/Meta-Llama-3-8B-Instruct',
     ollama: 'llama3',
   };
@@ -105,6 +106,22 @@ export function getProvider(name, settings = config) {
       ? { baseUrl: settings.openaiBaseUrl }
       : {}),
   });
+}
+
+/**
+ * Applies the optional explicit fallback policy to a Gemini provider. Other
+ * providers, and Gemini without AI_FALLBACK_PROVIDER, are returned unchanged.
+ */
+export function withConfiguredFallback(provider, settings = config) {
+  if (!provider || provider.name !== 'gemini') return provider;
+
+  const hasSetting = settings && typeof settings === 'object'
+    && Object.prototype.hasOwnProperty.call(settings, 'aiFallbackProvider');
+  const fallbackName = hasSetting ? settings.aiFallbackProvider : config.aiFallbackProvider;
+  if (!fallbackName || fallbackName === provider.name) return provider;
+
+  const fallback = getProvider(fallbackName, settings);
+  return createFallbackProvider({ primary: provider, fallback });
 }
 
 /** Lists the provider names that are currently implemented. */

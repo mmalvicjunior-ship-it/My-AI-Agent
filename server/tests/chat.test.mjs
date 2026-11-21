@@ -9,6 +9,7 @@ import { config } from '../src/config.js';
 import { mockProvider } from '../src/ai/mock.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createGeminiProvider } from '../src/ai/gemini.js';
+import { createFallbackProvider } from '../src/ai/fallback.js';
 import {
   normalizeChatInput,
   normalizeChatProvider,
@@ -487,4 +488,99 @@ test('malformed provider result is treated as a provider error', async () => {
 
   assert.equal(status, 502);
   assert.equal(data.ok, false);
+});
+
+test('chat reports the actual provider/model when Gemini falls back to OpenRouter', async () => {
+  const primary = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat() {
+      const error = new Error('Gemini daily quota is exhausted.');
+      error.statusCode = 429;
+      error.category = 'QUOTA_EXHAUSTED';
+      error.errorType = 'QUOTA_EXHAUSTED';
+      error.fallbackEligible = true;
+      error.publicMessage = 'Google Gemini daily quota is exhausted.';
+      throw error;
+    },
+  };
+  const fallback = {
+    name: 'openai',
+    model: 'particle-ai/particle-1:free',
+    async chat() {
+      return {
+        text: 'OpenRouter reply.',
+        provider: 'openai',
+        model: 'particle-ai/particle-1:free',
+      };
+    },
+  };
+  const provider = createFallbackProvider({ primary, fallback, log: { warn() {} } });
+  const api = await startServer(createApp({
+    auth: false,
+    provider,
+    providerName: 'gemini',
+  }).app);
+
+  const { status, data } = await api.post('/api/chat', { message: 'hi', provider: 'gemini' });
+  assert.equal(status, 200);
+  assert.equal(data.ok, true);
+  assert.equal(data.provider, 'openai');
+  assert.equal(data.model, 'particle-ai/particle-1:free');
+  assert.equal(data.reply, 'OpenRouter reply.');
+  assert.deepEqual(data.fallback, {
+    from: 'gemini',
+    fromModel: 'gemini-3.8-flash',
+    reason: 'QUOTA_EXHAUSTED',
+    retryAfterMs: null,
+  });
+});
+
+test('chat exposes quota error category and Retry-After without exposing secrets', async () => {
+  const secret = 'sk-test-secret-should-never-appear';
+  const provider = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat() {
+      const error = new Error(`Gemini quota failed with ${secret}`);
+      error.statusCode = 429;
+      error.category = 'QUOTA_EXHAUSTED';
+      error.errorType = 'QUOTA_EXHAUSTED';
+      error.retryable = false;
+      error.fallbackEligible = false;
+      error.retryAfterMs = 3_600_000;
+      error.publicMessage = 'Google Gemini daily quota is exhausted. No further Gemini requests will be made.';
+      throw error;
+    },
+  };
+  const api = await startServer(createApp({ auth: false, provider, providerName: 'gemini' }).app);
+
+  const { status, data } = await api.post('/api/chat', { message: 'hi', provider: 'gemini' });
+  assert.equal(status, 429);
+  assert.equal(data.errorCategory, 'QUOTA_EXHAUSTED');
+  assert.equal(data.retryAfterSeconds, 3600);
+  assert.match(data.error, /daily quota is exhausted/i);
+  assert.ok(!JSON.stringify(data).includes(secret));
+});
+
+test('health exposes explicit fallback configuration without exposing keys', async () => {
+  const savedFallback = config.aiFallbackProvider;
+  const savedAiKey = config.aiApiKey;
+  config.aiFallbackProvider = 'openai';
+  config.aiApiKey = 'sk-openrouter-health-fallback-secret';
+
+  try {
+    const provider = createGeminiProvider({ apiKey: 'gemini-test-key' });
+    const api = await startServer(createApp({ auth: false, provider, providerName: 'gemini' }).app);
+    const { status, data } = await api.get('/api/health');
+
+    assert.equal(status, 200);
+    assert.equal(data.fallbackProvider, 'openai');
+    assert.equal(data.fallbackConfigured, true);
+    assert.ok(!JSON.stringify(data).includes(config.aiApiKey));
+    assert.ok(!JSON.stringify(data).includes('gemini-test-key'));
+  } finally {
+    config.aiFallbackProvider = savedFallback;
+    config.aiApiKey = savedAiKey;
+  }
 });

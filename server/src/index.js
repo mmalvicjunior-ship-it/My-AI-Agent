@@ -5,7 +5,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { config, safeSummary, redactSecrets } from './config.js';
 import { openDb } from './db/index.js';
-import { getProvider } from './ai/index.js';
+import { getProvider, withConfiguredFallback } from './ai/index.js';
 import { createChatRouter } from './routes/chat.js';
 import { createFilesRouter } from './routes/files.js';
 import { createEditsRouter } from './routes/edits.js';
@@ -94,13 +94,14 @@ export function createApp(options = {}) {
   // AI provider: injected by tests, otherwise resolved from AI_PROVIDER in .env.
   // Background tasks keep using this startup provider; chat requests may pick a
   // different provider per request through providerResolver.
-  const provider = 'provider' in options ? options.provider : getProvider(config.aiProvider);
+  const rawProvider = 'provider' in options ? options.provider : getProvider(config.aiProvider);
+  const provider = withConfiguredFallback(rawProvider);
   const providerName = 'providerName' in options ? options.providerName : config.aiProvider;
   const providerResolver = 'providerResolver' in options
     ? options.providerResolver
     : (requestedName) => {
       if (!requestedName || requestedName === providerName) return provider;
-      return getProvider(requestedName);
+      return withConfiguredFallback(getProvider(requestedName));
     };
   // Authentication is on unless a test explicitly opts out. The production
   // entry point calls createApp() with no options, so it can never run open.
@@ -152,6 +153,9 @@ export function createApp(options = {}) {
       // The real service name (for example OpenRouter) so the UI can name it.
       providerLabel: provider?.displayName
         || (activeProvider === 'gemini' ? 'Google Gemini' : null),
+      // Explicit fallback is opt-in and never includes credentials.
+      fallbackProvider: config.aiFallbackProvider || null,
+      fallbackConfigured: Boolean(config.aiFallbackProvider && config.aiApiKey),
       aiConfigured: activeProvider === 'mock' || activeProvider === 'ollama' || keyConfigured,
       aiWarning,
       // Lets the UI avoid offering npm_* quick actions in multi-user mode,

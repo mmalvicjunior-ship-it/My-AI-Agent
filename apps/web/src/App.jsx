@@ -81,6 +81,14 @@ const PROVIDER_KEY = 'myai.provider';
 const MAX_CHARS = 20_000;
 const CHAT_PROVIDER_IDS = new Set(['openai', 'gemini']);
 const PROVIDER_LABELS = { openai: 'OpenRouter', gemini: 'Google Gemini' };
+const FALLBACK_REASON_LABELS = {
+  QUOTA_EXHAUSTED: 'The daily quota was exhausted.',
+  RATE_LIMITED: 'The rate limit was reached.',
+  CAPACITY_UNAVAILABLE: 'The model was temporarily at capacity.',
+  NETWORK_TIMEOUT: 'The request timed out.',
+  NETWORK_ERROR: 'The provider could not be reached.',
+  PROVIDER_ERROR: 'The provider was temporarily unavailable.',
+};
 const ACTIVE_PROJECT_KEY = 'myai.active-project.v1';
 
 function activeProjectStorageKey(userId) {
@@ -273,6 +281,13 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
           onClick={handleCodeCopy}
           dangerouslySetInnerHTML={{ __html: formatMarkdown(message.content) }}
         />
+        {message.fallback && (
+          <div className="tool-activity" aria-label="Provider fallback">
+            <span className="tool-activity-item completed">
+              {PROVIDER_LABELS[message.fallback.from] || message.fallback.from} was unavailable; answered by {PROVIDER_LABELS[message.provider] || message.provider}. {FALLBACK_REASON_LABELS[message.fallback.reason] || 'An alternative provider was used.'}
+            </span>
+          </div>
+        )}
         {message.toolActivity?.length > 0 && (
           <div className="tool-activity" aria-label="Agent actions">
             {message.toolActivity.map((activity, activityIndex) => {
@@ -369,6 +384,7 @@ function App() {
     provider: null,
     providerLabel: null,
     providers: null,
+    fallbackProvider: null,
     npmScriptsEnabled: false,
     warning: 'Checking AI provider configuration…',
   });
@@ -653,6 +669,7 @@ function App() {
           provider: data.aiProvider || 'mock',
           providerLabel: data.providerLabel || null,
           providers: data.providers || null,
+          fallbackProvider: data.fallbackProvider || null,
           npmScriptsEnabled: data.npmScriptsEnabled !== false,
           warning: data.aiWarning || null,
         });
@@ -663,6 +680,7 @@ function App() {
           provider: null,
           providerLabel: null,
           providers: null,
+          fallbackProvider: null,
           npmScriptsEnabled: false,
           warning: 'Cannot reach the AI server. Start or restart the backend and try again.',
         });
@@ -768,6 +786,7 @@ function App() {
           provider: result.provider,
           model: result.model,
           toolActivity: result.toolActivity || [],
+          fallback: result.fallback || null,
           feedback: null,
         }],
         updatedAt: Date.now(),
@@ -777,7 +796,8 @@ function App() {
       if (error.name === 'AbortError') return;
       setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
       setToast({ message: error.message || 'Something went wrong. Please try again.' });
-      if (['openai', 'gemini', 'huggingface', 'ollama'].includes(health.provider)
+      const providerToFlag = providerForRequest || selectedProvider || health.provider;
+      if (['openai', 'gemini', 'huggingface', 'ollama'].includes(providerToFlag)
         && [401, 403, 429, 502, 503, 504].includes(error.status)) {
         setHealth((current) => ({ ...current, warning: error.message }));
       }

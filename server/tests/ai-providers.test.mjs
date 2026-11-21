@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { mockProvider } from '../src/ai/mock.js';
 import { createGeminiProvider } from '../src/ai/gemini.js';
+import { createFallbackProvider } from '../src/ai/fallback.js';
 import { createHuggingFaceProvider } from '../src/ai/huggingface.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createOllamaProvider } from '../src/ai/ollama.js';
@@ -1414,18 +1415,278 @@ test('OpenAI adapter gives clear authentication and quota errors', async (t) => 
   }
 });
 
-test('Gemini adapter uses supported default model gemini-2.5-flash', async () => {
+test('Gemini adapter uses supported default model gemini-3.8-flash', async () => {
   let request;
   const provider = createGeminiProvider({
     apiKey: 'test-gemini-key',
     fetchImpl: async (url, options) => {
       request = { url, options };
       return Response.json({
-        candidates: [{ content: { parts: [{ text: 'Hello from Gemini 2.5 Flash.' }] } }],
+        candidates: [{ content: { parts: [{ text: 'Hello from Gemini 3.8 Flash.' }] } }],
       });
     },
   });
   const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
-  assert.ok(request.url.includes('gemini-2.5-flash'), 'Default model should be gemini-2.5-flash');
-  assert.equal(result.text, 'Hello from Gemini 2.5 Flash.');
+  assert.ok(request.url.includes('gemini-3.8-flash'), 'Default model should be gemini-3.8-flash');
+  assert.equal(result.text, 'Hello from Gemini 3.8 Flash.');
+});
+
+test('Gemini registry default is gemini-3.8-flash while OpenRouter stays optional', () => {
+  const settings = {
+    aiProvider: 'gemini',
+    aiApiKey: 'test-key',
+    aiModel: '',
+    openaiBaseUrl: 'https://openrouter.ai/api/v1',
+    geminiApiKey: 'test-gemini-key',
+    geminiModel: '',
+  };
+
+  const gemini = getProvider('gemini', settings);
+  assert.equal(gemini.model, 'gemini-3.8-flash');
+
+  const openRouter = getProvider('openai', settings);
+  assert.equal(openRouter.name, 'openai');
+  assert.equal(openRouter.model, 'particle-ai/particle-1:free');
+});
+
+test('Gemini daily quota exhaustion is not retried and starts a cooldown', async () => {
+  let calls = 0;
+  const cooldownStore = new Map();
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({
+        error: {
+          code: 429,
+          status: 'RESOURCE_EXHAUSTED',
+          message: 'Resource has been exhausted (e.g. check quota).',
+        },
+      }, { status: 429 });
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.category, 'QUOTA_EXHAUSTED');
+      assert.equal(error.retryable, false);
+      assert.equal(error.fallbackEligible, true);
+      assert.match(error.publicMessage, /quota|exhausted/i);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'daily quota must never be retried');
+  const cooldown = cooldownStore.get('gemini:gemini-3.8-flash');
+  assert.ok(cooldown);
+  assert.equal(cooldown.category, 'QUOTA_EXHAUSTED');
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi again' }] }),
+    (error) => {
+      assert.equal(error.category, 'QUOTA_EXHAUSTED');
+      assert.match(error.publicMessage, /No further Gemini requests|cooldown/i);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'cooldown must prevent repeated quota calls');
+});
+
+test('Gemini retries HTTP 503 with bounded backoff and succeeds when capacity returns', async () => {
+  let calls = 0;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls < 3) {
+        return Response.json({
+          error: { message: 'This model is currently experiencing high demand.' },
+        }, { status: 503 });
+      }
+      return Response.json({
+        candidates: [{ content: { parts: [{ text: 'Recovered reply.' }] } }],
+      });
+    },
+  });
+
+  const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+  assert.equal(result.text, 'Recovered reply.');
+  assert.equal(calls, 3);
+});
+
+test('Gemini stops after the retry limit when HTTP 503 persists', async () => {
+  let calls = 0;
+  const cooldownStore = new Map();
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    maxAttempts: 3,
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({
+        error: { message: 'This model is currently experiencing high demand.' },
+      }, { status: 503 });
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.category, 'CAPACITY_UNAVAILABLE');
+      assert.equal(error.fallbackEligible, true);
+      assert.match(error.publicMessage, /capacity|temporarily unavailable/i);
+      return true;
+    },
+  );
+  assert.equal(calls, 3, 'retry count must be capped');
+  assert.ok(cooldownStore.has('gemini:gemini-3.8-flash'));
+});
+
+test('Gemini does not retry when Retry-After exceeds the interactive cap', async () => {
+  let calls = 0;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '60' } },
+      );
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.category, 'RATE_LIMITED');
+      assert.equal(error.retryAfterMs, 60_000);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'a long Retry-After must not be ignored');
+});
+
+test('Gemini retries timeouts with a bounded attempt count', async () => {
+  let calls = 0;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    maxAttempts: 2,
+    retryDelaysMs: [0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      const error = new Error('timeout');
+      error.name = 'TimeoutError';
+      throw error;
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.category, 'NETWORK_TIMEOUT');
+      assert.equal(error.statusCode, 504);
+      assert.equal(error.fallbackEligible, true);
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
+test('explicit fallback returns the actual OpenRouter provider and model', async () => {
+  let fallbackCalls = 0;
+  const primary = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat() {
+      const error = new Error('Gemini daily quota is exhausted.');
+      error.category = 'QUOTA_EXHAUSTED';
+      error.errorType = 'QUOTA_EXHAUSTED';
+      error.fallbackEligible = true;
+      error.publicMessage = 'Gemini daily quota is exhausted.';
+      throw error;
+    },
+  };
+  const fallback = {
+    name: 'openai',
+    model: 'particle-ai/particle-1:free',
+    async chat() {
+      fallbackCalls += 1;
+      return {
+        text: 'Fallback reply.',
+        provider: 'openai',
+        model: 'particle-ai/particle-1:free',
+      };
+    },
+  };
+  const wrapped = createFallbackProvider({
+    primary,
+    fallback,
+    log: { warn() {} },
+  });
+
+  const result = await wrapped.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+  assert.equal(result.provider, 'openai');
+  assert.equal(result.model, 'particle-ai/particle-1:free');
+  assert.equal(result.text, 'Fallback reply.');
+  assert.deepEqual(result.fallback, {
+    from: 'gemini',
+    fromModel: 'gemini-3.8-flash',
+    reason: 'QUOTA_EXHAUSTED',
+    retryAfterMs: null,
+  });
+  assert.equal(fallbackCalls, 1);
+});
+
+test('explicit fallback is disabled after tool execution or for invalid credentials', async () => {
+  let fallbackCalls = 0;
+  const fallback = {
+    name: 'openai',
+    model: 'particle-ai/particle-1:free',
+    async chat() {
+      fallbackCalls += 1;
+      return { text: 'should not run', provider: 'openai', model: 'particle-ai/particle-1:free' };
+    },
+  };
+
+  const afterTools = new Error('Provider failed after a tool ran.');
+  afterTools.category = 'CAPACITY_UNAVAILABLE';
+  afterTools.fallbackEligible = true;
+  afterTools.toolActivity = [{ tool: 'read_file', status: 'completed' }];
+  const wrappedAfterTools = createFallbackProvider({
+    primary: { name: 'gemini', model: 'gemini-3.8-flash', async chat() { throw afterTools; } },
+    fallback,
+    log: { warn() {} },
+  });
+  await assert.rejects(
+    wrappedAfterTools.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => error === afterTools,
+  );
+
+  const invalidKey = new Error('API key not valid.');
+  invalidKey.category = 'INVALID_API_KEY';
+  invalidKey.fallbackEligible = false;
+  const wrappedInvalidKey = createFallbackProvider({
+    primary: { name: 'gemini', model: 'gemini-3.8-flash', async chat() { throw invalidKey; } },
+    fallback,
+    log: { warn() {} },
+  });
+  await assert.rejects(
+    wrappedInvalidKey.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => error === invalidKey,
+  );
+
+  assert.equal(fallbackCalls, 0);
 });

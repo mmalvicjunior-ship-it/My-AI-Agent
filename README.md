@@ -128,9 +128,12 @@ model available to your OpenRouter account:
 ```dotenv
 AI_PROVIDER=openai
 AI_API_KEY=your_openrouter_api_key_here
-AI_MODEL=meta-llama/llama-3.1-8b-instruct:free
+AI_MODEL=particle-ai/particle-1:free
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 ```
+
+When `AI_MODEL` is left empty with the OpenRouter base URL above, the app uses
+`particle-ai/particle-1:free`. Explicit `AI_MODEL` values always take priority.
 
 OpenRouter model availability and free-tier limits can change; choose a model
 listed as available in your OpenRouter account if this example is unavailable.

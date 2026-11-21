@@ -134,6 +134,74 @@ test('provider selection keeps OpenRouter and Gemini credentials independent', (
   assert.equal(gemini.model, 'gemini-test-model');
 });
 
+test('OpenRouter uses the verified free default when AI_MODEL is unset', () => {
+  const provider = getProvider('openai', {
+    aiProvider: 'openai',
+    aiApiKey: 'test-openrouter-key',
+    aiModel: '',
+    openaiBaseUrl: 'https://openrouter.ai/api/v1',
+  });
+
+  assert.equal(provider.model, 'particle-ai/particle-1:free');
+});
+
+test('explicit AI_MODEL still overrides the OpenRouter default', () => {
+  const provider = getProvider('openai', {
+    aiProvider: 'openai',
+    aiApiKey: 'test-openrouter-key',
+    aiModel: 'custom/model:free',
+    openaiBaseUrl: 'https://openrouter.ai/api/v1/',
+  });
+
+  assert.equal(provider.model, 'custom/model:free');
+});
+
+test('non-OpenRouter OpenAI-compatible endpoints keep the generic default', () => {
+  const provider = getProvider('openai', {
+    aiProvider: 'openai',
+    aiApiKey: 'test-key',
+    aiModel: '',
+    openaiBaseUrl: 'https://api.example.com/v1',
+  });
+
+  assert.equal(provider.model, 'gpt-4o-mini');
+});
+
+test('the retired model is never selected as an adapter default', () => {
+  const retiredModel = ['cohere', 'north-mini-code:free'].join('/');
+
+  for (const openaiBaseUrl of ['', 'https://openrouter.ai/api/v1']) {
+    const provider = getProvider('openai', {
+      aiProvider: 'openai',
+      aiApiKey: 'test-key',
+      aiModel: '',
+      openaiBaseUrl,
+    });
+    assert.notEqual(provider.model, retiredModel);
+  }
+});
+
+test('OpenRouter selected model is sent in the chat completion request body', async () => {
+  let requestBody;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-openrouter-key',
+    model: 'particle-ai/particle-1:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return Response.json({
+        model: 'particle-ai/particle-1:free',
+        choices: [{ message: { content: 'Hello via OpenRouter.' } }],
+      });
+    },
+  });
+
+  const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+
+  assert.equal(requestBody.model, 'particle-ai/particle-1:free');
+  assert.equal(result.model, 'particle-ai/particle-1:free');
+});
+
 test('Gemini keeps legacy shared AI_API_KEY/AI_MODEL settings working', () => {
   // Existing Gemini-only deployments configured the key/model through the
   // shared variables, so those must continue to work.
@@ -325,7 +393,7 @@ test('OpenAI adapter supports an OpenRouter-compatible base URL', async () => {
 test('OpenAI adapter names OpenRouter in upstream errors', async () => {
   const provider = createOpenAIProvider({
     apiKey: 'test-openrouter-key',
-    model: 'cohere/north-mini-code:free',
+    model: 'particle-ai/particle-1:free',
     baseUrl: 'https://openrouter.ai/api/v1',
     fetchImpl: async () => Response.json({
       error: { message: 'Rate limit exceeded: free-models-per-day.' },

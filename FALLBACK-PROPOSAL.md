@@ -1,7 +1,7 @@
 PROPOSED FALLBACK / QUOTA RECOVERY UPGRADE — INSPECTION ONLY (not implemented)
 ===============================================
 INSPECTED STATE:
-- .env: AI_PROVIDER=openai, AI_MODEL=cohere/north-mini-code:free, OPENAI_BASE_URL=https://openrouter.ai/api/v1 (OpenRouter free tier).
+- .env: AI_PROVIDER=openai, AI_MODEL=particle-ai/particle-1:free, OPENAI_BASE_URL=https://openrouter.ai/api/v1 (OpenRouter free tier).
 - Provider adapters: mock.js, openai.js, gemini.js, huggingface.js, ollama.js (existing architecture; no OpenCode/Big Pickle adapter exists; cannot assume compatibility).
 - Recovery logic: provider_paused status, saveRecoveryInfo/loadRecoveryInfo/claimRecoverableTask in store.js; runner tick resumes when retryAfter known; DB CHECK updated.
 - Task Center: provider_paused display mapped.

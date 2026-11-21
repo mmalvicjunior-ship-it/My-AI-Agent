@@ -36,6 +36,22 @@ const providerFactories = new Map([
   ['ollama', createOllamaProvider],
 ]);
 
+// Verified free coding model from the live OpenRouter catalogue. Used only when
+// no explicit AI_MODEL is configured and the OpenAI-compatible base URL is
+// OpenRouter; official OpenAI and other endpoints keep their existing default.
+const OPENROUTER_DEFAULT_MODEL = 'particle-ai/particle-1:free';
+
+function isOpenRouterBaseUrl(baseUrl) {
+  if (typeof baseUrl !== 'string' || !baseUrl.trim()) return false;
+  try {
+    const url = new URL(baseUrl.trim());
+    return url.hostname.toLowerCase() === 'openrouter.ai'
+      && url.pathname.replace(/\/+$/, '') === '/api/v1';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolves the configured provider. Select "mock" explicitly for offline
  * replies; a missing key for a real provider is reported as a configuration
@@ -81,9 +97,10 @@ export function getProvider(name, settings = config) {
   // In a legacy Gemini-only setup, AI_API_KEY belongs to Gemini. Do not forward
   // that credential to the OpenAI/OpenRouter adapter when switching providers.
   const legacyGeminiKey = !settings.geminiApiKey && settings.aiProvider === 'gemini';
+  const usingOpenRouter = name === 'openai' && isOpenRouterBaseUrl(settings.openaiBaseUrl);
   return createProvider({
     apiKey: legacyGeminiKey ? '' : settings.aiApiKey,
-    model: settings.aiModel || defaults[name],
+    model: settings.aiModel || (usingOpenRouter ? OPENROUTER_DEFAULT_MODEL : defaults[name]),
     ...(name === 'openai' && settings.openaiBaseUrl
       ? { baseUrl: settings.openaiBaseUrl }
       : {}),

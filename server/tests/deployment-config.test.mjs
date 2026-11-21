@@ -97,7 +97,15 @@ test('backend auth router registers the documented email/password and Google rou
   const routes = [...auth.matchAll(/router\.(?:get|post|put|patch|delete)\('([^']+)'/g)]
     .map((match) => match[1])
     .sort();
-  assert.deepEqual(routes, ['/google/callback', '/google/start', '/login', '/logout', '/me', '/register']);
+  assert.deepEqual(routes, [
+    '/admin/provision',
+    '/google/callback',
+    '/google/start',
+    '/login',
+    '/logout',
+    '/me',
+    '/register',
+  ]);
 });
 
 test('frontend exposes email/password and Google authentication', () => {
@@ -116,24 +124,23 @@ test('frontend exposes email/password and Google authentication', () => {
   assert.match(app, /\/api\/auth\/logout/);
 });
 
-test('the setup fragment token is forwarded to the Google OAuth start contract', () => {
+test('ordinary Google sign-in is token-free and customer-safe', () => {
   const authScreen = read('apps/web/src/AuthScreen.jsx');
   const auth = read('server/src/routes/auth.js');
 
-  // The setup link is a same-document navigation when pasted into an open tab,
-  // so the token must be re-read on hashchange and at request time, not only on
-  // the component's first mount.
-  assert.match(authScreen, /addEventListener\('hashchange', processFragment\)/);
-  assert.match(authScreen, /function bootstrapTokenFromLocation\(\)/);
-  assert.match(authScreen, /const token = bootstrapTokenFromLocation\(\);/);
-  assert.match(authScreen, /if \(token\) body\.bootstrapToken = token;/);
-  assert.match(authScreen, /clearBootstrapFromLocation\(\);\s*\n\s*window\.location\.assign\(result\.url\)/);
+  // The frontend starts OAuth with an empty body and goes straight to Google.
+  assert.match(authScreen, /\/api\/auth\/google\/start/);
+  assert.match(authScreen, /body: '\{\}'/);
+  assert.match(authScreen, /window\.location\.assign\(result\.url\)/);
+  assert.doesNotMatch(authScreen, /bootstrap/i);
+  assert.doesNotMatch(authScreen, /BOOTSTRAP_TOKEN|environment|configured on this server/i);
   assert.doesNotMatch(authScreen, /console\.(log|debug|info)\([^)]*token/i);
 
-  // Backend expects exactly bootstrapToken from config.bootstrapToken and
-  // never accepts a client-supplied role.
-  assert.match(auth, /req\.body\?\.bootstrapToken/);
+  // The backend keeps the token only in the owner-only provisioning endpoint.
+  assert.match(auth, /router\.post\('\/admin\/provision'/);
   assert.match(auth, /tokensEqual\(provided, config\.bootstrapToken\)/);
+  assert.doesNotMatch(auth, /bootstrapToken[\s\S]{0,200}\/register/);
+  assert.doesNotMatch(auth, /bootstrapToken[\s\S]{0,200}\/google\/start/);
 });
 
 test('frontend and backend authentication endpoints agree', () => {

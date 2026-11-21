@@ -21,8 +21,8 @@ process.env.WORKSPACE_ROOT = path.join(root, 'workspaces');
 // module (and therefore src/config.js) is imported.
 process.env.DATABASE_BACKEND = 'sqlite';
 process.env.WORKSPACE_STORAGE = 'local';
-// The first account requires BOOTSTRAP_TOKEN. Tests register through the same
-// public route, so they get a known test-only token.
+// Owner-only admin provisioning uses BOOTSTRAP_TOKEN. Tests exercise that
+// protected route with a known test-only token.
 process.env.BOOTSTRAP_TOKEN = 'test-bootstrap-token';
 
 // Windows keeps the SQLite file open until after the 'exit' handler runs, so a

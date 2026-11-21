@@ -46,7 +46,7 @@ async function request(method, pathname, { token, body } = {}) {
 
 async function register(email) {
   const { status, data } = await request('POST', '/api/auth/register', {
-    body: { email, password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+    body: { email, password: 'correct-horse-battery' },
   });
   assert.equal(status, 201, `could not register ${email}: ${JSON.stringify(data)}`);
   return data;
@@ -317,7 +317,7 @@ test('import paths that are ancestors of the database directory are rejected', a
       const reg = await fetch(`${broadBase}/api/auth/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email: 'db-ancestor@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' }),
+        body: JSON.stringify({ email: 'db-ancestor@example.com', password: 'correct-horse-battery' }),
       });
       const regData = await reg.json();
       assert.equal(reg.status, 201);

@@ -55,7 +55,7 @@ test('session 401s are tagged AUTH_REQUIRED', async () => {
 test('a provider 401 on /api/chat is not a session failure', async () => {
   const email = `redirect-${Date.now()}@example.com`;
   const registered = await request('POST', '/api/auth/register', {
-    body: { email, password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+    body: { email, password: 'correct-horse-battery' },
   });
   assert.equal(registered.status, 201, registered.data?.error);
   const { token } = registered.data;

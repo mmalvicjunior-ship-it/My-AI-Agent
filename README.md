@@ -60,26 +60,25 @@ sidebar to end the session. Accounts are stored locally in SQLite.
   no cookie, so no CSRF token is needed. Clearing site data signs you out.
 - Sessions expire after `AUTH_SESSION_DAYS` (default 30). Expired or revoked
   tokens receive `401` and return the UI to the sign-in screen.
-- `/api/health` is the only public endpoint besides register/login/logout. Every
-  project, file, task, proposal, and command endpoint requires a session and is
-  scoped to the owning account. Requesting another account's project returns
-  `404`, not its contents.
-- The first account may only be created with the server-side `BOOTSTRAP_TOKEN`
-  (a fail-closed shared secret), so a public visitor can never race the
-  administrator onto a fresh deployment. After the first account exists the
-  token is ignored and `ALLOW_REGISTRATION=false` closes public registration;
-  existing accounts can always log in. The first account adopts projects that
-  predate accounts (`owner_id IS NULL`) so existing local data stays reachable;
-  later accounts inherit nothing. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
+- `/api/health` is the only public endpoint besides register/login/logout and
+  the owner-only admin provisioning route. Every project, file, task,
+  proposal, and command endpoint requires a session and is scoped to the owning
+  account. Requesting another account's project returns `404`, not its contents.
+- Ordinary registration and Google sign-in never require a token and always
+  create ordinary users. The first administrator is provisioned separately by
+  the owner through `POST /api/auth/admin/provision`, which reuses the
+  server-side `BOOTSTRAP_TOKEN` and stops working once one admin exists. No
+  startup migration promotes an arbitrary first visitor. The provisioned admin
+  adopts projects that predate accounts (`owner_id IS NULL`) so existing local
+  data stays reachable. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
 - Optional Google sign-in (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_OAUTH_REDIRECT_URI`)
   uses Google's authorization-code flow entirely server-side: the browser is
-  redirected to Google, Google calls back `/api/auth/google/callback`, and the
-  server exchanges the code and validates the identity against Google's
-  tokeninfo endpoint (verified email required) before issuing a normal session
-  token. Google users are never administrators (the first account can be
-  created through Google only via the bootstrap token), existing
-  email/password accounts are never auto-linked, and no client secret reaches
-  the browser. Setup: `docs/GOOGLE-OAUTH.md`.
+  redirected straight to Google, Google calls back
+  `/api/auth/google/callback`, and the server exchanges the code and validates
+  the identity against Google's tokeninfo endpoint (verified email required)
+  before issuing a normal session token. Google users are never administrators,
+  existing email/password accounts are never auto-linked, and no client secret
+  reaches the browser. Setup: `docs/GOOGLE-OAUTH.md`.
 - Register/login are throttled in memory (10 attempts per 15 minutes per IP,
   with a per-IP registration limit and a login spray backstop; `TRUST_PROXY`
   controls how many proxy hops are trusted for client IPs). The counters reset
@@ -88,11 +87,14 @@ sidebar to end the session. Accounts are stored locally in SQLite.
 These routes are public:
 
 ```text
-POST /api/auth/register   { email, password, bootstrapToken? } -> { token, expiresAt, user }
-                          (bootstrapToken is required only while no account exists)
+POST /api/auth/register   { email, password } -> { token, expiresAt, user }
+                          (always creates an ordinary user)
 POST /api/auth/login      { email, password } -> { token, expiresAt, user }
 POST /api/auth/logout     invalidates the presented session (idempotent)
 GET  /api/auth/me         verifies a token and returns the current user
+POST /api/auth/admin/provision
+                          { bootstrapToken, email, [password|googleSub] }
+                          owner-only; works only while no admin exists
 GET  /api/health          provider status only; no credentials
 ```
 
@@ -383,8 +385,8 @@ prompts). Never commit real values.
 | `DATABASE_PATH` | Yes | `/var/data/app.db` on the mounted disk. |
 | `WORKSPACE_ROOT` | Yes | `/var/data/workspaces` on the mounted disk. |
 | `AUTH_SESSION_DAYS` | No | Session lifetime in days (1-365). Defaults to `30`. |
-| `BOOTSTRAP_TOKEN` | Yes before first account | Shared secret required to create the FIRST account only. Set in the Render dashboard; never commit it. Ignored once an account exists. |
-| `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after creating your account to close public registration. Does not affect the first account. |
+| `BOOTSTRAP_TOKEN` | Yes before admin provisioning | Shared secret for the owner-only `/api/auth/admin/provision` endpoint. Set in the Render dashboard; never commit it. Not used by ordinary registration or Google sign-in. |
+| `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after provisioning the administrator to close public registration. Existing accounts can always log in. |
 | `GOOGLE_CLIENT_ID` | No | Google OAuth 2.0 client ID (Web application). Enables the "Continue with Google" button. Render only; never the frontend. |
 | `GOOGLE_CLIENT_SECRET` | No | Google OAuth 2.0 client secret. Server-side only, never exposed to the browser. |
 | `GOOGLE_OAUTH_REDIRECT_URI` | No | Exact authorized redirect URI. For the current Vercel app use `https://my-ai-agent-apps.vercel.app/api/auth/google/callback`. |
@@ -499,8 +501,8 @@ directories are off unless `PROJECT_IMPORT_ROOT` is configured. Before exposing
 the service publicly:
 
 - Generate a strong `BOOTSTRAP_TOKEN` and set it in the Render dashboard
-  BEFORE the first deploy; the first account can only be registered by
-  opening the app with `#bootstrap=<token>` in the URL (see
+  BEFORE the first deploy. Ordinary users sign in normally; the owner creates
+  the single administrator with `POST /api/auth/admin/provision` (see
   `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
 - Keep `PROJECT_IMPORT_ROOT` unset unless you deliberately need directory
   imports; if set, point it at a dedicated folder, never the filesystem root or

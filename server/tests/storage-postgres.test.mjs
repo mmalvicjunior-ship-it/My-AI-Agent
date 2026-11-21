@@ -177,12 +177,12 @@ test('authentication sessions and case-insensitive emails work on Postgres', () 
 test('OAuth state rows can be inserted and atomically consumed', () => {
   const stateHash = auth.hashToken('local-state-value');
   db.prepare(
-    'INSERT INTO oauth_states (state_hash, bootstrap_ok, allow_create, expires_at) VALUES (?, ?, ?, ?)',
-  ).run(stateHash, 1, 1, new Date(Date.now() + 60_000).toISOString());
+    'INSERT INTO oauth_states (state_hash, allow_create, expires_at) VALUES (?, ?, ?)',
+  ).run(stateHash, 1, new Date(Date.now() + 60_000).toISOString());
   const consumed = db.prepare(
-    'DELETE FROM oauth_states WHERE state_hash = ? RETURNING bootstrap_ok, allow_create',
+    'DELETE FROM oauth_states WHERE state_hash = ? RETURNING allow_create',
   ).get(stateHash);
-  assert.deepEqual(consumed, { bootstrap_ok: 1, allow_create: 1 });
+  assert.deepEqual(consumed, { allow_create: 1 });
   assert.equal(db.prepare('SELECT state_hash FROM oauth_states WHERE state_hash = ?').get(stateHash), null);
 });
 

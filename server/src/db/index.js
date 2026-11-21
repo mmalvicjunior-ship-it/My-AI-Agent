@@ -10,10 +10,8 @@ import { createPostgresDb, POSTGRES_SCHEMA_SQL } from '../storage/postgres-db.js
 function openPersistentDb() {
   const db = createPostgresDb(config);
   db.exec(POSTGRES_SCHEMA_SQL);
-  // Idempotent first-account promotion, matching the SQLite migration.
-  db.exec(`UPDATE users SET is_admin = 1
-           WHERE id = (SELECT MIN(id) FROM users)
-             AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)`);
+  // Roles are never inferred at startup. The first administrator is created
+  // only by the owner-only /api/auth/admin/provision endpoint.
   ensurePlanColumn(db);
   ensureAutonomyColumn(db);
   ensureResultColumn(db);
@@ -47,7 +45,7 @@ export function openDb() {
     db.exec('ALTER TABLE projects ADD COLUMN root_path TEXT');
   }
   // Per-user ownership. Existing rows migrate with owner_id = NULL and are
-  // adopted by the first account created after authentication is enabled.
+  // adopted by the provisioned administrator.
   if (!projectColumns.some((column) => column.name === 'owner_id')) {
     db.exec('ALTER TABLE projects ADD COLUMN owner_id INTEGER');
   }
@@ -63,22 +61,16 @@ export function openDb() {
       is_admin      INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))
     );
   `);
-  // Migration for databases created before roles existed. Both steps run in
-  // one transaction and the promotion is idempotent, so re-running on every
-  // boot is safe:
-  //   1. add the is_admin column if it is missing (existing rows stay 0);
-  //   2. promote the earliest account (MIN(id)) to administrator exactly
-  //      once, and only while no administrator exists.
-  // The promotion deliberately runs on every boot, not only when the column
-  // was just added: if a previous boot crashed between the ALTER TABLE and
-  // the promotion UPDATE, the next boot completes it instead of leaving a
-  // database with no administrator. The promotion never reassigns an account
-  // that is already an administrator. SQLite cannot add a CHECK constraint
-  // via ALTER TABLE on an existing column; values are only ever written as
-  // 0/1 by the server, so the migrated column is safe without one.
-  // NOTE: on a legacy database with several accounts, "earliest" is MIN(id),
-  // which may not be the intended administrator. Verify after deploying and
-  // correct out of band if needed (see docs/FIRST-ACCOUNT-BOOTSTRAP.md).
+  // Migration for databases created before roles existed. The only automatic
+  // change is additive: add the is_admin column with ordinary-user defaults.
+  // No account is ever promoted at startup. The first administrator is set by
+  // the owner-only /api/auth/admin/provision endpoint instead.
+  //
+  // The demotion below only resolves legacy databases that already contain
+  // more than one administrator (from older builds), so the single-admin index
+  // can be created safely. It never grants admin to a non-admin account.
+  // SQLite cannot add a CHECK constraint via ALTER TABLE on an existing
+  // column; values are only ever written as 0/1 by the server.
   const userColumns = db.prepare('PRAGMA table_info(users)').all();
   const hasAdminColumn = userColumns.some((column) => column.name === 'is_admin');
   db.exec('BEGIN');
@@ -86,15 +78,13 @@ export function openDb() {
     if (!hasAdminColumn) {
       db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
     }
-    db.exec(`UPDATE users SET is_admin = 1
-             WHERE id = (SELECT MIN(id) FROM users)
-               AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)`);
-    // Keep exactly one administrator even if an older deployment produced
-    // several admins. The earliest account remains the initial administrator.
+    // Preserve an existing administrator. If a legacy build produced several,
+    // keep the earliest and demote the rest so the unique index can be added.
+    // With no administrator, this is a no-op: nobody is promoted.
     db.exec(`UPDATE users SET is_admin = 0
              WHERE is_admin = 1
                AND id <> (SELECT MIN(id) FROM users WHERE is_admin = 1)`);
-    // Database-level guard for concurrent first-account attempts: a stale
+    // Database-level guard for concurrent provisioning attempts: a stale
     // COUNT(*) must never be able to create a second administrator.
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_admin ON users (is_admin) WHERE is_admin = 1');
     db.exec('COMMIT');
@@ -117,13 +107,13 @@ export function openDb() {
 
   // One-time OAuth state values for the Google sign-in flow. Only the
   // SHA-256 hash of each state is stored, and rows are consumed (deleted)
-  // on use. `allow_create` captures the outcome of the server-side checks
-  // made when the flow was started, so the callback never re-trusts a
-  // browser-supplied verdict.
+  // on use. `allow_create` captures the server-side registration setting from
+  // when the flow started, so the callback never re-trusts the browser.
+  // The legacy bootstrap_ok column is intentionally omitted: existing rows
+  // with that column keep its harmless default of 0.
   db.exec(`
     CREATE TABLE IF NOT EXISTS oauth_states (
       state_hash   TEXT PRIMARY KEY,
-      bootstrap_ok INTEGER NOT NULL DEFAULT 0 CHECK (bootstrap_ok IN (0, 1)),
       allow_create INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
       created_at   TEXT NOT NULL DEFAULT (datetime('now')),
       expires_at   TEXT NOT NULL

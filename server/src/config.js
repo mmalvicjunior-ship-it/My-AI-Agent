@@ -152,11 +152,11 @@ export const config = {
   pythonRunTimeoutMs: positiveIntFromEnv('PYTHON_RUN_TIMEOUT_MS', 30_000, { min: 100, max: 600_000 }),
   pythonRunMaxOutputBytes: positiveIntFromEnv('PYTHON_RUN_MAX_OUTPUT_BYTES', 16_000, { min: 1, max: 1_048_576 }),
 
-  // Authentication defaults. Registration stays enabled so a fresh deployment
-  // can create accounts after bootstrap; the FIRST account always requires
-  // BOOTSTRAP_TOKEN (a server-side shared secret), so an unknown visitor can
-  // never register before the administrator. Set ALLOW_REGISTRATION=false
-  // once the administrator account exists.
+  // Authentication defaults. Registration stays enabled so ordinary users can
+  // sign up normally, including on a fresh deployment. BOOTSTRAP_TOKEN is used
+  // only by the owner-only /api/auth/admin/provision endpoint, never by public
+  // registration or Google sign-in. Set ALLOW_REGISTRATION=false once the
+  // administrator account exists to close public registration.
   authSessionDays: sessionDaysFromEnv(),
   allowRegistration: process.env.ALLOW_REGISTRATION !== 'false',
   bootstrapToken: (process.env.BOOTSTRAP_TOKEN || '').trim(),

@@ -1,4 +1,5 @@
-// Account endpoints: register, login, logout and session verification.
+// Account endpoints: registration, login, logout, session verification, and
+// the owner-only first-administrator provisioning endpoint.
 // Mounted at /api/auth before the global authentication middleware so that
 // these routes are the only public write endpoints besides /api/health.
 import crypto from 'node:crypto';
@@ -70,9 +71,10 @@ export function isSingleAdminViolation(error) {
 }
 
 /**
- * Inserts a user and resolves a lost first-account race as an ordinary user.
- * The database has a unique partial index on is_admin=1, so only the first
- * successful insert can become the administrator.
+ * Inserts a user with an explicit role. Only the owner-only provisioning
+ * endpoint may pass requestAdmin=true; every public path passes false.
+ * The database has a unique partial index on is_admin=1, so a lost provisioning
+ * race can never produce a second administrator.
  */
 export function createUserWithRole(db, { email, passwordHash, googleSub = null, requestAdmin = false }) {
   const hasGoogleSub = typeof googleSub === 'string' && googleSub.length > 0;
@@ -88,8 +90,8 @@ export function createUserWithRole(db, { email, passwordHash, googleSub = null, 
     return { id: insert(values), isAdmin: Boolean(requestAdmin) };
   } catch (error) {
     if (!requestAdmin || !isSingleAdminViolation(error)) throw error;
-    // Another first-account attempt committed first. This request is now a
-    // later account and must never inherit administrator privileges.
+    // Another provisioning attempt committed first. This request must never
+    // create a second administrator.
     const retry = [...values];
     retry[2] = 0;
     return { id: insert(retry), isAdmin: false };
@@ -115,6 +117,9 @@ export function createAuthRouter({ db }) {
   // Google sign-in has its own bucket so a broken third party can never lock
   // out email/password authentication.
   const googleLimiter = createAttemptLimiter({ max: 20 });
+  // First-administrator provisioning is owner-only and must not share a bucket
+  // with ordinary registration traffic.
+  const adminProvisionLimiter = createAttemptLimiter({ max: 10 });
 
   /** True only when every value needed for the Google flow is configured. */
   function googleConfigured(cfg) {
@@ -128,22 +133,11 @@ export function createAuthRouter({ db }) {
       return rejectRateLimited(res, limit, 'Too many registration attempts. Try again later.');
     }
 
-    // Bootstrap protection: while the users table is empty, nobody can register
-    // without the server-side BOOTSTRAP_TOKEN. This applies even when
-    // ALLOW_REGISTRATION=false, so initial account creation can never be
-    // locked out by an ordinary env flag, and an unknown public visitor can
-    // never become the first account.
-    const userCount = Number(db.prepare('SELECT COUNT(*) AS count FROM users').get().count);
-    if (userCount === 0) {
-      const provided = typeof req.body?.bootstrapToken === 'string' ? req.body.bootstrapToken.trim() : '';
-      if (!tokensEqual(provided, config.bootstrapToken)) {
-        return res.status(403).json({
-          ok: false,
-          error: 'Creating the first account requires the server bootstrap token. Provide it via the setup URL (#bootstrap=<token>) when registering the first account.',
-        });
-      }
-    } else if (!config.allowRegistration) {
-      return res.status(403).json({ ok: false, error: 'Registration is disabled on this server.' });
+    if (!config.allowRegistration) {
+      return res.status(403).json({
+        ok: false,
+        error: 'New registrations are currently closed. Please contact your administrator.',
+      });
     }
 
     const email = normalizeEmail(req.body?.email);
@@ -162,13 +156,13 @@ export function createAuthRouter({ db }) {
 
     let created;
     try {
-      // Only the first successfully inserted account can become administrator;
-      // createUserWithRole enforces that even if another request wins the race.
+      // Public registration can never create an administrator, including when
+      // this is the first account or the client sends a role field.
       created = createUserWithRole(db, {
         email,
         passwordHash: hashPassword(req.body.password),
         googleSub: null,
-        requestAdmin: userCount === 0,
+        requestAdmin: false,
       });
     } catch (error) {
       // Unique constraint race with another registration for the same email.
@@ -178,16 +172,15 @@ export function createAuthRouter({ db }) {
       throw error;
     }
 
-    // The first account adopts pre-authentication projects so existing local
-    // data remains reachable. Later accounts never inherit another user's data.
-    if (created.isAdmin) claimUnclaimedProjects(db, created.id);
+    // Pre-authentication projects are claimed only by the provisioned
+    // administrator, never by an arbitrary public registration.
 
     const session = createSession(db, created.id, config.authSessionDays);
     return res.status(201).json({
       ok: true,
       token: session.token,
       expiresAt: session.expiresAt,
-      user: { id: created.id, email, isAdmin: created.isAdmin },
+      user: { id: created.id, email, isAdmin: false },
     });
   });
 
@@ -197,26 +190,20 @@ export function createAuthRouter({ db }) {
       return rejectRateLimited(res, limit, 'Too many sign-in attempts. Try again later.');
     }
     if (!googleConfigured(config)) {
-      return res.status(503).json({ ok: false, error: 'Google sign-in is not configured on this server.' });
-    }
-    const userCount = Number(db.prepare('SELECT COUNT(*) AS count FROM users').get().count);
-    const provided = typeof req.body?.bootstrapToken === 'string' ? req.body.bootstrapToken.trim() : '';
-    // The FIRST account is always governed by the bootstrap protection, even
-    // when it is created through Google. Fail here, not after a round trip.
-    if (userCount === 0 && !tokensEqual(provided, config.bootstrapToken)) {
-      return res.status(403).json({
+      return res.status(503).json({
         ok: false,
-        error: 'Creating the first account requires the server bootstrap token. Provide it via the setup URL (#bootstrap=<token>) when registering the first account.',
+        error: 'Google sign-in is temporarily unavailable. Please try again later.',
       });
     }
-    const bootstrapOk = userCount === 0 ? 1 : 0;
-    const allowCreate = (userCount === 0 ? bootstrapOk === 1 : Boolean(config.allowRegistration)) ? 1 : 0;
+    // Ordinary Google sign-in never needs a setup token. New accounts are
+    // governed only by the server's registration setting.
+    const allowCreate = config.allowRegistration ? 1 : 0;
 
     const state = createOAuthState();
     // One-time state, stored only as a SHA-256 hash, valid for 10 minutes.
     db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(new Date().toISOString());
-    db.prepare('INSERT INTO oauth_states (state_hash, bootstrap_ok, allow_create, expires_at) VALUES (?, ?, ?, ?)')
-      .run(hashToken(state), bootstrapOk, allowCreate, new Date(Date.now() + STATE_TTL_MS).toISOString());
+    db.prepare('INSERT INTO oauth_states (state_hash, allow_create, expires_at) VALUES (?, ?, ?)')
+      .run(hashToken(state), allowCreate, new Date(Date.now() + STATE_TTL_MS).toISOString());
     return res.json({
       ok: true,
       url: googleAuthorizeUrl({ clientId: config.googleClientId, redirectUri: config.googleRedirectUri, state }),
@@ -242,7 +229,7 @@ export function createAuthRouter({ db }) {
     // statement, so a replayed or concurrent second callback finds nothing.
     const stateHash = hashToken(state);
     const stateRow = db.prepare(
-      'DELETE FROM oauth_states WHERE state_hash = ? RETURNING bootstrap_ok, allow_create, expires_at',
+      'DELETE FROM oauth_states WHERE state_hash = ? RETURNING allow_create, expires_at',
     ).get(stateHash);
     if (!stateRow) return redirectWithError('google_state');
     if (new Date(stateRow.expires_at).getTime() <= Date.now()) return redirectWithError('google_state');
@@ -277,14 +264,12 @@ export function createAuthRouter({ db }) {
         return redirectWithError(existing.google_sub ? 'google_identity_conflict' : 'google_account_exists');
       }
 
-      const userCount = Number(db.prepare('SELECT COUNT(*) AS count FROM users').get().count);
-      if (userCount === 0) {
-        if (stateRow.bootstrap_ok !== 1) return redirectWithError('google_bootstrap_required');
-      } else if (stateRow.allow_create !== 1) {
+      if (stateRow.allow_create !== 1) {
         return redirectWithError('google_registration_disabled');
       }
       // Google-only accounts get an unusable random password hash: password
-      // sign-in is impossible for them; only Google sign-in works.
+      // sign-in is impossible for them; only Google sign-in works. They are
+      // always ordinary users; administrators are provisioned separately.
       const shadowHash = hashPassword(crypto.randomBytes(32).toString('hex'));
       let created;
       try {
@@ -292,7 +277,7 @@ export function createAuthRouter({ db }) {
           email: normalized,
           passwordHash: shadowHash,
           googleSub: identity.sub,
-          requestAdmin: userCount === 0,
+          requestAdmin: false,
         });
       } catch (error) {
         // A concurrent flow may have created the same identity or email between
@@ -307,13 +292,125 @@ export function createAuthRouter({ db }) {
         }
         throw error;
       }
-      // The first account adopts pre-authentication projects, like email sign-up.
-      if (created.isAdmin) claimUnclaimedProjects(db, created.id);
       return finish(created.id);
     } catch (error) {
       console.error('[auth] Google callback failed:', redactSecrets(String(error?.message || error)));
       return redirectWithError('google_identity_invalid');
     }
+  });
+
+  /**
+   * Owner-only first-administrator provisioning.
+   *
+   * This is the secure replacement for the old "first account becomes admin"
+   * behavior. Ordinary sign-up and Google sign-in never call it and never need
+   * a token. The operator supplies the existing server-side BOOTSTRAP_TOKEN
+   * directly to this endpoint, either to create a password administrator or to
+   * promote an already verified account. It stops working as soon as one
+   * administrator exists.
+   */
+  router.post('/admin/provision', (req, res) => {
+    const limit = adminProvisionLimiter(clientKey(req));
+    if (!limit.allowed) {
+      return rejectRateLimited(res, limit, 'Too many setup attempts. Try again later.');
+    }
+
+    const provided = typeof req.body?.bootstrapToken === 'string' ? req.body.bootstrapToken.trim() : '';
+    if (!tokensEqual(provided, config.bootstrapToken)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Administrator setup requires the server setup token.',
+      });
+    }
+
+    const adminCount = Number(
+      db.prepare('SELECT COUNT(*) AS count FROM users WHERE is_admin = 1').get().count,
+    );
+    if (adminCount > 0) {
+      return res.status(409).json({ ok: false, error: 'Administrator setup is already complete.' });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    const googleSub = typeof req.body?.googleSub === 'string' ? req.body.googleSub.trim() : '';
+
+    let existing = null;
+    if (email) {
+      existing = db.prepare('SELECT id, email, google_sub FROM users WHERE lower(email) = ?').get(email);
+    } else if (googleSub) {
+      existing = db.prepare('SELECT id, email, google_sub FROM users WHERE google_sub = ?').get(googleSub);
+    }
+
+    if (googleSub && existing && existing.google_sub !== googleSub) {
+      return res.status(409).json({
+        ok: false,
+        error: 'That Google identity does not match the account for this email.',
+      });
+    }
+
+    if (existing) {
+      try {
+        db.prepare('UPDATE users SET is_admin = 1 WHERE id = ? AND is_admin = 0').run(existing.id);
+        claimUnclaimedProjects(db, existing.id);
+      } catch (error) {
+        if (isSingleAdminViolation(error)) {
+          return res.status(409).json({ ok: false, error: 'Administrator setup is already complete.' });
+        }
+        throw error;
+      }
+      // Existing sessions stay valid: role is read from the database on every
+      // request. No new session is minted for a promotion.
+      return res.json({
+        ok: true,
+        created: false,
+        user: { id: existing.id, email: existing.email, isAdmin: true },
+      });
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Provide an email address for the administrator account.',
+      });
+    }
+    if (googleSub) {
+      return res.status(400).json({
+        ok: false,
+        error: 'A Google identity must sign in once before it can be promoted.',
+      });
+    }
+    const passwordError = validatePassword(req.body?.password);
+    if (passwordError) {
+      return res.status(400).json({ ok: false, error: passwordError });
+    }
+
+    let created;
+    let session;
+    try {
+      created = createUserWithRole(db, {
+        email,
+        passwordHash: hashPassword(req.body.password),
+        googleSub: null,
+        requestAdmin: true,
+      });
+      claimUnclaimedProjects(db, created.id);
+      session = createSession(db, created.id, config.authSessionDays);
+    } catch (error) {
+      if (isSingleAdminViolation(error)) {
+        return res.status(409).json({ ok: false, error: 'Administrator setup is already complete.' });
+      }
+      if (isDuplicateEmailError(error)) {
+        return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
+      }
+      throw error;
+    }
+
+    return res.status(201).json({
+      ok: true,
+      created: true,
+      token: session.token,
+      expiresAt: session.expiresAt,
+      user: { id: created.id, email, isAdmin: true },
+    });
   });
 
   router.post('/login', (req, res) => {

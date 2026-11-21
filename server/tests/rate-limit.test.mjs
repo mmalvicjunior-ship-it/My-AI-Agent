@@ -5,8 +5,8 @@
 // (IP, email) with a per-IP backstop against password spraying. A 429 always
 // carries a Retry-After header and a retryAfterSeconds body field.
 //
-// Also covers F7 bootstrap safety: registration may be disabled after the
-// first account exists, and existing accounts can still log in.
+// Also verifies that registration can be closed after accounts exist while
+// existing accounts can still log in.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -34,7 +34,7 @@ async function request(method, pathname, { body, xff } = {}) {
 
 const reg = (email, xff) => request('POST', '/api/auth/register', {
   xff,
-  body: { email, password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+  body: { email, password: 'correct-horse-battery' },
 });
 const badLogin = (email, xff) => request('POST', '/api/auth/login', {
   xff,
@@ -112,17 +112,17 @@ test('spoofed X-Forwarded-For prefix does not defeat the limiter when one hop is
 test('registration limiter returns 429 with Retry-After and does not affect other IPs', async () => {
   const xff = '203.0.113.30';
   for (let attempt = 1; attempt <= 10; attempt += 1) {
-    const res = await request('POST', '/api/auth/register', { xff, body: { email: 'not-an-email', password: 'x'.repeat(9), bootstrapToken: 'test-bootstrap-token' } });
+    const res = await request('POST', '/api/auth/register', { xff, body: { email: 'not-an-email', password: 'x'.repeat(9) } });
     assert.equal(res.status, 400, `attempt ${attempt}`);
   }
-  const blocked = await request('POST', '/api/auth/register', { xff, body: { email: 'not-an-email', password: 'x'.repeat(9), bootstrapToken: 'test-bootstrap-token' } });
+  const blocked = await request('POST', '/api/auth/register', { xff, body: { email: 'not-an-email', password: 'x'.repeat(9) } });
   assert.equal(blocked.status, 429);
   assert.ok(blocked.retryAfter && Number(blocked.retryAfter) >= 1, 'registration 429 carries Retry-After');
 
   // Another IP can still register.
   const other = await request('POST', '/api/auth/register', {
     xff: '203.0.113.31',
-    body: { email: `elsewhere-${Date.now()}@example.com`, password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+    body: { email: `elsewhere-${Date.now()}@example.com`, password: 'correct-horse-battery' },
   });
   assert.equal(other.status, 201, JSON.stringify(other.data));
 });
@@ -138,7 +138,7 @@ test('per-IP backstop caps password spraying across many accounts', async () => 
   assert.ok(blocked.retryAfter && Number(blocked.retryAfter) >= 1, 'backstop 429 carries Retry-After');
 }, { timeout: 60000 });
 
-test('registration can be disabled after bootstrap and existing accounts can still log in', async () => {
+test('registration can be disabled after accounts exist and existing accounts can still log in', async () => {
   const email = `bootstrap-${Date.now()}@example.com`;
   const xff = '203.0.113.50';
   const created = await reg(email, xff);
@@ -150,7 +150,7 @@ test('registration can be disabled after bootstrap and existing accounts can sti
 
     const refused = await reg(`blocked-${Date.now()}@example.com`, xff);
     assert.equal(refused.status, 403);
-    assert.match(refused.data.error, /disabled/i);
+    assert.match(refused.data.error, /closed|not being accepted|contact your administrator/i);
 
     const login = await request('POST', '/api/auth/login', {
       xff,

@@ -92,11 +92,10 @@ test('first account registration, login, session verification and logout use Pos
     body: {
       email: 'storage-user@example.test',
       password: 'correct-horse-battery',
-      bootstrapToken: config.bootstrapToken,
     },
   });
   assert.equal(registered.status, 201);
-  assert.equal(registered.data.user.isAdmin, true);
+  assert.equal(registered.data.user.isAdmin, false, 'public registration is always ordinary');
   token = registered.data.token;
 
   const me = await request('GET', '/api/auth/me');

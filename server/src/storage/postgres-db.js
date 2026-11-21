@@ -26,8 +26,8 @@ export const POSTGRES_SCHEMA_SQL = `
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email));
   CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users (google_sub);
-  -- Keep exactly one administrator even on databases created before this
-  -- invariant existed. The earliest account remains the initial administrator.
+  -- Resolve legacy duplicate administrators only; no account is promoted at
+  -- startup. The first administrator comes from /api/auth/admin/provision.
   UPDATE users SET is_admin = 0
    WHERE is_admin = 1
      AND id <> (SELECT MIN(id) FROM users WHERE is_admin = 1);
@@ -35,7 +35,6 @@ export const POSTGRES_SCHEMA_SQL = `
 
   CREATE TABLE IF NOT EXISTS oauth_states (
     state_hash   TEXT PRIMARY KEY,
-    bootstrap_ok INTEGER NOT NULL DEFAULT 0 CHECK (bootstrap_ok IN (0, 1)),
     allow_create INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
     created_at   TEXT NOT NULL DEFAULT (${NOW}),
     expires_at   TEXT NOT NULL

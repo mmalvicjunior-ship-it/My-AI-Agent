@@ -1,22 +1,48 @@
-// Bootstrap regression tests: while the users table is empty, the FIRST
-// account may only be created with the server-side BOOTSTRAP_TOKEN. This stops
-// an unknown public visitor from registering before the administrator, and it
-// works even with ALLOW_REGISTRATION=false. After the first account exists,
-// only ALLOW_REGISTRATION governs new accounts; existing accounts always log in.
-import { test, before, after } from 'node:test';
+// Administrator provisioning regression tests.
+//
+// Ordinary registration and Google sign-in never need a setup token and never
+// create an administrator. The existing BOOTSTRAP_TOKEN is reused only by the
+// owner-only POST /api/auth/admin/provision endpoint, which works while there
+// is no administrator and stops working once one exists.
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
 
-const servers = [];
-let base;
+async function withFreshApp(fn) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-admin-'));
+  const originalDbPath = config.databasePath;
+  const originalWorkspaceRoot = config.workspaceRoot;
+  config.databasePath = path.join(tempDir, 'fresh.db');
+  config.workspaceRoot = path.join(tempDir, 'workspaces');
+  let server;
+  try {
+    const created = createApp({ provider: null });
+    server = created.app.listen(0);
+    await once(server, 'listening');
+    const base = `http://127.0.0.1:${server.address().port}`;
+    await fn({ base, db: created.db });
+  } finally {
+    server?.closeAllConnections?.();
+    server?.close();
+    config.databasePath = originalDbPath;
+    config.workspaceRoot = originalWorkspaceRoot;
+    // Temp files are left in place on Windows, where SQLite may keep a handle.
+  }
+}
 
-async function request(method, pathname, { body } = {}) {
+async function request(base, method, pathname, { token, body } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (token) headers.authorization = `Bearer ${token}`;
   const res = await fetch(base + pathname, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   let data = null;
@@ -26,105 +52,176 @@ async function request(method, pathname, { body } = {}) {
   return { status: res.status, data };
 }
 
-before(async () => {
-  const created = createApp({ provider: null });
-  const server = created.app.listen(0);
-  await once(server, 'listening');
-  servers.push(server);
-  base = `http://127.0.0.1:${server.address().port}`;
-});
+function adminCount(db) {
+  return Number(db.prepare('SELECT COUNT(*) AS count FROM users WHERE is_admin = 1').get().count);
+}
 
-after(() => {
-  for (const server of servers) {
-    server.closeAllConnections?.();
-    server.close();
-  }
-});
-
-// IMPORTANT: this file relies on execution order. The database is empty when
-// the suite starts and the first successful registration is the bootstrap.
-// ALLOW_REGISTRATION is pinned to false throughout tests 1-4 to prove the
-// bootstrap path can never be locked out by that flag.
-test('first account is refused while BOOTSTRAP_TOKEN is not configured', async () => {
-  const originalToken = config.bootstrapToken;
-  const originalAllow = config.allowRegistration;
-  try {
-    config.allowRegistration = false;
-    config.bootstrapToken = ''; // deployment without the variable set
-    const res = await request('POST', '/api/auth/register', {
-      body: { email: 'nobody@example.com', password: 'correct-horse-battery' },
+test('ordinary registration works on a fresh deployment and stays non-admin', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const res = await request(base, 'POST', '/api/auth/register', {
+      body: {
+        email: 'first@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'not-needed',
+        isAdmin: true,
+      },
     });
-    assert.equal(res.status, 403);
-    assert.match(res.data.error, /bootstrap token/i);
-  } finally {
-    config.bootstrapToken = originalToken;
-    config.allowRegistration = originalAllow;
-  }
-});
+    assert.equal(res.status, 201);
+    assert.equal(res.data.user.isAdmin, false, 'public registration never grants admin');
+    assert.ok(res.data.token);
+    assert.equal(adminCount(db), 0, 'no administrator is inferred from the first account');
+  });
+}, { timeout: 30_000 });
 
-test('first account is refused without the token, and with a wrong token', async () => {
-  const originalAllow = config.allowRegistration;
-  try {
-    config.allowRegistration = false;
-    const missing = await request('POST', '/api/auth/register', {
-      body: { email: 'nobody@example.com', password: 'correct-horse-battery' },
-    });
-    assert.equal(missing.status, 403);
-    assert.match(missing.data.error, /bootstrap token/i);
+test('admin provisioning is refused without a valid server token', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const originalToken = config.bootstrapToken;
+    try {
+      config.bootstrapToken = '';
+      const unconfigured = await request(base, 'POST', '/api/auth/admin/provision', {
+        body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+      });
+      assert.equal(unconfigured.status, 403);
+      assert.doesNotMatch(unconfigured.data.error, /BOOTSTRAP_TOKEN|bootstrapToken|#bootstrap=/i);
 
-    const wrong = await request('POST', '/api/auth/register', {
-      body: { email: 'nobody@example.com', password: 'correct-horse-battery', bootstrapToken: 'not-the-token' },
-    });
-    assert.equal(wrong.status, 403);
-    assert.match(wrong.data.error, /bootstrap token/i);
-  } finally {
-    config.allowRegistration = originalAllow;
-  }
-});
+      config.bootstrapToken = originalToken;
+      const missing = await request(base, 'POST', '/api/auth/admin/provision', {
+        body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+      });
+      assert.equal(missing.status, 403);
 
-test('first account is created with the correct token', async () => {
-  const originalAllow = config.allowRegistration;
-  try {
-    config.allowRegistration = false; // flag must not lock out initial creation
-    const res = await request('POST', '/api/auth/register', {
-      body: { email: 'admin@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+      const wrong = await request(base, 'POST', '/api/auth/admin/provision', {
+        body: { email: 'admin@example.com', password: 'correct-horse-battery', bootstrapToken: 'not-the-token' },
+      });
+      assert.equal(wrong.status, 403);
+      assert.equal(adminCount(db), 0);
+    } finally {
+      config.bootstrapToken = originalToken;
+    }
+  });
+}, { timeout: 30_000 });
+
+test('admin provisioning creates the first administrator with the server token', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const res = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: {
+        email: 'admin@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'test-bootstrap-token',
+      },
     });
     assert.equal(res.status, 201, JSON.stringify(res.data));
-    assert.ok(res.data.token, 'first account receives a session token');
-  } finally {
-    config.allowRegistration = originalAllow;
-  }
-});
+    assert.equal(res.data.created, true);
+    assert.equal(res.data.user.isAdmin, true);
+    assert.ok(res.data.token, 'a newly created admin receives a session');
+    assert.equal(adminCount(db), 1);
 
-test('after bootstrap, ALLOW_REGISTRATION=false refuses new accounts; the first account still logs in', async () => {
-  const original = config.allowRegistration;
-  try {
-    config.allowRegistration = false;
-    const refused = await request('POST', '/api/auth/register', {
-      body: { email: 'second@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
-    });
-    assert.equal(refused.status, 403);
-    assert.match(refused.data.error, /disabled/i);
+    const me = await request(base, 'GET', '/api/auth/me', { token: res.data.token });
+    assert.equal(me.status, 200);
+    assert.equal(me.data.user.isAdmin, true);
+  });
+}, { timeout: 30_000 });
 
-    const login = await request('POST', '/api/auth/login', {
-      body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+test('admin provisioning stops after one administrator exists', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const first = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: {
+        email: 'admin@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'test-bootstrap-token',
+      },
     });
-    assert.equal(login.status, 200, 'existing account logs in while registration is disabled');
-    assert.ok(login.data.token);
-  } finally {
-    config.allowRegistration = original;
-  }
-});
+    assert.equal(first.status, 201);
 
-test('after bootstrap, registration ignores the token and follows ALLOW_REGISTRATION', async () => {
-  const original = config.allowRegistration;
-  try {
-    config.allowRegistration = true;
-    const res = await request('POST', '/api/auth/register', {
-      body: { email: 'second@example.com', password: 'correct-horse-battery' },
+    const second = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: {
+        email: 'second-admin@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'test-bootstrap-token',
+      },
     });
-    assert.equal(res.status, 201, 'later accounts do not need the bootstrap token');
-  } finally {
-    config.allowRegistration = original;
-  }
+    assert.equal(second.status, 409);
+    assert.match(second.data.error, /already complete/i);
+    assert.equal(adminCount(db), 1);
+    assert.equal(db.prepare('SELECT COUNT(*) AS c FROM users').get().c, 1);
+  });
+}, { timeout: 30_000 });
+
+test('admin provisioning promotes an existing account without invalidating its session', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const registered = await request(base, 'POST', '/api/auth/register', {
+      body: { email: 'owner@example.com', password: 'correct-horse-battery' },
+    });
+    assert.equal(registered.status, 201);
+    const sessionToken = registered.data.token;
+
+    const before = await request(base, 'GET', '/api/auth/me', { token: sessionToken });
+    assert.equal(before.data.user.isAdmin, false);
+
+    const provisioned = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { email: 'owner@example.com', bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(provisioned.status, 200);
+    assert.equal(provisioned.data.created, false);
+    assert.equal(provisioned.data.user.isAdmin, true);
+    assert.equal(provisioned.data.token, undefined, 'promotion does not mint a new session');
+
+    const after = await request(base, 'GET', '/api/auth/me', { token: sessionToken });
+    assert.equal(after.status, 200, 'the existing session remains valid');
+    assert.equal(after.data.user.isAdmin, true, 'the role is read from the database');
+    assert.equal(adminCount(db), 1);
+  });
+}, { timeout: 30_000 });
+
+test('admin provisioning can promote a verified Google identity by googleSub', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    db.prepare('INSERT INTO users (email, password_hash, is_admin, google_sub) VALUES (?, ?, 0, ?)')
+      .run('google-owner@example.com', 'shadow-hash', 'google-sub-owner');
+
+    const mismatch = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { email: 'google-owner@example.com', googleSub: 'wrong-sub', bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(mismatch.status, 409);
+    assert.equal(adminCount(db), 0);
+
+    const promoted = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { googleSub: 'google-sub-owner', bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(promoted.status, 200);
+    assert.equal(promoted.data.user.email, 'google-owner@example.com');
+    assert.equal(promoted.data.user.isAdmin, true);
+    assert.equal(adminCount(db), 1);
+  });
+}, { timeout: 30_000 });
+
+test('admin provisioning rejects malformed identity and password requests', async () => {
+  await withFreshApp(async ({ base, db }) => {
+    const noIdentity = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(noIdentity.status, 400);
+
+    const newGoogleSub = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { googleSub: 'not-signed-in-yet', bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(newGoogleSub.status, 400);
+
+    const weakPassword = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: { email: 'admin@example.com', password: 'short', bootstrapToken: 'test-bootstrap-token' },
+    });
+    assert.equal(weakPassword.status, 400);
+
+    const clientRole = await request(base, 'POST', '/api/auth/admin/provision', {
+      body: {
+        email: 'admin@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'test-bootstrap-token',
+        isAdmin: false,
+        is_admin: 0,
+      },
+    });
+    assert.equal(clientRole.status, 201);
+    assert.equal(clientRole.data.user.isAdmin, true, 'client fields cannot downgrade provisioning');
+    assert.equal(adminCount(db), 1);
+  });
 }, { timeout: 30_000 });

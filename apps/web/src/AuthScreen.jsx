@@ -1,23 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { extractBootstrapToken, stripBootstrapFromFragment } from './bootstrapToken.js';
 
-// Friendly descriptions for the machine-readable error codes the Google
-// callback uses in its redirect fragment (#auth_error=<code>).
-// In-memory only: survives React remounts for the lifetime of the page, but is
-// never written to storage or sent anywhere except the bootstrap request body.
-let pendingBootstrapToken = '';
-
+// Friendly, customer-safe descriptions for the machine-readable error codes
+// the Google callback uses in its redirect fragment (#auth_error=<code>).
 const GOOGLE_ERRORS = {
-  google_not_configured: 'Google sign-in is not configured on this server.',
-  google_bootstrap_required: 'Creating the first account requires the server bootstrap token. Open the setup URL (#bootstrap=<token>) first.',
-  google_registration_disabled: 'Registration is disabled on this server. Ask the administrator for an account.',
+  google_not_configured: 'Google sign-in is temporarily unavailable. Please try again later.',
+  google_registration_disabled: 'New accounts are not being accepted right now. Please contact your administrator.',
   google_account_exists: 'An account with this email already exists. Sign in with your password instead.',
-  google_identity_conflict: 'This Google identity is already linked to a different account.',
+  google_identity_conflict: 'That Google account is already associated with a different account. Please contact support.',
   google_cancelled: 'Google sign-in was cancelled.',
-  google_state: 'That sign-in link expired or was already used. Please try again.',
-  google_unverified_email: 'Your Google account email address is not verified.',
+  google_state: 'That sign-in link has expired. Please try again.',
+  google_unverified_email: 'Please use a Google account with a verified email address.',
   google_unavailable: 'Google sign-in is unavailable right now. Please try again later.',
-  google_identity_invalid: 'Google identity could not be verified. Please try again.',
+  google_identity_invalid: 'Google sign-in could not be completed. Please try again.',
 };
 
 /**
@@ -25,15 +19,13 @@ const GOOGLE_ERRORS = {
  * The backend issues a bearer token; App.jsx stores it and attaches it to
  * every /api request. No token or password is ever written to logs.
  *
- * The bootstrap token may be provided via the URL fragment
- * #bootstrap=<token> for initial setup (first account only). Fragments never
- * reach any server, so the token cannot appear in any access log. It is read
- * automatically from the operator's setup URL and is never shown in the form,
- * so ordinary users are never asked for an administrator secret.
+ * Google sign-in needs no setup token: clicking the button starts the normal
+ * OAuth flow and sends the user straight to Google. Administrator provisioning
+ * is a separate owner-only server operation and is never surfaced here.
  *
  * The Google sign-in flow starts with POST /api/auth/google/start and returns
  * the user here with the session token in the URL fragment (#auth_token=...),
- * for the same reason: fragments never travel to any server or log.
+ * because fragments never travel to any server or log.
  */
 export default function AuthScreen({ apiBase = '', onAuthenticated }) {
   const [mode, setMode] = useState('login');
@@ -46,39 +38,6 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
 
   const isRegister = mode === 'register';
 
-  // The URL fragment may carry the one-time bootstrap token (#bootstrap=...)
-  // or the result of the Google flow (#auth_token=... / #auth_error=...).
-  // The bootstrap value is moved into memory and the fragment is stripped as
-  // soon as it is seen, so it is never kept in the address bar.
-  const [urlBootstrapToken, setUrlBootstrapToken] = useState('');
-
-  // A setup link pasted into an already open tab only fires hashchange; it does
-  // not remount this component. Capture the token on mount and on every hash
-  // change, then read it from memory when the setup request is made.
-  function captureBootstrapFragment() {
-    const token = extractBootstrapToken(window.location.hash);
-    if (!token) return;
-    pendingBootstrapToken = token;
-    setUrlBootstrapToken(token);
-
-    const remaining = stripBootstrapFromFragment(window.location.hash);
-    if (remaining !== window.location.hash && window.history?.replaceState) {
-      window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}${remaining}`);
-    }
-  }
-
-  function bootstrapTokenFromLocation() {
-    return pendingBootstrapToken || urlBootstrapToken;
-  }
-
-  function clearBootstrapFromLocation() {
-    pendingBootstrapToken = '';
-    setUrlBootstrapToken('');
-    const remaining = stripBootstrapFromFragment(window.location.hash);
-    if (remaining === window.location.hash || !window.history?.replaceState) return;
-    window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}${remaining}`);
-  }
-
   useEffect(() => {
     let cancelled = false;
     let handledAuthToken = false;
@@ -90,15 +49,19 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
       const authToken = params.get('auth_token');
       const authError = params.get('auth_error');
       const authExpires = params.get('auth_expires') || undefined;
+      if (!authToken && !authError) return;
 
-      captureBootstrapFragment();
-      if (authError) setError(GOOGLE_ERRORS[authError] || 'Google sign-in failed. Please try again.');
+      // The callback fragment is consumed immediately and never kept in the
+      // address bar, browser history, or any analytics/logging surface.
+      if (window.history?.replaceState) {
+        window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
+      }
+      if (authError) {
+        setError(GOOGLE_ERRORS[authError] || 'Google sign-in could not be completed. Please try again.');
+        return;
+      }
       if (!authToken || handledAuthToken) return;
-
-      // An OAuth callback token is consumed immediately. A bootstrap token was
-      // captured into memory above and already removed from the address bar.
       handledAuthToken = true;
-      window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
 
       // Verify the fragment-carried session token against the trusted backend
       // before accepting it, then hand it to the app exactly like a password
@@ -138,22 +101,20 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
     setError(null);
     setGoogleBusy(true);
     try {
-      const body = {};
-      const token = bootstrapTokenFromLocation();
-      if (token) body.bootstrapToken = token;
+      // Ordinary Google sign-in needs no setup token. The backend returns
+      // Google's authorize URL and the browser goes there immediately.
       const response = await fetch(`${apiBase}/api/auth/google/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: '{}',
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok || !result.ok || !result.url) {
-        throw new Error(result.error || 'Could not start Google sign-in.');
+        throw new Error('Google sign-in is unavailable right now. Please try again.');
       }
-      clearBootstrapFromLocation();
       window.location.assign(result.url);
     } catch (err) {
-      setError(err.message || 'Could not start Google sign-in.');
+      setError(err.message || 'Google sign-in is unavailable right now. Please try again.');
       setGoogleBusy(false);
     }
   };
@@ -167,25 +128,18 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
     }
     setBusy(true);
     try {
-      // Build the request body: always include email and password. Only the
-      // operator's setup URL may inject the first-account bootstrap token.
-      const body = { email: email.trim(), password };
-      const token = bootstrapTokenFromLocation();
-      if (isRegister && token) body.bootstrapToken = token;
-
       const response = await fetch(`${apiBase}/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ email: email.trim(), password }),
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok || !result.ok || !result.token) {
-        throw new Error(result.error || `Request failed (${response.status})`);
+        throw new Error(result.error || 'We could not complete that request. Please try again.');
       }
-      clearBootstrapFromLocation();
       onAuthenticated(result.token, result.user, result.expiresAt);
     } catch (err) {
-      setError(err.message || 'Could not sign in.');
+      setError(err.message || 'We could not complete that request. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -294,11 +248,6 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
                 </button>
               </div>
             </label>
-            {isRegister && urlBootstrapToken && (
-              <div className="auth-bootstrap-hint">
-                <span>First-account setup detected. Your administrator secret will be applied automatically.</span>
-              </div>
-            )}
 
             {error && <div className="auth-error" role="alert">{error}</div>}
 
@@ -309,7 +258,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated }) {
 
           <p className="auth-note">
             {isRegister
-              ? 'New accounts can use Google or email and password. Projects created before accounts existed are adopted by the first account.'
+              ? 'New accounts can use Google or email and password. Your projects stay private to your account.'
               : 'Sessions stay signed in across refreshes and can be ended with Sign out.'}
           </p>
         </div>

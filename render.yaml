@@ -37,20 +37,19 @@ services:
       # Retained for compatibility; the actual Node binary is pinned in the Dockerfile.
       - key: NODE_VERSION
         value: "22"
-      # Bootstrap procedure: before the first deploy, enter BOOTSTRAP_TOKEN
-      # (a long random string) in the Render dashboard. Deploy, then register
-      # the first (administrator) account by entering that token on the sign-up
-      # form. Registration of the first account fails with 403 otherwise, so
-      # a public visitor can never race the administrator. Afterwards set
-      # ALLOW_REGISTRATION to "false" (existing accounts can always log in).
-      # BOOTSTRAP_TOKEN is only read while no user exists; it may be removed
-      # after bootstrap. sync:false keeps the real value out of the repo.
+      # Admin provisioning: before the first deploy, set BOOTSTRAP_TOKEN to a
+      # long random string in the Render dashboard. Ordinary users sign up and
+      # use Google sign-in without it. The owner calls
+      # POST /api/auth/admin/provision with this token to create or promote the
+      # first administrator; the endpoint stops working once one admin exists.
+      # Afterwards set ALLOW_REGISTRATION to "false" (existing accounts can
+      # always log in). sync:false keeps the real value out of the repo.
       - key: BOOTSTRAP_TOKEN
         sync: false
       - key: AUTH_SESSION_DAYS
         value: "30"
       - key: ALLOW_REGISTRATION
-        # Governs accounts created AFTER the first one. Leave "true" only while
-        # you are bootstrapping; set "false" in the dashboard once the admin
-        # account exists. Login for existing accounts is unaffected.
+        # Governs ordinary public registration. Leave "true" so Google and
+        # password sign-up work normally; set "false" once the administrator is
+        # provisioned. Login for existing accounts is unaffected.
         value: "true"

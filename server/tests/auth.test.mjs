@@ -33,7 +33,7 @@ async function request(method, path, { token, body } = {}) {
 }
 
 function register(email, password = 'correct-horse-battery') {
-  return request('POST', '/api/auth/register', { body: { email, password, bootstrapToken: 'test-bootstrap-token' } });
+  return request('POST', '/api/auth/register', { body: { email, password } });
 }
 
 function login(email, password = 'correct-horse-battery') {
@@ -74,7 +74,7 @@ test('registration validates its input', async () => {
     [{ email: 'short@example.com', password: 'short' }, 'short password'],
   ];
   for (const [body, label] of cases) {
-    const { status, data } = await request('POST', '/api/auth/register', { body: { bootstrapToken: 'test-bootstrap-token', ...body } });
+    const { status, data } = await request('POST', '/api/auth/register', { body });
     assert.equal(status, 400, `${label} must be rejected`);
     assert.equal(data.ok, false);
     assert.equal(typeof data.error, 'string');

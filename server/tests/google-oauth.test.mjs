@@ -134,10 +134,15 @@ const errorLocation = (res) => new URLSearchParams(String(res.headers.get('locat
 const authFragment = (res) => new URLSearchParams(String(res.headers.get('location') || '').split('#')[1] || '');
 
 async function registerAdmin(base) {
-  const res = await request('POST', base, '/api/auth/register', {
-    body: { email: 'admin@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+  const res = await request('POST', base, '/api/auth/admin/provision', {
+    body: {
+      email: 'admin@example.com',
+      password: 'correct-horse-battery',
+      bootstrapToken: 'test-bootstrap-token',
+    },
   });
   assert.equal(res.status, 201);
+  assert.equal(res.data.user.isAdmin, true);
   return res;
 }
 
@@ -155,7 +160,8 @@ test('google/start returns 503 when Google is not configured', async () => {
       await withApp(async ({ base, db }) => {
         const res = await startGoogle(base, {});
         assert.equal(res.status, 503);
-        assert.match(res.data.error, /not configured/i);
+        assert.match(res.data.error, /temporarily unavailable/i);
+        assert.doesNotMatch(res.data.error, /configured|environment|GOOGLE_/i);
         const cbRes = await callback(base, { state: 'anything' });
         assert.equal(cbRes.status, 302);
         assert.equal(errorLocation(cbRes).get('auth_error'), 'google_not_configured');
@@ -167,18 +173,20 @@ test('google/start returns 503 when Google is not configured', async () => {
   });
 }, { timeout: 30_000 });
 
-test('google/start refuses the first account without the bootstrap token', async () => {
+test('google/start redirects directly to Google on a fresh database without any token', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     try {
       await withApp(async ({ base, db }) => {
         const res = await startGoogle(base, {});
-        assert.equal(res.status, 403);
-        assert.match(res.data.error, /bootstrap token/i);
+        assert.equal(res.status, 200);
+        assert.equal(res.data.ok, true);
+        const url = new URL(res.data.url);
+        assert.equal(url.origin, 'https://accounts.google.com');
+        assert.equal(url.searchParams.get('client_id'), config.googleClientId);
+        assert.ok(url.searchParams.get('state'), 'the authorize URL carries a one-time state');
         assert.equal(Number(db.prepare('SELECT COUNT(*) AS c FROM users').get().c), 0);
-
-        const wrong = await startGoogle(base, { bootstrapToken: 'not-the-token' });
-        assert.equal(wrong.status, 403);
+        assert.doesNotMatch(JSON.stringify(res.data), /bootstrap/i);
       });
     } finally {
       restore();
@@ -186,14 +194,14 @@ test('google/start refuses the first account without the bootstrap token', async
   });
 }, { timeout: 30_000 });
 
-test('the first account can be created through Google with the bootstrap token and becomes the administrator', async () => {
+test('the first Google sign-in creates an ordinary account without any token', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     const restoreFetch = globalThis.fetch;
     mockGoogle({ tokeninfoBody: claimsFor('google-sub-admin', 'boss@example.com') });
     try {
       await withApp(async ({ base, db }) => {
-        const start = await startGoogle(base, { bootstrapToken: 'test-bootstrap-token' });
+        const start = await startGoogle(base, {});
         assert.equal(start.status, 200);
         assert.equal(start.data.ok, true);
         const state = stateFrom(start);
@@ -202,16 +210,17 @@ test('the first account can be created through Google with the bootstrap token a
         assert.equal(cb.status, 302);
         const fragment = authFragment(cb);
         assert.ok(fragment.get('auth_token'), 'the callback redirects with a session token in the fragment');
+        assert.equal(errorLocation(cb).get('auth_error'), null);
 
         const row = db.prepare('SELECT email, is_admin, google_sub FROM users').get();
         assert.equal(row.email, 'boss@example.com');
-        assert.equal(row.is_admin, 1, 'the first Google-created account must be the administrator');
+        assert.equal(row.is_admin, 0, 'a Google-created account is never an administrator');
         assert.equal(row.google_sub, 'google-sub-admin');
 
         const me = await request('GET', base, '/api/auth/me', { token: fragment.get('auth_token') });
         assert.equal(me.status, 200);
         assert.equal(me.data.user.email, 'boss@example.com');
-        assert.equal(me.data.user.isAdmin, true);
+        assert.equal(me.data.user.isAdmin, false);
       });
     } finally {
       globalThis.fetch = restoreFetch;
@@ -220,16 +229,16 @@ test('the first account can be created through Google with the bootstrap token a
   });
 }, { timeout: 30_000 });
 
-test('two bootstrap-authorized Google starts still create only one administrator', async () => {
+test('two simultaneous first Google sign-ins create two ordinary accounts', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     const originalFetch = globalThis.fetch;
-    mockGoogle({ tokeninfoBody: claimsFor('google-sub-first-admin', 'first-admin@example.com') });
+    mockGoogle({ tokeninfoBody: claimsFor('google-sub-first-user', 'first-user@example.com') });
     try {
       await withApp(async ({ base, db }) => {
-        // Both flows start while the database is empty and carry a valid token.
-        const start1 = await startGoogle(base, { bootstrapToken: 'test-bootstrap-token' });
-        const start2 = await startGoogle(base, { bootstrapToken: 'test-bootstrap-token' });
+        // Both flows start while the database is empty and send no token.
+        const start1 = await startGoogle(base, {});
+        const start2 = await startGoogle(base, {});
         assert.equal(start1.status, 200);
         assert.equal(start2.status, 200);
         const state1 = stateFrom(start1);
@@ -253,9 +262,10 @@ test('two bootstrap-authorized Google starts still create only one administrator
 
         const rows = db.prepare('SELECT email, is_admin FROM users ORDER BY id').all();
         assert.deepEqual(rows.map((row) => ({ email: row.email, is_admin: row.is_admin })), [
-          { email: 'first-admin@example.com', is_admin: 1 },
+          { email: 'first-user@example.com', is_admin: 0 },
           { email: 'second-user@example.com', is_admin: 0 },
         ]);
+        assert.equal(Number(db.prepare('SELECT COUNT(*) AS c FROM users WHERE is_admin = 1').get().c), 0);
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -264,7 +274,7 @@ test('two bootstrap-authorized Google starts still create only one administrator
   });
 }, { timeout: 30_000 });
 
-test('a new Google user (after bootstrap) is a normal non-administrator account', async () => {
+test('new Google users stay ordinary even after an administrator exists', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     const restoreFetch = globalThis.fetch;

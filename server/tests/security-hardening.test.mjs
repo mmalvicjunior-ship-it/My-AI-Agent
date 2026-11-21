@@ -128,7 +128,7 @@ const fragmentFrom = (res) => new URLSearchParams(String(res.headers.get('locati
 
 async function registerAdmin(base) {
   const res = await request('POST', base, '/api/auth/register', {
-    body: { email: 'admin@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
+    body: { email: 'admin@example.com', password: 'correct-horse-battery' },
   });
   assert.equal(res.status, 201);
   return res;

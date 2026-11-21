@@ -5,12 +5,15 @@ authentication. When the three `GOOGLE_*` variables are set, a
 "Continue with Google" button appears on the sign-in/registration screen;
 when they are not set, nothing changes and the button is never shown.
 
+Google sign-in is a normal user flow. It needs no bootstrap token, setup URL,
+URL fragment, or developer configuration from the person signing in.
+
 ## How it works (server-side authorization-code flow)
 
-1. The browser calls `POST /api/auth/google/start` (optionally carrying the
-   first-account `bootstrapToken` in the JSON body only). The server creates
-   a random one-time `state`, stores only its SHA-256 hash with a 10-minute
-   expiry, and returns Google's consent-screen URL.
+1. The browser calls `POST /api/auth/google/start` with an empty JSON body. The
+   server creates a random one-time `state`, stores only its SHA-256 hash with a
+   10-minute expiry, and returns Google's consent-screen URL. The frontend
+   navigates there immediately.
 2. Google redirects the browser back to the server callback
    `GET /api/auth/google/callback?code=...&state=...`.
 3. The server exchanges the code for tokens (server-to-server, client secret
@@ -18,15 +21,16 @@ when they are not set, nothing changes and the button is never shown.
    `tokeninfo` endpoint: audience must equal the client ID, issuer must be
    Google, `email_verified` must be true, and `sub`/`email` must be present.
    The email is taken only from Google's response — never from the frontend.
-4. The server looks up the account by `google_sub`, or creates a new
-   non-administrator account (or the first administrator account when the
-   database is empty and the bootstrap token was validated at step 1), and
-   issues the same bearer session token as email/password login.
+4. The server looks up the account by `google_sub`, or creates a new ordinary
+   account, then issues the same bearer session token as email/password login.
+   An administrator is never created here; see
+   `docs/FIRST-ACCOUNT-BOOTSTRAP.md` for owner-only provisioning.
 5. The browser lands back on the app with the token in the URL fragment
    (`#auth_token=...&auth_expires=...`), which the SPA verifies with
    `/api/auth/me` before applying. Fragments are never sent to any server, so
    the session token cannot appear in Vercel, Render, proxy, CDN, or
-   application logs. Failures return as `#auth_error=<code>` instead.
+   application logs. Failures return as `#auth_error=<code>` and are shown as
+   friendly application-level messages.
 
 ### Account rules
 
@@ -36,10 +40,10 @@ when they are not set, nothing changes and the button is never shown.
   their password instead (`google_account_exists`).
 - A different Google `sub` claiming an email that is already linked to another
   Google identity is rejected (`google_identity_conflict`).
-- Google-created accounts are never administrators, except the very first
-  account, which still requires the `BOOTSTRAP_TOKEN` exactly as before.
+- Google-created accounts are **never** administrators, including the first
+  account on a fresh deployment.
 - Google registration respects `ALLOW_REGISTRATION=false`
-  (`google_registration_disabled`).
+  (`google_registration_disabled`); login for existing accounts is unaffected.
 - Google-only accounts get an unusable password hash, so password sign-in is
   impossible for them.
 
@@ -94,16 +98,18 @@ paths. `APP_ORIGIN` is the one exception and is usually unnecessary.
 
 ## Troubleshooting
 
-The callback redirects to `/#auth_error=<code>` with these codes:
+The callback redirects to `/#auth_error=<code>` with these codes. The browser
+shows a friendly message for each one; these names are internal diagnostics
+only.
 
-| Code | Meaning |
+| Code | User-facing meaning |
 | --- | --- |
-| `google_not_configured` | The server does not have all three Google variables set. |
+| `google_not_configured` | Google sign-in is temporarily unavailable. |
 | `google_cancelled` | The user cancelled on Google's consent screen. |
-| `google_state` | Missing, unknown, expired, or already-used `state` (CSRF protection). Restart the flow. |
-| `google_identity_invalid` | Google's identity could not be validated (audience, issuer, malformed claims, exchange failure). |
-| `google_unverified_email` | Google reports the email as not verified. |
-| `google_account_exists` | An email/password account already uses that email; sign in with the password instead. |
-| `google_identity_conflict` | That Google identity is already linked to a different account. |
-| `google_bootstrap_required` | The database has no accounts yet and the bootstrap token was missing/invalid at flow start. |
-| `google_registration_disabled` | `ALLOW_REGISTRATION=false` and no account exists for this identity. |
+| `google_state` | The sign-in link expired or was already used; try again. |
+| `google_identity_invalid` | Google identity could not be verified. |
+| `google_unverified_email` | A verified Google email address is required. |
+| `google_account_exists` | An email/password account already uses that email. |
+| `google_identity_conflict` | That Google account is linked to a different account. |
+| `google_registration_disabled` | New accounts are not being accepted right now. |
+| `google_unavailable` | Google sign-in is temporarily unavailable. |

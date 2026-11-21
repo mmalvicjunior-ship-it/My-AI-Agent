@@ -1,13 +1,14 @@
 // Role-based auth regression tests.
 //
-// Verifies the first-account bootstrap flow, the is_admin flag, and that
-// ordinary users can never register as administrators:
-//   1. First account requires BOOTSTRAP_TOKEN (unchanged behavior).
-//   2. The first account is created through the normal register endpoint and
-//      receives is_admin=true; later accounts always receive is_admin=false.
-//   3. A client-supplied is_admin field is ignored on every registration.
-//   4. Login and /api/auth/me expose isAdmin so the frontend can redirect by
-//      actual account role.
+// Verifies that public registration never grants admin, that client-supplied
+// role fields are ignored, and that the owner-only provisioning endpoint is
+// the sole source of administrator privileges:
+//   1. First and later public accounts are ordinary users.
+//   2. A client cannot self-promote with isAdmin/is_admin/admin fields.
+//   3. Provisioning promotes an existing account and existing sessions see it.
+//   4. The database still permits only one administrator.
+//   5. On a fresh database, ordinary registration needs no token while
+//      administrator provisioning remains token-gated.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -22,6 +23,7 @@ import { createUserWithRole } from '../src/routes/auth.js';
 const servers = [];
 let base;
 let db;
+let firstAccountToken;
 
 async function request(method, pathname, { token, body } = {}) {
   const headers = {};
@@ -55,23 +57,18 @@ after(() => {
   }
 });
 
-test('first account registers normally with the bootstrap token and becomes admin', async () => {
-  const originalAllow = config.allowRegistration;
-  try {
-    config.allowRegistration = false; // flag must not lock out initial creation
-    const res = await request('POST', '/api/auth/register', {
-      body: { email: 'admin@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' },
-    });
-    assert.equal(res.status, 201);
-    assert.equal(res.data.ok, true);
-    assert.equal(res.data.user.isAdmin, true, 'the first account must be the administrator');
-    assert.ok(res.data.token, 'first account receives a session token');
-  } finally {
-    config.allowRegistration = originalAllow;
-  }
+test('the first public account registers without a token and is not an admin', async () => {
+  const res = await request('POST', '/api/auth/register', {
+    body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+  });
+  assert.equal(res.status, 201);
+  assert.equal(res.data.ok, true);
+  assert.equal(res.data.user.isAdmin, false, 'public registration never grants admin');
+  assert.ok(res.data.token, 'the first public account receives a session token');
+  firstAccountToken = res.data.token;
 });
 
-test('second account registers normally and is never an administrator', async () => {
+test('later public accounts are never administrators', async () => {
   const res = await request('POST', '/api/auth/register', {
     body: { email: 'user@example.com', password: 'correct-horse-battery' },
   });
@@ -80,13 +77,30 @@ test('second account registers normally and is never an administrator', async ()
   assert.equal(res.data.user.isAdmin, false, 'later accounts must not be administrators');
 });
 
-test('client-supplied is_admin is ignored on registration', async () => {
+test('client-supplied role fields are ignored on registration', async () => {
   const res = await request('POST', '/api/auth/register', {
     body: { email: 'evil@example.com', password: 'correct-horse-battery', isAdmin: true, is_admin: true, admin: true },
   });
   assert.equal(res.status, 201);
   assert.equal(res.data.ok, true);
   assert.equal(res.data.user.isAdmin, false, 'a client cannot self-promote to administrator');
+});
+
+test('owner-only provisioning promotes an existing account and updates its role', async () => {
+  const provision = await request('POST', '/api/auth/admin/provision', {
+    body: {
+      email: 'admin@example.com',
+      bootstrapToken: 'test-bootstrap-token',
+      isAdmin: false,
+    },
+  });
+  assert.equal(provision.status, 200, JSON.stringify(provision.data));
+  assert.equal(provision.data.created, false);
+  assert.equal(provision.data.user.isAdmin, true);
+
+  const me = await request('GET', '/api/auth/me', { token: firstAccountToken });
+  assert.equal(me.status, 200);
+  assert.equal(me.data.user.isAdmin, true, 'the existing session sees the promoted role');
 });
 
 test('login and /me expose the real account role', async () => {
@@ -111,7 +125,7 @@ test('login and /me expose the real account role', async () => {
   assert.equal(meUser.data.user.isAdmin, false);
 });
 
-test('only one administrator can exist and a lost first-account race is downgraded', () => {
+test('only one administrator can exist and a lost provisioning race is downgraded', () => {
   const admins = db.prepare('SELECT id FROM users WHERE is_admin = 1').all();
   assert.equal(admins.length, 1, 'the database must contain exactly one administrator');
 
@@ -121,23 +135,21 @@ test('only one administrator can exist and a lost first-account race is downgrad
     /UNIQUE constraint failed: users\.is_admin|idx_users_single_admin/i,
   );
 
-  // Simulates the request that sees an empty table but inserts after another
-  // first-account attempt has already committed.
+  // Simulates a provisioning request that saw no admin but inserts after
+  // another provisioning request committed.
   const lostRace = createUserWithRole(db, {
     email: 'race-loser@example.com',
     passwordHash: 'not-a-real-hash',
     googleSub: null,
     requestAdmin: true,
   });
-  assert.equal(lostRace.isAdmin, false, 'the losing request must become an ordinary user');
+  assert.equal(lostRace.isAdmin, false, 'the losing request must not create a second admin');
   const stored = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(lostRace.id);
   assert.equal(stored.is_admin, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS c FROM users WHERE is_admin = 1').get().c, 1);
 });
 
-test('first-account registration still fails without a valid bootstrap token', async () => {
-  // Fresh, empty database: the bootstrap path must still fail closed, proving
-  // that the URL-based flow cannot bypass server-side validation.
+test('a fresh database allows ordinary registration but keeps provisioning token-gated', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-authrole-'));
   const tempDbPath = path.join(tempDir, 'fresh.db');
   const originalDbPath = config.databasePath;
@@ -151,32 +163,36 @@ test('first-account registration still fails without a valid bootstrap token', a
     await once(freshServer, 'listening');
     const freshBase = `http://127.0.0.1:${freshServer.address().port}`;
 
-    const noToken = await fetch(`${freshBase}/api/auth/register`, {
+    const first = await fetch(`${freshBase}/api/auth/register`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'nobody@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'first@example.com', password: 'correct-horse-battery' }),
     });
-    const noTokenData = await noToken.json();
-    assert.equal(noToken.status, 403);
-    assert.match(noTokenData.error, /bootstrap token/i);
+    const firstData = await first.json();
+    assert.equal(first.status, 201, 'ordinary registration needs no bootstrap token');
+    assert.equal(firstData.user.isAdmin, false);
 
-    const wrongToken = await fetch(`${freshBase}/api/auth/register`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'nobody@example.com', password: 'correct-horse-battery', bootstrapToken: 'not-the-token' }),
-    });
-    const wrongTokenData = await wrongToken.json();
-    assert.equal(wrongToken.status, 403);
-    assert.match(wrongTokenData.error, /bootstrap token/i);
+    for (const bootstrapToken of [undefined, 'not-the-token']) {
+      const denied = await fetch(`${freshBase}/api/auth/admin/provision`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: 'fresh-admin@example.com', password: 'correct-horse-battery', bootstrapToken }),
+      });
+      assert.equal(denied.status, 403);
+    }
 
-    const adminRes = await fetch(`${freshBase}/api/auth/register`, {
+    const provisioned = await fetch(`${freshBase}/api/auth/admin/provision`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'first@example.com', password: 'correct-horse-battery', bootstrapToken: 'test-bootstrap-token' }),
+      body: JSON.stringify({
+        email: 'fresh-admin@example.com',
+        password: 'correct-horse-battery',
+        bootstrapToken: 'test-bootstrap-token',
+      }),
     });
-    const adminData = await adminRes.json();
-    assert.equal(adminRes.status, 201);
-    assert.equal(adminData.user.isAdmin, true, 'the first account must be the administrator');
+    const provisionedData = await provisioned.json();
+    assert.equal(provisioned.status, 201);
+    assert.equal(provisionedData.user.isAdmin, true);
   } finally {
     freshServer?.closeAllConnections?.();
     freshServer?.close();

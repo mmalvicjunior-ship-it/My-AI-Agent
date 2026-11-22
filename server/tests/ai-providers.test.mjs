@@ -413,6 +413,57 @@ test('OpenAI adapter names OpenRouter in upstream errors', async () => {
   );
 });
 
+test('OpenAI adapter logs redacted OpenRouter diagnostics without the API key', async () => {
+  const secret = 'sk-test-openrouter-secret-123';
+  const logs = [];
+  const originalError = console.error;
+  const provider = createOpenAIProvider({
+    apiKey: secret,
+    model: 'particle-ai/particle-1:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    fetchImpl: async () => Response.json({
+      error: {
+        message: 'Rate limit exceeded',
+        metadata: {
+          error_type: 'rate_limit_exceeded',
+          provider_code: 'provider-429',
+        },
+      },
+    }, {
+      status: 429,
+      headers: {
+        'Retry-After': '12',
+        'X-RateLimit-Limit': '20',
+        'X-RateLimit-Remaining': '0',
+      },
+    }),
+  });
+
+  console.error = (...args) => logs.push(args.join(' '));
+  try {
+    await assert.rejects(
+      provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+      (error) => {
+        assert.equal(error.category, 'RATE_LIMITED');
+        assert.equal(error.retryAfterSeconds, 12);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  const log = logs.join('\n');
+  assert.match(log, /provider=OpenRouter/);
+  assert.match(log, /model=particle-ai\/particle-1:free/);
+  assert.match(log, /category=RATE_LIMITED/);
+  assert.match(log, /metadata=.*rate_limit_exceeded/);
+  assert.match(log, /rateLimit=.*"remaining":"0"/);
+  assert.match(log, /retryAfterSeconds=12/);
+  assert.match(log, /detail="OpenRouter rate limit was reached/);
+  assert.ok(!log.includes(secret));
+});
+
 test('OpenAI adapter reports that the configured model cannot call tools', async () => {
   const provider = createOpenAIProvider({
     apiKey: 'test-key',

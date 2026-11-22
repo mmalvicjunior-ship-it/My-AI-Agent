@@ -129,3 +129,91 @@ test('network failures and timeouts are retryable and fallback eligible', () => 
   assert.equal(network.retryable, true);
   assert.equal(isFallbackEligibleProviderError(network), true);
 });
+
+test('OpenRouter 429 metadata distinguishes transient rate limits from quota limits', async () => {
+  const rateLimited = await createProviderHttpError(
+    fakeResponse(429, {
+      error: {
+        message: 'Rate limit exceeded',
+        metadata: { error_type: 'rate_limit_exceeded' },
+      },
+    }, {
+      'retry-after': '12',
+      'x-ratelimit-limit': '20',
+      'x-ratelimit-remaining': '0',
+    }),
+    'OpenRouter',
+    'test-key',
+  );
+  assert.equal(rateLimited.category, 'RATE_LIMITED');
+  assert.equal(rateLimited.retryable, true);
+  assert.equal(rateLimited.retryAfterSeconds, 12);
+  assert.equal(rateLimited.providerDetails.classificationSource, 'rate_limit_metadata');
+  assert.equal(rateLimited.providerDetails.retryAfterSource, 'retry-after');
+  assert.deepEqual(rateLimited.providerDetails.rateLimit, { limit: '20', remaining: '0' });
+
+  const keyLimit = await createProviderHttpError(
+    fakeResponse(429, {
+      error: {
+        message: 'Rate limit exceeded',
+        metadata: { limit_source: 'openrouter_key_limit' },
+      },
+    }),
+    'OpenRouter',
+    'test-key',
+  );
+  assert.equal(keyLimit.category, 'QUOTA_EXHAUSTED');
+  assert.equal(keyLimit.retryable, false);
+  assert.equal(keyLimit.providerDetails.classificationSource, 'quota_metadata');
+
+  const inFlight = await createProviderHttpError(
+    fakeResponse(429, {
+      error: {
+        message: 'Request rejected',
+        metadata: {
+          limit_source: 'openrouter_in_flight_budget',
+          reason: 'in_flight_budget_exhausted',
+        },
+      },
+    }),
+    'OpenRouter',
+    'test-key',
+  );
+  assert.equal(inFlight.category, 'RATE_LIMITED');
+  assert.equal(inFlight.retryable, true);
+  assert.equal(inFlight.providerDetails.classificationSource, 'in_flight_budget');
+});
+
+test('429 diagnostics redact secrets in allowlisted upstream metadata', async () => {
+  const secret = 'sk-test-secret-123456';
+  const error = await createProviderHttpError(
+    fakeResponse(429, {
+      error: {
+        code: secret,
+        message: 'Rate limit exceeded',
+        metadata: { provider_code: secret },
+      },
+    }),
+    'OpenRouter',
+    'test-key',
+  );
+
+  assert.equal(error.providerDetails.upstreamCode, '[redacted credential]');
+  assert.equal(error.providerDetails.metadata.provider_code, '[redacted credential]');
+  assert.ok(!JSON.stringify(error.providerDetails).includes(secret));
+  assert.ok(!error.publicMessage.includes(secret));
+});
+
+test('X-RateLimit-Reset supplies retry timing when Retry-After is absent', async () => {
+  const reset = Date.now() + 9_000;
+  const error = await createProviderHttpError(
+    fakeResponse(429, { error: { message: 'Rate limit exceeded' } }, {
+      'x-ratelimit-reset': String(reset),
+    }),
+    'OpenRouter',
+    'test-key',
+  );
+
+  assert.equal(error.providerDetails.retryAfterSource, 'x-ratelimit-reset');
+  assert.equal(error.retryAfterSeconds, 9);
+});

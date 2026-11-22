@@ -3,6 +3,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
@@ -582,5 +583,81 @@ test('health exposes explicit fallback configuration without exposing keys', asy
   } finally {
     config.aiFallbackProvider = savedFallback;
     config.aiApiKey = savedAiKey;
+  }
+});
+
+test('chat logs redacted diagnostics and exposes fallback failure details', async () => {
+  const secret = 'sk-test-diagnostic-secret-123';
+  const provider = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat() {
+      const error = new Error('OpenRouter request failed with status 429.');
+      error.statusCode = 429;
+      error.category = 'RATE_LIMITED';
+      error.errorType = 'RATE_LIMITED';
+      error.retryable = true;
+      error.fallbackEligible = true;
+      error.publicMessage = 'OpenRouter rate limit was reached; retry after 12 seconds.';
+      error.retryAfterMs = 12_000;
+      error.fallbackAttempted = true;
+      error.fallbackFrom = 'gemini';
+      error.fallbackReason = 'CAPACITY_UNAVAILABLE';
+      error.providerDetails = {
+        status: 429,
+        upstreamCode: '',
+        upstreamStatus: '',
+        metadata: { error_type: 'rate_limit_exceeded', provider_code: secret },
+        rateLimit: { limit: '20', remaining: '0' },
+        classificationSource: 'rate_limit_metadata',
+        retryAfterSource: 'retry-after',
+      };
+      throw error;
+    },
+  };
+
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args.join(' '));
+  let response;
+  try {
+    const api = await startServer(createApp({ auth: false, provider, providerName: 'gemini' }).app);
+    response = await api.post('/api/chat', { message: 'hi', provider: 'gemini' });
+  } finally {
+    console.error = originalError;
+  }
+
+  const { status, data } = response;
+  assert.equal(status, 429);
+  assert.equal(data.errorCategory, 'RATE_LIMITED');
+  assert.equal(data.retryAfterSeconds, 12);
+  assert.equal(data.fallbackAttempted, true);
+  assert.equal(data.fallbackFrom, 'gemini');
+  assert.equal(data.fallbackReason, 'CAPACITY_UNAVAILABLE');
+  assert.ok(!JSON.stringify(data).includes(secret));
+
+  const log = logs.join('\n');
+  assert.match(log, /category=RATE_LIMITED/);
+  assert.match(log, /upstreamMetadata=.*rate_limit_exceeded/);
+  assert.match(log, /rateLimit=.*"remaining":"0"/);
+  assert.match(log, /retryAfterSeconds=12/);
+  assert.match(log, /fallbackAttempted=true fallbackFrom=gemini/);
+  assert.match(log, /fallbackReason=CAPACITY_UNAVAILABLE/);
+  assert.ok(!log.includes(secret));
+});
+
+test('web client consumes chat error metadata and fallback failure notices', () => {
+  const source = readFileSync(new URL('../../apps/web/src/App.jsx', import.meta.url), 'utf8');
+  const tokens = [
+    'result.errorCategory',
+    'result.retryAfterSeconds',
+    'result.fallbackAttempted',
+    'result.fallbackFrom',
+    'result.fallbackReason',
+    'providerErrorToast',
+    'ERROR_CATEGORY_LABELS',
+  ];
+  for (const token of tokens) {
+    assert.ok(source.includes(token), `App.jsx should use ${token}`);
   }
 });

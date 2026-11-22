@@ -12,6 +12,18 @@ const CHAT_PROVIDERS = new Set(CHAT_PROVIDER_IDS);
 
 const bad = (error) => ({ ok: false, error });
 
+function compactSafe(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+function safeLogText(value) {
+  return redactSecrets(String(value ?? '').replace(/[\r\n]+/g, ' ')).slice(0, 500);
+}
+
 /**
  * Validates the optional per-request provider override. Omitting it keeps the
  * startup provider (including mock/ollama and background-task behaviour).
@@ -161,12 +173,40 @@ export function createChatRouter({
         ...(result.fallback ? { fallback: result.fallback } : {}),
       });
     } catch (err) {
-      // Log only a redacted one-liner; the client gets a generic message.
+      // Log a redacted one-liner with allowlisted diagnostics only; the client
+      // gets the safe public message plus classification/retry metadata.
       const status = err.statusCode || 502;
-      console.error(
-        `[chat] Request failed: provider=${activeProvider.name ?? activeProviderName} status=${status}:`,
-        redactSecrets(`${err.name}: ${err.message}`),
-      );
+      const details = err.providerDetails && typeof err.providerDetails === 'object'
+        ? err.providerDetails
+        : {};
+      const logParts = [
+        `[chat] Request failed: provider=${activeProvider.name ?? activeProviderName} status=${status}`,
+        `detail="${safeLogText(err.publicMessage ?? err.message)}"`,
+      ];
+      if (err.category || err.errorType) {
+        logParts.push(`category=${err.category || err.errorType}`);
+      }
+      if (details.upstreamCode) logParts.push(`upstreamCode=${details.upstreamCode}`);
+      if (details.upstreamStatus) logParts.push(`upstreamStatus=${details.upstreamStatus}`);
+      if (details.metadata && Object.keys(details.metadata).length) {
+        logParts.push(`upstreamMetadata=${safeLogText(compactSafe(details.metadata))}`);
+      }
+      if (details.rateLimit && Object.keys(details.rateLimit).length) {
+        logParts.push(`rateLimit=${safeLogText(compactSafe(details.rateLimit))}`);
+      }
+      if (details.classificationSource) {
+        logParts.push(`classificationSource=${details.classificationSource}`);
+      }
+      if (details.retryAfterSource) logParts.push(`retryAfterSource=${details.retryAfterSource}`);
+      if (Number.isFinite(err.retryAfterMs) && err.retryAfterMs > 0) {
+        logParts.push(`retryAfterSeconds=${Math.ceil(err.retryAfterMs / 1000)}`);
+      }
+      if (err.fallbackAttempted) {
+        logParts.push(`fallbackAttempted=true fallbackFrom=${err.fallbackFrom ?? 'unknown'}`);
+        if (err.fallbackReason) logParts.push(`fallbackReason=${err.fallbackReason}`);
+      }
+      console.error(logParts.join(' '));
+
       const body = {
         ok: false,
         error: typeof err.publicMessage === 'string'
@@ -179,7 +219,11 @@ export function createChatRouter({
       if (Number.isFinite(err.retryAfterMs) && err.retryAfterMs > 0) {
         body.retryAfterSeconds = Math.ceil(err.retryAfterMs / 1000);
       }
-      if (err.fallbackAttempted) body.fallbackAttempted = true;
+      if (err.fallbackAttempted) {
+        body.fallbackAttempted = true;
+        if (typeof err.fallbackFrom === 'string') body.fallbackFrom = err.fallbackFrom;
+        if (typeof err.fallbackReason === 'string') body.fallbackReason = err.fallbackReason;
+      }
       return res.status(status).json(body);
     }
   });

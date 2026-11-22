@@ -89,6 +89,44 @@ const FALLBACK_REASON_LABELS = {
   NETWORK_ERROR: 'The provider could not be reached.',
   PROVIDER_ERROR: 'The provider was temporarily unavailable.',
 };
+const ERROR_CATEGORY_LABELS = {
+  QUOTA_EXHAUSTED: 'Provider quota is exhausted.',
+  RATE_LIMITED: 'Provider rate limit reached.',
+  CAPACITY_UNAVAILABLE: 'Provider is temporarily at capacity.',
+  PROVIDER_ERROR: 'Provider is temporarily unavailable.',
+  NETWORK_TIMEOUT: 'Provider request timed out.',
+  NETWORK_ERROR: 'Provider could not be reached.',
+  INVALID_API_KEY: 'Provider API key was rejected.',
+  REQUEST_ERROR: 'Provider rejected the request.',
+};
+
+function formatRetryDelay(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const value = Math.ceil(seconds);
+  if (value < 60) return `${value} second(s)`;
+  if (value < 3600) return `${Math.ceil(value / 60)} minute(s)`;
+  return `${Math.ceil(value / 3600)} hour(s)`;
+}
+
+function providerErrorToast(error) {
+  const base = error.message || 'Something went wrong. Please try again.';
+  const extras = [];
+  if (error.category) {
+    extras.push(ERROR_CATEGORY_LABELS[error.category] || `Error category: ${error.category}.`);
+  }
+  if (error.retryAfterSeconds) {
+    const delay = formatRetryDelay(error.retryAfterSeconds);
+    if (delay) extras.push(`Retry after about ${delay}.`);
+  }
+  if (error.fallbackAttempted) {
+    const from = PROVIDER_LABELS[error.fallbackFrom] || error.fallbackFrom || 'The primary provider';
+    const reason = FALLBACK_REASON_LABELS[error.fallbackReason]
+      || (error.fallbackReason ? `Reason: ${error.fallbackReason}.` : '');
+    extras.push(`Fallback also failed: ${from} was unavailable. ${reason}`.trim());
+  }
+  return extras.length ? `${base} ${extras.join(' ')}` : base;
+}
+
 const ACTIVE_PROJECT_KEY = 'myai.active-project.v1';
 
 function activeProjectStorageKey(userId) {
@@ -776,6 +814,12 @@ function App() {
       if (!response.ok || !result.ok) {
         const error = new Error(result.error || `Request failed (${response.status})`);
         error.status = response.status;
+        error.category = result.errorCategory || null;
+        const retryAfter = Number(result.retryAfterSeconds);
+        error.retryAfterSeconds = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null;
+        error.fallbackAttempted = Boolean(result.fallbackAttempted);
+        error.fallbackFrom = result.fallbackFrom || null;
+        error.fallbackReason = result.fallbackReason || null;
         throw error;
       }
       updateSession(sessionId, (session) => ({
@@ -795,11 +839,12 @@ function App() {
     } catch (error) {
       if (error.name === 'AbortError') return;
       setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
-      setToast({ message: error.message || 'Something went wrong. Please try again.' });
+      const toastMessage = providerErrorToast(error);
+      setToast({ message: toastMessage });
       const providerToFlag = providerForRequest || selectedProvider || health.provider;
       if (['openai', 'gemini', 'huggingface', 'ollama'].includes(providerToFlag)
         && [401, 403, 429, 502, 503, 504].includes(error.status)) {
-        setHealth((current) => ({ ...current, warning: error.message }));
+        setHealth((current) => ({ ...current, warning: toastMessage }));
       }
     } finally {
       if (controllerRef.current === controller) {

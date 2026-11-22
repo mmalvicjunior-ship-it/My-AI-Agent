@@ -1,4 +1,8 @@
-import { createProviderHttpError, createProviderNetworkError } from './provider-error.js';
+import {
+  createProviderHttpError,
+  createProviderNetworkError,
+  redactProviderDetail,
+} from './provider-error.js';
 
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
@@ -326,6 +330,44 @@ function providerLabel(baseUrl) {
   }
 }
 
+function compactSafe(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/**
+ * One-line diagnostic for provider HTTP failures. All fields are already
+ * redacted/allowlisted by provider-error.js; this adds a final safety pass.
+ */
+function logProviderHttpError({ providerName, model, error, toolSupportFailure }) {
+  const details = error?.providerDetails && typeof error.providerDetails === 'object'
+    ? error.providerDetails
+    : {};
+  const parts = [
+    `[openai] Provider error: provider=${providerName} model=${model} status=${error?.statusCode ?? details.status ?? 'unknown'}`,
+    `category=${error?.category ?? error?.errorType ?? 'UNKNOWN'}`,
+    `detail="${redactProviderDetail(error?.publicMessage)}"`,
+  ];
+  if (details.upstreamCode) parts.push(`upstreamCode=${details.upstreamCode}`);
+  if (details.upstreamStatus) parts.push(`upstreamStatus=${details.upstreamStatus}`);
+  if (details.metadata && Object.keys(details.metadata).length) {
+    parts.push(`metadata=${compactSafe(details.metadata)}`);
+  }
+  if (details.rateLimit && Object.keys(details.rateLimit).length) {
+    parts.push(`rateLimit=${compactSafe(details.rateLimit)}`);
+  }
+  if (details.classificationSource) parts.push(`classificationSource=${details.classificationSource}`);
+  if (details.retryAfterSource) parts.push(`retryAfterSource=${details.retryAfterSource}`);
+  if (Number.isFinite(error?.retryAfterSeconds)) {
+    parts.push(`retryAfterSeconds=${error.retryAfterSeconds}`);
+  }
+  if (toolSupportFailure) parts.push('toolSupportFailure=true');
+  console.error(parts.join(' '));
+}
+
 function configurationError() {
   const error = new Error('OpenAI is selected, but AI_API_KEY is not configured.');
   error.statusCode = 503;
@@ -421,6 +463,7 @@ export function createOpenAIProvider({
           if (toolSupportFailure) {
             error.publicMessage = `The configured model "${model}" cannot call tools on this provider, so workspace tools are unavailable for this request. OpenRouter model capabilities and free-tier availability vary; set AI_MODEL to a tool-capable model in the project-root .env.`;
           }
+          logProviderHttpError({ providerName, model, error, toolSupportFailure });
           throw error;
         }
 

@@ -57,26 +57,58 @@ function assertCommandAllowed(command, allowedCommands) {
   }
 }
 
+/**
+ * Removes the server-managed `projectId` from model-facing tool schemas.
+ * The chat route owns workspace selection and injects the id after a tool
+ * call, so asking the model to supply it is both unnecessary and unsafe.
+ */
+export function stripServerManagedProjectId(schema) {
+  if (Array.isArray(schema)) return schema.map(stripServerManagedProjectId);
+  if (!schema || typeof schema !== 'object') return schema;
+
+  const cleaned = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      const properties = {};
+      for (const [propertyName, propertySchema] of Object.entries(value)) {
+        if (propertyName === 'projectId') continue;
+        properties[propertyName] = stripServerManagedProjectId(propertySchema);
+      }
+      cleaned.properties = properties;
+      continue;
+    }
+    if (key === 'required' && Array.isArray(value)) {
+      const required = value.filter((name) => name !== 'projectId');
+      if (required.length) cleaned.required = required;
+      continue;
+    }
+    cleaned[key] = stripServerManagedProjectId(value);
+  }
+  return cleaned;
+}
+
 function declarationsFor(allowedCommands) {
-  if (allowedCommands === commandNames) return geminiToolDeclarations;
-  return geminiToolDeclarations.map((group) => ({
-    functionDeclarations: group.functionDeclarations.map((declaration) => {
-      if (declaration.name !== 'run_command') return declaration;
-      return {
-        ...declaration,
-        parameters: {
-          ...declaration.parameters,
-          properties: {
-            ...declaration.parameters.properties,
-            command: {
-              ...declaration.parameters.properties.command,
-              enum: [...allowedCommands],
+  const selected = allowedCommands === commandNames
+    ? geminiToolDeclarations
+    : geminiToolDeclarations.map((group) => ({
+      functionDeclarations: group.functionDeclarations.map((declaration) => {
+        if (declaration.name !== 'run_command') return declaration;
+        return {
+          ...declaration,
+          parameters: {
+            ...declaration.parameters,
+            properties: {
+              ...declaration.parameters.properties,
+              command: {
+                ...declaration.parameters.properties.command,
+                enum: [...allowedCommands],
+              },
             },
           },
-        },
-      };
-    }),
-  }));
+        };
+      }),
+    }));
+  return stripServerManagedProjectId(selected);
 }
 
 export const geminiToolDeclarations = [{

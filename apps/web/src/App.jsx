@@ -326,6 +326,13 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
             </span>
           </div>
         )}
+        {message.workspace && !message.workspace.available && (
+          <div className="tool-activity" aria-label="Workspace availability">
+            <span className="tool-activity-item failed">
+              No approved workspace was selected, so file inspection tools were unavailable. Select a project to let the agent inspect its files.
+            </span>
+          </div>
+        )}
         {message.toolActivity?.length > 0 && (
           <div className="tool-activity" aria-label="Agent actions">
             {message.toolActivity.map((activity, activityIndex) => {
@@ -831,6 +838,7 @@ function App() {
           model: result.model,
           toolActivity: result.toolActivity || [],
           fallback: result.fallback || null,
+          workspace: result.workspace || null,
           feedback: null,
         }],
         updatedAt: Date.now(),
@@ -1704,7 +1712,7 @@ function App() {
                 )}
 
                 <div className="starter-grid">
-                  {starters.map((starter) => (
+                  {(activeProject ? starters : []).map((starter) => (
                     <button key={starter.title} className="starter-card" onClick={() => sendMessage(starter.prompt)}>
                       <span className="starter-icon">{starter.icon}</span>
                       <span className="starter-title">{starter.title}</span>

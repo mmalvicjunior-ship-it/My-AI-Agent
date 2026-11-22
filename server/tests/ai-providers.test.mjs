@@ -314,7 +314,7 @@ test('OpenAI adapter forwards history, model, and API key', async () => {
     messages: [
       {
         role: 'system',
-        content: 'You are MyAI, a coding assistant. Answer clearly and accurately. You have access only to this conversation: no project workspace is selected, so you have no workspace tools. You cannot read or write files, run commands, browse the web, or reach any external service. Say so plainly if a request needs workspace access or the web. Never claim to have applied a change, run a command, accessed external tools, or browsed the web.',
+        content: 'You are MyAI, a coding assistant. Answer clearly and accurately. No approved project workspace is selected for this request, so you have no workspace tools and access only to this conversation. You cannot inspect the whole PC, read or write files, run commands, browse the web, or reach external services. You can inspect files only inside an approved workspace after the user selects one. Say so plainly when a request needs workspace access. Never claim whole-PC access or that you applied a change, ran a command, used an external tool, or browsed the web.',
       },
       ...messages,
     ],
@@ -339,7 +339,8 @@ test('OpenAI adapter sends no tools when no workspace is selected', async () => 
   assert.equal(body.tools, undefined);
   assert.equal(body.tool_choice, undefined);
   assert.match(body.messages[0].content, /no workspace tools/i);
-  assert.match(body.messages[0].content, /cannot read or write files/i);
+  assert.match(body.messages[0].content, /cannot inspect the whole PC/i);
+  assert.match(body.messages[0].content, /read or write files/i);
   assert.match(body.messages[0].content, /browse the web/i);
   assert.deepEqual(result.toolActivity, []);
 });
@@ -1233,7 +1234,7 @@ test('Gemini adapter maps assistant turns and forwards system instructions', asy
   assert.equal(request.options.headers['x-goog-api-key'], 'test-gemini-key');
   assert.deepEqual(body.systemInstruction, {
     parts: [
-      { text: "You are a helpful coding assistant. Follow the user's instructions directly. When a project workspace is selected, inspect relevant files with tools before proposing changes, use create_file for new files and propose_file_change for edits to existing files. All file changes and commands require explicit user approval; use only the provided safe command tools. Never claim a tool succeeded unless its result confirms success." },
+      { text: 'You are MyAI, a coding assistant. Answer clearly and accurately. When an approved project workspace is selected, use the listed workspace tools to list, read, and search its files and to stage allowlisted checks before proposing changes. You can inspect only that approved workspace. You cannot inspect the whole PC, access files outside the selected workspace, browse the web, or reach external services; say so plainly when a request is outside that scope. Use create_file for new files and propose_file_change for edits to existing files. Hard rule: a tool result with status "awaiting_user_approval" means nothing has been written or run yet. Describe it as staged and awaiting the user\'s approval, and never say that you created, wrote, updated, applied, ran, or executed it. File changes and commands require explicit user approval. Never claim a tool succeeded unless its result confirms success. After a tool returns enough information, stop calling tools and answer. Never repeat the same tool call with the same arguments. If the user asks to list files, call list_files once for the requested directory (the project root if unspecified), report the returned paths, and do not read file contents.' },
       { text: 'Be concise.' },
     ],
   });

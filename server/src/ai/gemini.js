@@ -3,10 +3,14 @@ import {
   createProviderNetworkError,
   isRetryableProviderError,
 } from './provider-error.js';
+import { withApprovalNotice } from './tool-response.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const SYSTEM_INSTRUCTION = "You are a helpful coding assistant. Follow the user's instructions directly. When a project workspace is selected, inspect relevant files with tools before proposing changes, use create_file for new files and propose_file_change for edits to existing files. All file changes and commands require explicit user approval; use only the provided safe command tools. Never claim a tool succeeded unless its result confirms success.";
+const MAX_TOOL_ROUNDS = 6;
+const SYSTEM_INSTRUCTION = "You are MyAI, a coding assistant. Answer clearly and accurately. When an approved project workspace is selected, use the listed workspace tools to list, read, and search its files and to stage allowlisted checks before proposing changes. You can inspect only that approved workspace. You cannot inspect the whole PC, access files outside the selected workspace, browse the web, or reach external services; say so plainly when a request is outside that scope. Use create_file for new files and propose_file_change for edits to existing files. Hard rule: a tool result with status \"awaiting_user_approval\" means nothing has been written or run yet. Describe it as staged and awaiting the user's approval, and never say that you created, wrote, updated, applied, ran, or executed it. File changes and commands require explicit user approval. Never claim a tool succeeded unless its result confirms success. After a tool returns enough information, stop calling tools and answer. Never repeat the same tool call with the same arguments. If the user asks to list files, call list_files once for the requested directory (the project root if unspecified), report the returned paths, and do not read file contents.";
+const FINAL_ANSWER_INSTRUCTION = 'Do not call any more tools. Use the tool results already in the conversation to answer. If you cannot complete the request from those results, say so clearly.';
+const ROUND_LIMIT_MESSAGE = `I reached the maximum of ${MAX_TOOL_ROUNDS} workspace tool-call rounds before producing a final answer. Please narrow the request and try again.`;
 
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -239,19 +243,22 @@ export function createGeminiProvider({
           parts: [{ text: message.content }],
         }));
       const activity = [];
-      const maxToolRounds = 6;
 
       try {
-        for (let round = 0; round <= maxToolRounds; round += 1) {
+        for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+          // On the final round the model is asked once for an answer without
+          // tools, matching the OpenRouter adapter's round-limit behaviour.
+          const forceFinalAnswer = round === MAX_TOOL_ROUNDS;
           const body = {
             contents,
             systemInstruction: {
               parts: [
                 { text: SYSTEM_INSTRUCTION },
+                ...(forceFinalAnswer ? [{ text: FINAL_ANSWER_INSTRUCTION }] : []),
                 ...systemInstructions.map((text) => ({ text })),
               ],
             },
-            ...(tools?.declarations?.length
+            ...(!forceFinalAnswer && tools?.declarations?.length
               ? {
                 tools: tools.declarations,
                 toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
@@ -263,19 +270,34 @@ export function createGeminiProvider({
           const candidate = result?.candidates?.[0];
           const parts = candidate?.content?.parts || [];
           const functionCalls = parts.filter((part) => part.functionCall?.name);
-          if (!functionCalls.length || !tools) {
+          if (!functionCalls.length || !tools || forceFinalAnswer) {
             const text = parts
               .map((part) => part.text)
               .filter((part) => typeof part === 'string')
               .join('');
+            if (forceFinalAnswer && (functionCalls.length || !text)) {
+              return {
+                text: ROUND_LIMIT_MESSAGE,
+                provider: this.name,
+                model,
+                toolActivity: activity,
+              };
+            }
             if (!text) throw new Error('Gemini returned a response without message text.');
-            return { text, provider: this.name, model, toolActivity: activity };
+            return {
+              text: withApprovalNotice(text, activity),
+              provider: this.name,
+              model,
+              toolActivity: activity,
+            };
           }
 
           contents.push({ role: 'model', parts });
           const functionResponses = [];
           for (const part of functionCalls) {
             const { name, args = {} } = part.functionCall;
+            const callId = part.functionCall.id;
+            const responseId = typeof callId === 'string' && callId ? { id: callId } : {};
             activity.push({ tool: name, status: 'running' });
             try {
               const output = await tools.execute(name, { ...args, projectId });
@@ -288,19 +310,21 @@ export function createGeminiProvider({
                 ...(name === 'run_command' ? { commandApproval: output, projectId } : {}),
               });
               const { originalContent, ...toolOutput } = output;
-              functionResponses.push({ functionResponse: { name, response: { result: toolOutput } } });
+              functionResponses.push({
+                functionResponse: { name, ...responseId, response: { result: toolOutput } },
+              });
             } catch (error) {
               const safeMessage = typeof error.publicMessage === 'string'
                 ? error.publicMessage
                 : error.message || 'Tool execution failed.';
               activity[activity.length - 1].status = 'failed';
-              functionResponses.push({ functionResponse: { name, response: { error: safeMessage } } });
+              functionResponses.push({
+                functionResponse: { name, ...responseId, response: { error: safeMessage } },
+              });
             }
           }
           contents.push({ role: 'user', parts: functionResponses });
         }
-
-        throw new Error(`Gemini exceeded the maximum of ${maxToolRounds} tool-call rounds.`);
       } catch (error) {
         if (activity.length && !error.toolActivity) {
           error.toolActivity = [...activity];

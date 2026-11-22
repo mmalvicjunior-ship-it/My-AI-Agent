@@ -162,6 +162,14 @@ export function createChatRouter({
       if (!result || typeof result.text !== 'string') {
         throw new Error('Provider returned a malformed result (missing text).');
       }
+      const workspace = {
+        available: Boolean(selectedProject),
+        projectId: selectedProject ? projectId : null,
+        requested: projectId !== null,
+        reason: selectedProject
+          ? null
+          : (projectId === null ? 'no_workspace_selected' : 'workspace_unavailable'),
+      };
       console.info(`[chat] Request succeeded: provider=${result.provider ?? activeProvider.name ?? activeProviderName} status=200`);
       return res.json({
         ok: true,
@@ -170,6 +178,7 @@ export function createChatRouter({
         model: result.model ?? activeProvider.model ?? null,
         reply: result.text,
         toolActivity: result.toolActivity || [],
+        workspace,
         ...(result.fallback ? { fallback: result.fallback } : {}),
       });
     } catch (err) {

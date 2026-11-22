@@ -1,19 +1,5 @@
 import React, { useState, useEffect } from 'react';
 
-// Friendly, customer-safe descriptions for the machine-readable error codes
-// the Google callback uses in its redirect fragment (#auth_error=<code>).
-const GOOGLE_ERRORS = {
-  google_not_configured: 'Google sign-in is temporarily unavailable. Please try again later.',
-  google_registration_disabled: 'New accounts are not being accepted right now. Please contact your administrator.',
-  google_account_exists: 'An account with this email already exists. Sign in with your password instead.',
-  google_identity_conflict: 'That Google account is already associated with a different account. Please contact support.',
-  google_cancelled: 'Google sign-in was cancelled.',
-  google_state: 'That sign-in link has expired. Please try again.',
-  google_unverified_email: 'Please use a Google account with a verified email address.',
-  google_unavailable: 'Google sign-in is unavailable right now. Please try again later.',
-  google_identity_invalid: 'Google sign-in could not be completed. Please try again.',
-};
-
 /**
  * Sign-in / registration screen shown before the workspace loads.
  * The backend issues a bearer token; App.jsx stores it and attaches it to
@@ -23,71 +9,24 @@ const GOOGLE_ERRORS = {
  * OAuth flow and sends the user straight to Google. Administrator provisioning
  * is a separate owner-only server operation and is never surfaced here.
  *
- * The Google sign-in flow starts with POST /api/auth/google/start and returns
- * the user here with the session token in the URL fragment (#auth_token=...),
- * because fragments never travel to any server or log.
+ * The Google callback fragment is verified by App.jsx before it decides whether
+ * this screen is needed, so a stale stored session cannot swallow a new token.
+ * Friendly callback errors are passed in via `initialError`.
  */
-export default function AuthScreen({ apiBase = '', onAuthenticated }) {
+export default function AuthScreen({ apiBase = '', onAuthenticated, initialError = null }) {
   const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState(initialError);
   const [busy, setBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
 
   const isRegister = mode === 'register';
 
   useEffect(() => {
-    let cancelled = false;
-    let handledAuthToken = false;
-
-    const processFragment = () => {
-      const hash = window.location.hash;
-      if (!hash || hash.length < 2) return;
-      const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
-      const authToken = params.get('auth_token');
-      const authError = params.get('auth_error');
-      const authExpires = params.get('auth_expires') || undefined;
-      if (!authToken && !authError) return;
-
-      // The callback fragment is consumed immediately and never kept in the
-      // address bar, browser history, or any analytics/logging surface.
-      if (window.history?.replaceState) {
-        window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
-      }
-      if (authError) {
-        setError(GOOGLE_ERRORS[authError] || 'Google sign-in could not be completed. Please try again.');
-        return;
-      }
-      if (!authToken || handledAuthToken) return;
-      handledAuthToken = true;
-
-      // Verify the fragment-carried session token against the trusted backend
-      // before accepting it, then hand it to the app exactly like a password
-      // login. No frontend copy of the user record is trusted.
-      (async () => {
-        try {
-          const response = await fetch(`${apiBase}/api/auth/me`, {
-            headers: { Authorization: `Bearer ${authToken}` },
-          });
-          const data = await response.json().catch(() => null);
-          if (!response.ok || !data?.ok || !data.user) throw new Error('Could not verify the Google session.');
-          if (!cancelled) onAuthenticated(authToken, data.user, authExpires);
-        } catch (err) {
-          if (!cancelled) setError(err.message || 'Google sign-in could not be completed.');
-        }
-      })();
-    };
-
-    processFragment();
-    window.addEventListener('hashchange', processFragment);
-    return () => {
-      cancelled = true;
-      window.removeEventListener('hashchange', processFragment);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (initialError) setError(initialError);
+  }, [initialError]);
 
   const switchMode = (next) => {
     if (busy) return;

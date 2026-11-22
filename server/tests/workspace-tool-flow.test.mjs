@@ -306,6 +306,6 @@ test('web client keeps the workspace signal and hides workspace starters without
     'utf8',
   );
   assert.match(source, /workspace: result\.workspace \|\| null/);
-  assert.match(source, /message\.workspace && !message\.workspace\.available/);
+  assert.match(source, /workspaceStatusMessage\(message\.workspace\)/);
   assert.match(source, /\(activeProject \? starters : \[\]\)/);
 });

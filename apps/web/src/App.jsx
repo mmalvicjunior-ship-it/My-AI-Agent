@@ -6,12 +6,23 @@ import TaskCenter from './TaskCenter';
 import AuthScreen from './AuthScreen';
 import ProjectDialog from './ProjectDialog';
 import WorkspaceFiles from './WorkspaceFiles';
-import { isSessionExpiredResponse } from './authResponse';
+import {
+  chooseAuthTokenForInitialization,
+  createAuthCallbackRunner,
+  googleErrorMessage,
+  parseAuthFragment,
+  shouldClearWorkspaceForAuthChange,
+  shouldSignOutFor401,
+} from './authFlow.js';
 import {
   TASK_LIST_LIMIT,
+  activeProjectIdForPersistence,
   buildPromptWithAttachment,
+  chatRequestContext,
   quickActionsFor,
   responseScopeKey,
+  selectRestoredProjectId,
+  workspaceStatusMessage,
 } from './workspaceUiHelpers.js';
 
 const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
@@ -326,10 +337,10 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
             </span>
           </div>
         )}
-        {message.workspace && !message.workspace.available && (
+        {workspaceStatusMessage(message.workspace) && (
           <div className="tool-activity" aria-label="Workspace availability">
             <span className="tool-activity-item failed">
-              No approved workspace was selected, so file inspection tools were unavailable. Select a project to let the agent inspect its files.
+              {workspaceStatusMessage(message.workspace)}
             </span>
           </div>
         )}
@@ -461,11 +472,20 @@ function App() {
   const [taskDetailError, setTaskDetailError] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [diffPreview, setDiffPreview] = useState(false);
+  const initialAuthFragment = parseAuthFragment(window.location.hash);
   const [auth, setAuth] = useState(() => readStoredAuth());
-  const [authChecking, setAuthChecking] = useState(() => Boolean(readStoredAuth()));
+  const [authChecking, setAuthChecking] = useState(
+    () => Boolean(readStoredAuth()) || initialAuthFragment.present,
+  );
+  const [authError, setAuthError] = useState(
+    () => (initialAuthFragment.error ? googleErrorMessage(initialAuthFragment.error) : null),
+  );
   const authRef = useRef(auth);
   const authUserId = auth?.user?.id ?? null;
   const activeProject = projects.find((project) => String(project.id) === String(projectId)) || null;
+  const projectsLoadedRef = useRef(false);
+  const projectsScopeRef = useRef(null);
+  const previousAuthUserIdRef = useRef(authUserId);
   const waitingTaskCount = tasks.filter((task) => task.status === 'waiting_approval').length;
   // Keep the latest task query inputs available to the stable loadTasks
   // callback so automatic loads do not re-run when only the filter changes.
@@ -494,6 +514,40 @@ function App() {
     setAuth(next);
   }, []);
 
+  // One cleanup path for sign-out, confirmed session expiry, and account
+  // changes. Everything derived from the old account or project is discarded.
+  const clearWorkspaceState = useCallback((userId = null) => {
+    persistActiveProjectId(userId, '');
+    projectsLoadedRef.current = false;
+    projectsScopeRef.current = null;
+    setProjects([]);
+    setProjectId('');
+    setWorkspaceFiles([]);
+    setWorkspaceLoading(false);
+    setSelectedFile(null);
+    setFileContent('');
+    setFileSearch('');
+    setCodeSearchResults([]);
+    setProjectDialogOpen(false);
+    setProjectError(null);
+    setTasks([]);
+    setProjectProposals([]);
+    setTaskStatusFilter(null);
+    setTaskDetail(null);
+    setTaskDetailError(null);
+    setFocusTaskId(null);
+    setRetryRequest(null);
+    setToast(null);
+    setAttachment(null);
+    setDiffPreview(false);
+  }, []);
+
+  const clearSession = useCallback((userId = null, { keepError = false } = {}) => {
+    clearWorkspaceState(userId);
+    if (!keepError) setAuthError(null);
+    applyAuth(null);
+  }, [applyAuth, clearWorkspaceState]);
+
   const signOut = useCallback(async () => {
     const current = authRef.current;
     if (current?.token) {
@@ -506,76 +560,107 @@ function App() {
         /* Best effort: local sign-out still happens. */
       }
     }
-    applyAuth(null);
-    persistActiveProjectId(current?.user?.id ?? null, '');
-    setProjects([]);
-    setProjectId('');
-    setWorkspaceFiles([]);
-    setSelectedFile(null);
-    setFileContent('');
-    setFileSearch('');
-    setCodeSearchResults([]);
-    setProjectDialogOpen(false);
-    setProjectError(null);
-    setTasks([]);
-    setProjectProposals([]);
-    setTaskStatusFilter(null);
-    setTaskDetail(null);
-    setFocusTaskId(null);
-  }, [applyAuth]);
+    clearSession(current?.user?.id ?? null);
+  }, [clearSession]);
 
   // Every API call goes through here so the bearer token is attached in one
-  // place. Only a genuine session 401 returns to the sign-in screen: /api/chat
-  // also relays the AI provider's 401 when its own key is rejected, and that
-  // must surface as an error in the conversation instead of signing the user
-  // out. Non-JSON 401 bodies still count as session failures off /api/chat.
+  // place. A 401 only ends the session when it belongs to the token that made
+  // the request, so a slow old response cannot sign out a newer Google token.
   const apiFetch = useCallback(async (input, init = {}) => {
     const headers = new Headers(init.headers || {});
     const current = authRef.current;
-    if (current?.token) headers.set('Authorization', `Bearer ${current.token}`);
+    const requestToken = current?.token ?? null;
+    if (requestToken) headers.set('Authorization', `Bearer ${requestToken}`);
     const response = await globalThis.fetch(input, { ...init, headers });
-    if (response.status === 401 && current) {
+    if (response.status === 401 && requestToken) {
       let code = null;
       try {
         code = (await response.clone().json())?.code ?? null;
       } catch {
         /* Body was not JSON; fall back to the request path. */
       }
-      if (isSessionExpiredResponse({ status: response.status, code, url: String(input) })) {
-        applyAuth(null);
+      if (shouldSignOutFor401({
+        status: response.status,
+        code,
+        url: String(input),
+        requestToken,
+        currentToken: authRef.current?.token ?? null,
+      })) {
+        clearSession(current?.user?.id ?? null);
       }
     }
     return response;
-  }, [applyAuth]);
+  }, [clearSession]);
 
   useEffect(() => {
     authRef.current = auth;
   }, [auth]);
 
-  // Verify a stored token once on load instead of trusting localStorage blindly.
-  // Only an explicit 401 ends the session. A network failure or a 5xx while the
-  // server restarts keeps the stored token so a refresh does not log the user
-  // out; the next authenticated request will confirm the session.
+  // The callback runner is created once per mounted app instance. Refs keep its
+  // handlers current without recreating it during React StrictMode remounts.
+  const applyAuthRef = useRef(applyAuth);
+  applyAuthRef.current = applyAuth;
+  const clearSessionRef = useRef(clearSession);
+  clearSessionRef.current = clearSession;
+  const authCallbackRunnerRef = useRef(null);
+  if (!authCallbackRunnerRef.current) {
+    authCallbackRunnerRef.current = createAuthCallbackRunner({
+      apiBase: API_BASE,
+      fetchImpl: (...args) => globalThis.fetch(...args),
+      clearHash: () => {
+        if (window.history?.replaceState) {
+          window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
+        }
+      },
+      onAuthenticated: (token, user, expiresAt) => {
+        setAuthError(null);
+        setAuthChecking(false);
+        applyAuthRef.current({ token, user, expiresAt });
+      },
+      onError: (message) => {
+        setAuthError(message);
+        setAuthChecking(false);
+        clearSessionRef.current(readStoredAuth()?.user?.id ?? null, { keepError: true });
+      },
+    });
+  }
+
+  // Google callback verification happens here, before the Login/workspace
+  // decision. A callback token always beats a stale token in localStorage.
+  // Without a callback, the stored token is verified exactly as before.
   useEffect(() => {
-    const current = readStoredAuth();
-    if (!current?.token) {
+    const fragment = parseAuthFragment(window.location.hash);
+    if (fragment.present) {
+      setAuthChecking(true);
+      authCallbackRunnerRef.current.run(window.location.hash);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const stored = readStoredAuth();
+    const token = chooseAuthTokenForInitialization({
+      callbackToken: null,
+      storedToken: stored?.token ?? null,
+    });
+    if (!token) {
       setAuthChecking(false);
       return undefined;
     }
-    let cancelled = false;
+    setAuthChecking(true);
     (async () => {
       try {
         const response = await globalThis.fetch(`${API_BASE}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${current.token}` },
+          headers: { Authorization: `Bearer ${token}` },
         });
         const data = await response.json().catch(() => null);
         if (cancelled) return;
         if (response.status === 401) {
-          applyAuth(null);
+          clearSession(stored?.user?.id ?? null);
         } else if (response.ok && data?.ok && data.user) {
-          applyAuth({ ...current, user: data.user });
+          setAuthError(null);
+          applyAuth({ ...stored, token, user: data.user });
         }
-        // Otherwise keep the stored session and retry implicitly later.
+        // A 5xx or network failure keeps the stored session for implicit retry.
       } catch {
         /* Server unreachable: keep the stored session. */
       } finally {
@@ -585,7 +670,16 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [applyAuth]);
+  }, [applyAuth, clearSession]);
+
+  // A different account must never inherit the previous account's workspace.
+  useEffect(() => {
+    const previous = previousAuthUserIdRef.current;
+    previousAuthUserIdRef.current = authUserId;
+    if (shouldClearWorkspaceForAuthChange(previous, authUserId)) {
+      clearWorkspaceState(previous);
+    }
+  }, [authUserId, clearWorkspaceState]);
 
   const activeSession = sessions.find((session) => session.id === activeId) || sessions[0];
   const messages = activeSession?.messages || [];
@@ -647,27 +741,29 @@ function App() {
     }
   }, [sessions]);
 
-  // Restore the active project for this account and fall back to the first
-  // available project. A stale id (deleted project) is ignored, and the
-  // selection is remembered per account so a refresh keeps the same workspace.
+  // Restore only from the current account's loaded project list. A stale ID
+  // from another account or a deleted project is replaced by a valid one.
   useEffect(() => {
-    if (!auth) return;
-    if (projects.length === 0) {
-      if (projectId) setProjectId('');
-      return;
-    }
-    if (projects.some((project) => String(project.id) === String(projectId))) return;
-    const stored = readActiveProjectId(authUserId);
-    const next = projects.some((project) => String(project.id) === String(stored))
-      ? stored
-      : String(projects[0].id);
-    setProjectId(next);
+    if (!auth || !projectsLoadedRef.current) return;
+    if (projectsScopeRef.current !== responseScopeKey(authUserId, null)) return;
+    const next = selectRestoredProjectId({
+      projects,
+      currentProjectId: projectId,
+      storedProjectId: readActiveProjectId(authUserId),
+      projectsLoaded: true,
+    });
+    if (next !== projectId) setProjectId(next);
   }, [auth, authUserId, projects, projectId]);
 
+  // Do not write a pre-load or cross-account selection into storage.
   useEffect(() => {
-    if (!auth || !projectId) return;
-    persistActiveProjectId(authUserId, projectId);
-  }, [auth, authUserId, projectId]);
+    if (!auth || projectsScopeRef.current !== responseScopeKey(authUserId, null)) return;
+    const validated = activeProjectIdForPersistence({
+      projectsLoaded: projectsLoadedRef.current,
+      activeProject,
+    });
+    if (validated !== null) persistActiveProjectId(authUserId, validated);
+  }, [auth, authUserId, activeProject]);
 
   // Never leave one project's file or search results on screen after switching.
   useEffect(() => {
@@ -734,18 +830,23 @@ function App() {
     const loadProjects = async () => {
       if (!authRef.current) {
         if (!cancelled) {
+          projectsLoadedRef.current = true;
+          projectsScopeRef.current = null;
           setProjects([]);
           setProjectId('');
         }
         return;
       }
       const scope = accountScope();
+      projectsLoadedRef.current = false;
+      projectsScopeRef.current = scope;
       try {
         const response = await apiFetch(`${API_BASE}/api/projects`);
         if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
         const data = await response.json();
         if (!cancelled && accountScope() === scope) {
           setProjects(Array.isArray(data.projects) ? data.projects : []);
+          projectsLoadedRef.current = true;
         }
       } catch (error) {
         if (!cancelled && accountScope() === scope) console.warn('Could not load projects.', error);
@@ -806,6 +907,16 @@ function App() {
     const providerForRequest = CHAT_PROVIDER_IDS.has(selectedProvider)
       ? selectedProvider
       : (CHAT_PROVIDER_IDS.has(health.provider) ? health.provider : null);
+    // Revalidate workspace scope from current account state on every send,
+    // including retries after authentication is restored.
+    const requestContext = chatRequestContext({
+      authToken: authRef.current?.token ?? null,
+      projects,
+      projectId,
+      activeProject,
+      projectsLoaded: projectsLoadedRef.current,
+      retryRequest,
+    });
     try {
       const response = await apiFetch(`${API_BASE}/api/chat`, {
         method: 'POST',
@@ -814,7 +925,7 @@ function App() {
         body: JSON.stringify({
           messages: [...history, { role: 'user', content: apiPrompt }],
           ...(providerForRequest ? { provider: providerForRequest } : {}),
-          ...(projectId ? { projectId: Number(projectId) } : {}),
+          ...(requestContext.projectId !== null ? { projectId: requestContext.projectId } : {}),
         }),
       });
       const result = await response.json();
@@ -860,7 +971,8 @@ function App() {
         setGenerating(false);
       }
     }
-  }, [generating, health.online, health.provider, projectId, selectedProvider, updateSession]);
+  }, [activeProject, generating, health.online, health.provider, projects, projectId,
+    retryRequest, selectedProvider, updateSession]);
 
   const sendMessage = useCallback(async (value = input) => {
     const rawPrompt = typeof value === 'string' ? value : '';
@@ -1525,6 +1637,7 @@ function App() {
     return (
       <AuthScreen
         apiBase={API_BASE}
+        initialError={authError}
         onAuthenticated={(token, user, expiresAt) => applyAuth({ token, user, expiresAt })}
       />
     );

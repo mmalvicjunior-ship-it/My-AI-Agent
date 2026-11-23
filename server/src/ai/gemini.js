@@ -3,13 +3,19 @@ import {
   createProviderNetworkError,
   isRetryableProviderError,
 } from './provider-error.js';
-import { withApprovalNotice } from './tool-response.js';
+import {
+  FINAL_ANSWER_INSTRUCTION,
+  NO_WORKSPACE_SYSTEM_INSTRUCTION,
+  WORKSPACE_SYSTEM_INSTRUCTION,
+  toolActivityDetail,
+  toolResultMessage,
+  trimToolResponse,
+  withApprovalNotice,
+} from './tool-response.js';
 
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const MAX_TOOL_ROUNDS = 6;
-const SYSTEM_INSTRUCTION = "You are MyAI, a coding assistant. Answer clearly and accurately. When an approved project workspace is selected, use the listed workspace tools to list, read, and search its files and to stage allowlisted checks before proposing changes. You can inspect only that approved workspace. You cannot inspect the whole PC, access files outside the selected workspace, browse the web, or reach external services; say so plainly when a request is outside that scope. Use create_file for new files and propose_file_change for edits to existing files. Hard rule: a tool result with status \"awaiting_user_approval\" means nothing has been written or run yet. Describe it as staged and awaiting the user's approval, and never say that you created, wrote, updated, applied, ran, or executed it. File changes and commands require explicit user approval. Never claim a tool succeeded unless its result confirms success. After a tool returns enough information, stop calling tools and answer. Never repeat the same tool call with the same arguments. If the user asks to list files, call list_files once for the requested directory (the project root if unspecified), report the returned paths, and do not read file contents.";
-const FINAL_ANSWER_INSTRUCTION = 'Do not call any more tools. Use the tool results already in the conversation to answer. If you cannot complete the request from those results, say so clearly.';
 const ROUND_LIMIT_MESSAGE = `I reached the maximum of ${MAX_TOOL_ROUNDS} workspace tool-call rounds before producing a final answer. Please narrow the request and try again.`;
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -233,6 +239,8 @@ export function createGeminiProvider({
         cooldownStore.delete(cooldownKey);
       }
 
+      const hasTools = Boolean(tools?.declarations?.length && typeof tools.execute === 'function');
+      const baseInstruction = hasTools ? WORKSPACE_SYSTEM_INSTRUCTION : NO_WORKSPACE_SYSTEM_INSTRUCTION;
       const systemInstructions = messages
         .filter((message) => message.role === 'system')
         .map((message) => message.content);
@@ -253,12 +261,12 @@ export function createGeminiProvider({
             contents,
             systemInstruction: {
               parts: [
-                { text: SYSTEM_INSTRUCTION },
+                { text: baseInstruction },
                 ...(forceFinalAnswer ? [{ text: FINAL_ANSWER_INSTRUCTION }] : []),
                 ...systemInstructions.map((text) => ({ text })),
               ],
             },
-            ...(!forceFinalAnswer && tools?.declarations?.length
+            ...(!forceFinalAnswer && hasTools
               ? {
                 tools: tools.declarations,
                 toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
@@ -270,7 +278,7 @@ export function createGeminiProvider({
           const candidate = result?.candidates?.[0];
           const parts = candidate?.content?.parts || [];
           const functionCalls = parts.filter((part) => part.functionCall?.name);
-          if (!functionCalls.length || !tools || forceFinalAnswer) {
+          if (!functionCalls.length || !hasTools || forceFinalAnswer) {
             const text = parts
               .map((part) => part.text)
               .filter((part) => typeof part === 'string')
@@ -302,16 +310,20 @@ export function createGeminiProvider({
             try {
               const output = await tools.execute(name, { ...args, projectId });
               const requiresApproval = ['create_file', 'propose_file_change', 'run_command'].includes(name);
+              // Derive activity counts from the result actually sent to the
+              // model, so transport trimming cannot inflate the UI numbers.
+              const toolResponse = trimToolResponse(toolResultMessage(output));
+              const detail = toolActivityDetail(name, toolResponse);
               Object.assign(activity[activity.length - 1], {
                 status: requiresApproval ? 'awaiting approval' : 'completed',
+                ...(detail ? { detail } : {}),
                 ...(['create_file', 'propose_file_change'].includes(name)
                   ? { proposal: { ...output, content: args.content }, projectId }
                   : {}),
                 ...(name === 'run_command' ? { commandApproval: output, projectId } : {}),
               });
-              const { originalContent, ...toolOutput } = output;
               functionResponses.push({
-                functionResponse: { name, ...responseId, response: { result: toolOutput } },
+                functionResponse: { name, ...responseId, response: toolResponse },
               });
             } catch (error) {
               const safeMessage = typeof error.publicMessage === 'string'

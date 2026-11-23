@@ -355,6 +355,9 @@ function Message({ message, index, sessionId, onCopy, onRegenerate, onFeedback, 
                 <span className={`tool-activity-item ${status.className}`}>
                   {status.icon} {activity.tool} · {status.label}{activity.reused ? ' · reused previous result' : ''}
                 </span>
+                {activity.detail && (
+                  <span className="tool-activity-item" aria-label="Tool details">{activity.detail}</span>
+                )}
                 {activity.proposal && (
                   <div className="diff-proposal">
                     <div className="file-panel-heading">

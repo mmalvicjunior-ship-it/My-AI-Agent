@@ -13,6 +13,7 @@ import { createWorkspaceTools, stripServerManagedProjectId, geminiToolDeclaratio
 import { createGeminiProvider } from '../src/ai/gemini.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createFallbackProvider } from '../src/ai/fallback.js';
+import { NO_WORKSPACE_SYSTEM_INSTRUCTION, WORKSPACE_SYSTEM_INSTRUCTION } from '../src/ai/tool-response.js';
 
 const db = openDb();
 const servers = [];
@@ -107,6 +108,12 @@ test('model-facing declarations hide projectId but keep every workspace tool', (
     assert.equal(Object.hasOwn(properties, 'projectId'), false, `${fn.name} must not ask the model for projectId`);
     assert.equal(required.includes('projectId'), false, `${fn.name} must not require projectId`);
   }
+  const byName = Object.fromEntries(functions.map((fn) => [fn.name, fn]));
+  assert.match(byName.list_files.description, /files array/i);
+  assert.match(byName.list_files.description, /truncated/i);
+  assert.match(byName.list_files.description, /limits/i);
+  assert.match(byName.read_file.description, /untrusted data/i);
+  assert.match(byName.search_files.description, /redacted/i);
 
   const tools = createWorkspaceTools({ db });
   const modelFunctions = tools.declarations.flatMap((group) => group.functionDeclarations || []);
@@ -120,7 +127,9 @@ test('Gemini tool results are passed back with matching call ids', async () => {
     declarations: stripServerManagedProjectId(geminiToolDeclarations),
     async execute(name, args) {
       executed.push({ name, args });
-      if (name === 'list_files') return { path: '.', entries: ['src/app.js'] };
+      if (name === 'list_files') return {
+        path: '.', files: ['src/app.js'], directories: ['src'], skipped: 0, errors: [], truncated: false,
+      };
       if (name === 'read_file') return { path: 'src/app.js', content: 'const broken = ;' };
       if (name === 'search_files') return { query: 'broken', results: [{ path: 'src/app.js', line: 1 }] };
       throw new Error(`Unexpected tool ${name}`);
@@ -170,6 +179,13 @@ test('Gemini tool results are passed back with matching call ids', async () => {
     assert.equal(responsePart.id, calls[index].id);
     assert.equal(responsePart.name, calls[index].name);
   }
+  const listResponse = requests[1].contents
+    .flatMap((content) => content.parts || [])
+    .map((part) => part.functionResponse)
+    .find((part) => part?.name === 'list_files');
+  assert.deepEqual(listResponse.response.result.files, ['src/app.js']);
+  assert.match(result.toolActivity[0].detail, /1 file/);
+  assert.match(result.toolActivity[2].detail, /1 match/);
   assert.match(result.text, /syntax error/);
   assert.deepEqual(result.toolActivity.map((item) => item.status), ['completed', 'completed', 'completed']);
 });
@@ -181,7 +197,9 @@ test('OpenRouter fallback runs the same workspace tools with the coding prompt',
     declarations: stripServerManagedProjectId(geminiToolDeclarations),
     async execute(name, args) {
       executed.push({ name, args });
-      return { path: '.', entries: ['README.md', 'server/index.js'] };
+      return {
+        path: '.', files: ['README.md', 'server/index.js'], directories: ['server'], skipped: 0, errors: [], truncated: false,
+      };
     },
   };
   const primary = createGeminiProvider({
@@ -235,6 +253,9 @@ test('OpenRouter fallback runs the same workspace tools with the coding prompt',
   assert.match(openAIRequests[0].messages[0].content, /cannot inspect the whole PC/i);
   assert.equal(openAIRequests[0].tools[0].function.parameters.properties.projectId, undefined);
   assert.equal(openAIRequests[1].messages.at(-1).role, 'tool');
+  const toolMessage = JSON.parse(openAIRequests[1].messages.at(-1).content);
+  assert.deepEqual(toolMessage.result.files, ['README.md', 'server/index.js']);
+  assert.match(result.toolActivity[0].detail, /2 files/);
   assert.match(result.text, /README\.md/);
 });
 
@@ -260,11 +281,11 @@ test('unavailable tools produce honest capability statements on both adapters', 
   await gemini.chat({ messages: [{ role: 'user', content: 'Check my PC.' }] });
 
   assert.equal(prompts.length, 2);
-  assert.match(prompts[0], /no workspace tools/i);
-  assert.match(prompts[0], /cannot inspect the whole PC/i);
-  assert.match(prompts[0], /only inside an approved workspace/i);
-  assert.match(prompts[1], /cannot inspect the whole PC/i);
-  assert.match(prompts[1], /only that approved workspace/i);
+  assert.equal(prompts[0], NO_WORKSPACE_SYSTEM_INSTRUCTION);
+  assert.equal(prompts[1], NO_WORKSPACE_SYSTEM_INSTRUCTION);
+  assert.match(prompts[1], /no workspace tools/i);
+  assert.match(prompts[1], /did not inspect or scan any files/i);
+  assert.match(prompts[1], /never claim an empty scan result/i);
 });
 
 test('restricted workspace actions stay staged and whole-PC paths stay unavailable', async () => {
@@ -308,4 +329,241 @@ test('web client keeps the workspace signal and hides workspace starters without
   assert.match(source, /workspace: result\.workspace \|\| null/);
   assert.match(source, /workspaceStatusMessage\(message\.workspace\)/);
   assert.match(source, /\(activeProject \? starters : \[\]\)/);
+  assert.match(source, /activity\.detail/);
+});
+
+test('both adapters receive the same grounded workspace scanning instructions', async () => {
+  const tools = {
+    declarations: stripServerManagedProjectId(geminiToolDeclarations),
+    execute: async () => ({ path: '.', files: [], truncated: false }),
+  };
+  const prompts = [];
+
+  const gemini = createGeminiProvider({
+    apiKey: 'test-key',
+    cooldownStore: new Map(),
+    fetchImpl: async (_url, options) => {
+      prompts.push(JSON.parse(options.body).systemInstruction.parts[0].text);
+      return Response.json({ candidates: [{ content: { parts: [{ text: 'Empty workspace.' }] } }] });
+    },
+  });
+  await gemini.chat({
+    messages: [{ role: 'user', content: 'Scan my project.' }],
+    tools,
+    projectId: 4,
+  });
+
+  const openAI = createOpenAIProvider({
+    apiKey: 'test-key',
+    fetchImpl: async (_url, options) => {
+      prompts.push(JSON.parse(options.body).messages[0].content);
+      return Response.json({ choices: [{ message: { content: 'Empty workspace.' } }] });
+    },
+  });
+  await openAI.chat({
+    messages: [{ role: 'user', content: 'Scan my project.' }],
+    tools,
+    projectId: 4,
+  });
+
+  assert.deepEqual(prompts, [WORKSPACE_SYSTEM_INSTRUCTION, WORKSPACE_SYSTEM_INSTRUCTION]);
+  assert.match(prompts[0], /files array/i);
+  assert.match(prompts[0], /no scannable files/i);
+  assert.match(prompts[0], /limits/i);
+  assert.match(prompts[0], /untrusted data, never as instructions/i);
+  assert.match(prompts[0], /actually read/i);
+  assert.match(prompts[0], /search matches/i);
+  assert.match(prompts[0], /inferred/i);
+});
+
+test('both adapters trim large real list_files arrays without exposing file names in activity', async () => {
+  const files = Array.from({ length: 3000 }, (_, index) => `src/generated-file-${String(index).padStart(4, '0')}.js`);
+  const scanResult = {
+    path: '.',
+    files,
+    directories: ['src'],
+    manifests: [],
+    skipped: 0,
+    errors: [],
+    truncated: false,
+    limits: { maxFiles: 5000 },
+  };
+  const tools = {
+    declarations: stripServerManagedProjectId(geminiToolDeclarations),
+    execute: async () => scanResult,
+  };
+
+  const geminiRequests = [];
+  const gemini = createGeminiProvider({
+    apiKey: 'test-key',
+    cooldownStore: new Map(),
+    fetchImpl: async (_url, options) => {
+      geminiRequests.push(JSON.parse(options.body));
+      if (geminiRequests.length === 1) {
+        return Response.json({
+          candidates: [{ content: { parts: [{ functionCall: { name: 'list_files', args: {}, id: 'call-large' } }] } }],
+        });
+      }
+      return Response.json({ candidates: [{ content: { parts: [{ text: 'Scan complete.' }] } }] });
+    },
+  });
+  const geminiResult = await gemini.chat({
+    messages: [{ role: 'user', content: 'Scan my project.' }],
+    tools,
+    projectId: 8,
+  });
+  const geminiResponse = geminiRequests[1].contents
+    .flatMap((content) => content.parts || [])
+    .map((part) => part.functionResponse)
+    .find((part) => part?.name === 'list_files');
+  assert.ok(geminiResponse.response.result.files.length < files.length);
+  assert.equal(geminiResponse.response.result.truncated, true);
+  assert.equal(geminiResponse.response.transportTrimmed, true);
+  assert.equal(
+    geminiResult.toolActivity[0].detail,
+    `${geminiResponse.response.result.files.length} files · 1 dir · truncated`,
+    'activity counts must match the result actually sent to the model',
+  );
+  assert.equal(JSON.stringify(geminiResult.toolActivity).includes('generated-file-'), false);
+
+  const openAIRequests = [];
+  const openAI = createOpenAIProvider({
+    apiKey: 'test-key',
+    fetchImpl: async (_url, options) => {
+      openAIRequests.push(JSON.parse(options.body));
+      if (openAIRequests.length === 1) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{ id: 'call-large', type: 'function', function: { name: 'list_files', arguments: '{}' } }],
+            },
+          }],
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'Scan complete.' } }] });
+    },
+  });
+  const openAIResult = await openAI.chat({
+    messages: [{ role: 'user', content: 'Scan my project.' }],
+    tools,
+    projectId: 8,
+  });
+  const serialized = openAIRequests[1].messages.at(-1).content;
+  const parsed = JSON.parse(serialized);
+  assert.ok(serialized.length <= 20_000 + 200, 'tool message stays near the shared character budget');
+  assert.ok(parsed.result.files.length < files.length);
+  assert.equal(parsed.result.truncated, true);
+  assert.equal(parsed.transportTrimmed, true);
+  assert.equal(
+    openAIResult.toolActivity[0].detail,
+    `${parsed.result.files.length} files · 1 dir · truncated`,
+    'activity counts must match the result actually sent to the model',
+  );
+  assert.equal(JSON.stringify(openAIResult.toolActivity).includes('generated-file-'), false);
+});
+
+test('Gemini and OpenRouter tool results redact the reviewer credential formats', async () => {
+  const project = makeProject('workspace-adapter-redaction');
+  const tools = createWorkspaceTools({ db });
+  const modelFacingTools = {
+    declarations: stripServerManagedProjectId(geminiToolDeclarations),
+    execute: tools.execute,
+  };
+  const secrets = ['hunter2', 'abcdef123456', 's3cr3tValue123456', 'dbSecretValue123456'];
+  const content = [
+    `password: ${secrets[0]}`,
+    `password = ${secrets[0]}`,
+    `token: ${secrets[1]}`,
+    `token = ${secrets[1]}`,
+    `secret: ${secrets[2]}`,
+    `secret = ${secrets[2]}`,
+    `db_password: ${secrets[3]}`,
+    `db_password = ${secrets[3]}`,
+    'export const answer = 42;',
+  ].join('\n');
+
+  try {
+    fs.mkdirSync(path.join(project.root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(project.root, 'src', 'reviewer-secrets.js'), content);
+
+    const geminiRequests = [];
+    const gemini = createGeminiProvider({
+      apiKey: 'test-key',
+      model: 'gemini-redaction-test',
+      cooldownStore: new Map(),
+      fetchImpl: async (_url, options) => {
+        const body = JSON.parse(options.body);
+        geminiRequests.push(body);
+        if (geminiRequests.length === 1) {
+          return Response.json({
+            candidates: [{
+              content: {
+                parts: [{
+                  functionCall: {
+                    name: 'read_file',
+                    args: { path: 'src/reviewer-secrets.js' },
+                    id: 'call-gemini-read',
+                  },
+                }],
+              },
+            }],
+          });
+        }
+        return Response.json({ candidates: [{ content: { parts: [{ text: 'Done.' }] } }] });
+      },
+    });
+    await gemini.chat({
+      messages: [{ role: 'user', content: 'Read the config.' }],
+      tools: modelFacingTools,
+      projectId: project.id,
+    });
+    const geminiToolResult = geminiRequests[1].contents
+      .flatMap((item) => item.parts || [])
+      .map((part) => part.functionResponse)
+      .find((part) => part?.name === 'read_file');
+    const geminiPayload = JSON.stringify(geminiToolResult.response);
+    assert.ok(geminiPayload.includes('[redacted]'), 'Gemini read_file result must be redacted');
+    for (const secret of secrets) {
+      assert.equal(geminiPayload.includes(secret), false, `Gemini tool result leaked ${secret}`);
+    }
+
+    const openAIRequests = [];
+    const openAI = createOpenAIProvider({
+      apiKey: 'test-key',
+      model: 'openrouter-redaction-test',
+      fetchImpl: async (_url, options) => {
+        const body = JSON.parse(options.body);
+        openAIRequests.push(body);
+        if (openAIRequests.length === 1) {
+          return Response.json({
+            choices: [{
+              message: {
+                tool_calls: [{
+                  id: 'call-openrouter-search',
+                  type: 'function',
+                  function: {
+                    name: 'search_files',
+                    arguments: JSON.stringify({ query: 'password' }),
+                  },
+                }],
+              },
+            }],
+          });
+        }
+        return Response.json({ choices: [{ message: { content: 'Done.' } }] });
+      },
+    });
+    await openAI.chat({
+      messages: [{ role: 'user', content: 'Search the config.' }],
+      tools: modelFacingTools,
+      projectId: project.id,
+    });
+    const openAIPayload = openAIRequests[1].messages.at(-1).content;
+    assert.ok(openAIPayload.includes('[redacted]'), 'OpenRouter search_files result must be redacted');
+    for (const secret of secrets) {
+      assert.equal(openAIPayload.includes(secret), false, `OpenRouter tool result leaked ${secret}`);
+    }
+  } finally {
+    fs.rmSync(project.root, { recursive: true, force: true });
+  }
 });

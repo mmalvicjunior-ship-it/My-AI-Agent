@@ -3,12 +3,20 @@ import {
   createProviderNetworkError,
   redactProviderDetail,
 } from './provider-error.js';
-import { withApprovalNotice } from './tool-response.js';
+import {
+  FINAL_ANSWER_INSTRUCTION,
+  NO_WORKSPACE_SYSTEM_INSTRUCTION,
+  WORKSPACE_SYSTEM_INSTRUCTION,
+  serializeToolResponse,
+  toolActivityDetail,
+  toolResultMessage,
+  trimToolResponse,
+  withApprovalNotice,
+} from './tool-response.js';
 
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const MAX_TOOL_ROUNDS = 6;
-const MAX_TOOL_RESULT_CHARS = 20_000;
 
 // Tools whose result is only staged; the user must approve before anything is
 // written or run.
@@ -17,9 +25,6 @@ const FILE_PROPOSAL_TOOLS = new Set(['create_file', 'propose_file_change']);
 // Tools that take a workspace-relative path, used to normalize call signatures.
 const PATH_ARGUMENT_TOOLS = new Set(['list_files', 'read_file', 'create_file', 'propose_file_change']);
 
-const SYSTEM_INSTRUCTION = "You are MyAI, a coding assistant. Answer clearly and accurately. No approved project workspace is selected for this request, so you have no workspace tools and access only to this conversation. You cannot inspect the whole PC, read or write files, run commands, browse the web, or reach external services. You can inspect files only inside an approved workspace after the user selects one. Say so plainly when a request needs workspace access. Never claim whole-PC access or that you applied a change, ran a command, used an external tool, or browsed the web.";
-const CODING_SYSTEM_INSTRUCTION = "You are MyAI, a coding assistant working in the selected approved project workspace. The workspace tools listed for this request are the only tools you have. Use them to list, read, and search files in that workspace and to stage allowlisted checks; inspect relevant files before proposing changes. You cannot inspect the whole PC or files outside the selected workspace. You cannot browse the web, reach external services, or use tools that are not listed. Say so plainly if a request is outside that scope. Use create_file for new files and propose_file_change for edits to existing files. Hard rule: a tool result with status \"awaiting_user_approval\" means nothing has been written or run yet. Describe it as staged and awaiting the user's approval, and never say that you created, wrote, updated, applied, ran, or executed it. File changes and commands require explicit user approval. Never claim a tool succeeded unless its result confirms success. After a tool returns enough information, stop calling tools and answer. Never repeat the same tool call with the same arguments. If the user asks to list files, call list_files once for the requested directory (the project root if unspecified), report the returned paths, and do not read file contents.";
-const FINAL_ANSWER_INSTRUCTION = "Do not call any more tools. Use the tool results already in the conversation to answer. If you cannot complete the request from those results, say so clearly.";
 const ROUND_LIMIT_MESSAGE = `I reached the maximum of ${MAX_TOOL_ROUNDS} workspace tool-call rounds before producing a final answer. Please narrow the request and try again.`;
 const REPEAT_MESSAGE = 'I stopped after the model repeated an identical workspace tool call. I reused the existing result and did not execute it again.';
 
@@ -159,23 +164,6 @@ function toolCallSignature(name, args) {
   return `${name}:${stableStringify(normalized)}`;
 }
 
-/** Serializes a tool result, trimming oversized payloads before they reach the model. */
-function serializeToolResponse(response) {
-  const serialized = JSON.stringify(response);
-  if (serialized.length <= MAX_TOOL_RESULT_CHARS) return serialized;
-  const result = response?.result;
-  if (result && typeof result === 'object' && !Array.isArray(result)) {
-    const trimmed = { ...result, truncated: true };
-    if (typeof trimmed.content === 'string') {
-      trimmed.content = `${trimmed.content.slice(0, MAX_TOOL_RESULT_CHARS)}\n[tool output truncated]`;
-    }
-    return JSON.stringify({ result: trimmed });
-  }
-  return JSON.stringify({
-    error: `Tool output was larger than ${MAX_TOOL_RESULT_CHARS} characters and was trimmed before it was sent to the model.`,
-  });
-}
-
 /**
  * Detects an upstream "this model cannot call tools" rejection so the user
  * gets an actionable message instead of a generic provider failure.
@@ -284,7 +272,7 @@ export function createOpenAIProvider({
       const conversationHistory = messages.filter((message) => message.role !== 'system');
       const hasTools = Boolean(tools?.declarations?.length && typeof tools.execute === 'function');
       const requestMessages = [
-        { role: 'system', content: hasTools ? CODING_SYSTEM_INSTRUCTION : SYSTEM_INSTRUCTION },
+        { role: 'system', content: hasTools ? WORKSPACE_SYSTEM_INSTRUCTION : NO_WORKSPACE_SYSTEM_INSTRUCTION },
         ...systemMessages,
         ...conversationHistory,
       ];
@@ -417,20 +405,24 @@ export function createOpenAIProvider({
               // tool a second time, then ask for a final answer.
               activityItem.status = previousResult.status;
               activityItem.reused = true;
+              if (previousResult.detail) activityItem.detail = previousResult.detail;
               toolResponse = previousResult.response;
               finalAnswerReason = REPEAT_MESSAGE;
             } else {
               try {
                 const output = await tools.execute(functionName, { ...args, projectId });
+                // Derive activity counts from the result actually sent to the
+                // model, so transport trimming cannot inflate the UI numbers.
+                toolResponse = trimToolResponse(toolResultMessage(output));
+                const detail = toolActivityDetail(functionName, toolResponse);
                 Object.assign(activityItem, {
                   status: APPROVAL_TOOLS.has(functionName) ? 'awaiting approval' : 'completed',
+                  ...(detail ? { detail } : {}),
                   ...(FILE_PROPOSAL_TOOLS.has(functionName)
                     ? { proposal: { ...output, content: args.content }, projectId }
                     : {}),
                   ...(functionName === 'run_command' ? { commandApproval: output, projectId } : {}),
                 });
-                const { originalContent, ...safeOutput } = output;
-                toolResponse = { result: safeOutput };
               } catch (error) {
                 const safeMessage = typeof error.publicMessage === 'string'
                   ? error.publicMessage
@@ -442,7 +434,11 @@ export function createOpenAIProvider({
                 }
                 toolResponse = { error: safeMessage };
               }
-              toolResults.set(signature, { response: toolResponse, status: activityItem.status });
+              toolResults.set(signature, {
+                response: toolResponse,
+                status: activityItem.status,
+                ...(activityItem.detail ? { detail: activityItem.detail } : {}),
+              });
             }
           } catch (error) {
             const safeMessage = typeof error.publicMessage === 'string'

@@ -250,6 +250,6 @@ export function redactSecrets(text) {
     // Google AI Studio keys start with "AIza".
     .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, '[redacted credential]')
     .replace(/\bBearer\s+[A-Za-z0-9_.-]+/gi, 'Bearer [redacted]')
-    .replace(/((?:AI_API_KEY|GEMINI_API_KEY|OPENROUTER_API_KEY|API_KEY|DATABASE_URL|NEON_DATABASE_URL|WORKSPACE_S3_SECRET_KEY|SECRET|PASSWORD|TOKEN))=["']?[^"'\s]+["']?/gi, '$1=[redacted]');
+    .replace(/((?:AI_API_KEY|GEMINI_API_KEY|OPENROUTER_API_KEY|API_KEY|DATABASE_URL|NEON_DATABASE_URL|WORKSPACE_S3_SECRET_KEY|DB_PASSWORD|CLIENT_SECRET|ACCESS_TOKEN|REFRESH_TOKEN|AUTH_TOKEN|SESSION_TOKEN|SECRET|PASSWORD|TOKEN))(\s*[:=]\s*)(["']?)([^\s"',;]+)\3/gi, '$1$2$3[redacted]$3');
   return safe;
 }

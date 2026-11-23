@@ -9,10 +9,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createApp } from '../src/index.js';
-import { config } from '../src/config.js';
+import { config, redactSecrets } from '../src/config.js';
 import {
   createTextFile,
+  isSensitiveFile,
   MAX_READ_BYTES,
+  MAX_SCAN_FILES,
   readTextFile,
   scanDirectory,
   searchWorkspace,
@@ -222,10 +224,16 @@ test('harmless relative paths that stay inside are allowed', async () => {
   const dir = path.join(config.workspaceRoot, String(id));
   fs.mkdirSync(path.join(dir, 'src'));
   fs.writeFileSync(path.join(dir, 'src', 'ok.js'), 'ok\n');
+  fs.writeFileSync(path.join(dir, '..notes'), 'dots\n');
 
   const { status, data } = await api.readFile(id, 'src/../src/ok.js');
   assert.equal(status, 200);
   assert.equal(data.content, 'ok\n');
+
+  // A real filename beginning with two dots is not a traversal attempt.
+  const dotted = await api.readFile(id, '..notes');
+  assert.equal(dotted.status, 200);
+  assert.equal(dotted.data.content, 'dots\n');
 });
 
 // ---------------------------------------------------------------------------
@@ -328,4 +336,310 @@ test('new-file proposals are path-safe and never overwrite existing files', () =
   assert.throws(() => createTextFile(root, 'new.js', 'overwrite'), /already exists/);
   assert.throws(() => createTextFile(root, '../outside.js', 'escape'), /escapes/);
   assert.throws(() => createTextFile(root, '.env', 'SECRET=x'), /credential/);
+});
+
+test('scanner recursively maps the workspace with the real result shape', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-map-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src', 'components'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'server', 'routes'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'server', 'services'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'tests'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+  for (const file of [
+    'package.json',
+    'src/index.js',
+    'src/components/Button.tsx',
+    'server/routes/auth.js',
+    'server/services/authService.js',
+    'tests/auth.test.js',
+    'docs/README.md',
+  ]) {
+    fs.writeFileSync(path.join(root, file), 'export default {};\n');
+  }
+
+  const scan = scanDirectory(root);
+  assert.deepEqual(scan.files, [
+    'docs/README.md',
+    'package.json',
+    'server/routes/auth.js',
+    'server/services/authService.js',
+    'src/components/Button.tsx',
+    'src/index.js',
+    'tests/auth.test.js',
+  ]);
+  assert.deepEqual(scan.manifests, ['package.json']);
+  assert.ok(scan.directories.includes('src/components'));
+  assert.ok(scan.projectMap.entryPoints.includes('src/index.js'));
+  assert.ok(scan.projectMap.routes.includes('server/routes/auth.js'));
+  assert.ok(scan.projectMap.components.includes('src/components/Button.tsx'));
+  assert.ok(scan.projectMap.services.includes('server/services/authService.js'));
+  assert.ok(scan.projectMap.tests.includes('tests/auth.test.js'));
+  assert.ok(scan.projectMap.docs.includes('docs/README.md'));
+  assert.ok(scan.languageHints.includes('JavaScript'));
+  assert.ok(scan.languageHints.includes('TypeScript'));
+  assert.ok(scan.frameworkHints.includes('React'));
+  assert.deepEqual(scan.projectTypes, ['Node.js']);
+  assert.equal(scan.skipped, 0);
+  assert.deepEqual(scan.errors, []);
+  assert.equal(scan.truncated, false);
+  assert.deepEqual(scan.limits, {
+    maxFiles: MAX_SCAN_FILES,
+    maxDepth: 12,
+    maxDirectories: 1000,
+    maxHintsPerCategory: 25,
+  });
+});
+
+test('root .gitignore is applied without exposing its contents', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-gitignore-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'generated'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.gitignore'), '# comment\n*.log\n!important.log\ngenerated/\n/root-only.txt\n');
+  for (const file of [
+    'debug.log',
+    'important.log',
+    'generated/gen.js',
+    'root-only.txt',
+    'src/root-only.txt',
+    'src/app.js',
+  ]) {
+    fs.writeFileSync(path.join(root, file), 'ok\n');
+  }
+
+  const scan = scanDirectory(root);
+  assert.ok(scan.files.includes('.gitignore'));
+  assert.ok(scan.files.includes('important.log'));
+  assert.ok(scan.files.includes('src/root-only.txt'));
+  assert.ok(scan.files.includes('src/app.js'));
+  assert.equal(scan.files.includes('debug.log'), false);
+  assert.equal(scan.files.includes('generated/gen.js'), false);
+  assert.equal(scan.files.includes('root-only.txt'), false);
+  assert.equal(JSON.stringify(scan).includes('# comment'), false);
+});
+
+test('credential filtering is precise and keeps false-positive source paths', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-credentials-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'token-service'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'credentials'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+  const allowed = [
+    'src/tokens.js',
+    'token-service/auth.js',
+    'src/passwordReset.js',
+    'docs/credentials.md',
+    'credentials/notes.txt',
+  ];
+  const denied = [
+    '.env',
+    'config.env.local',
+    'client_secret.json',
+    'id_ed25519',
+    'server.key',
+    'secrets.txt',
+    'secrets.conf',
+    'credentials.json',
+    'api_secret.txt',
+    '.npmrc',
+    'token',
+    'password',
+    'db_password',
+  ];
+  for (const file of [...allowed, ...denied]) {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), 'value\n');
+  }
+
+  const scan = scanDirectory(root);
+  for (const file of allowed) assert.ok(scan.files.includes(file), `${file} should be scanned`);
+  for (const file of denied) assert.equal(scan.files.includes(file), false, `${file} must be excluded`);
+  assert.equal(isSensitiveFile('src/tokens.js'), false);
+  assert.equal(isSensitiveFile('token-service'), false);
+  assert.equal(isSensitiveFile('client_secret.json'), true);
+  assert.equal(isSensitiveFile('api_secret.txt'), true);
+  assert.equal(isSensitiveFile('.env.production'), true);
+  assert.equal(isSensitiveFile('token'), true);
+  assert.equal(isSensitiveFile('password'), true);
+  assert.equal(isSensitiveFile('db_password'), true);
+  assert.equal(isSensitiveFile('secrets.conf'), true);
+  assert.ok(scan.skipped >= denied.length);
+});
+
+test('read_file and search_files redact embedded credentials before model context', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-redaction-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  const secrets = [
+    'sk-test-secret-key-1234567890',
+    'clientSecretValue123456',
+    'eyJabc1234567890.defghijklmnop.qrs1234567890',
+    'Authorization: Bearer abcdefghijklmnopqrst',
+  ];
+  fs.writeFileSync(path.join(root, 'src', 'config.js'), [
+    `const apiKey = "${secrets[0]}";`,
+    `const clientSecret = "${secrets[1]}";`,
+    `const token = "${secrets[2]}";`,
+    `const header = "${secrets[3]}";`,
+    'export const answer = 42;',
+  ].join('\n'));
+
+  const read = readTextFile(root, 'src/config.js');
+  assert.equal(read.redacted, true);
+  for (const secret of secrets) {
+    assert.equal(read.content.includes(secret), false, `${secret} must be redacted`);
+  }
+  assert.match(read.content, /answer = 42/);
+
+  const secretSearch = searchWorkspace(root, secrets[0]);
+  assert.deepEqual(secretSearch.results, []);
+  const normalSearch = searchWorkspace(root, 'answer');
+  assert.equal(normalSearch.results[0].path, 'src/config.js');
+  for (const secret of secrets) {
+    assert.equal(JSON.stringify(normalSearch).includes(secret), false);
+  }
+});
+
+test('reviewer credential formats are redacted before read_file and search_files results', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-reviewer-redaction-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  const secrets = [
+    'hunter2',
+    'abcdef123456',
+    's3cr3tValue123456',
+    'dbSecretValue123456',
+  ];
+  fs.writeFileSync(path.join(root, 'src', 'reviewer-secrets.js'), [
+    `password: ${secrets[0]}`,
+    `password = ${secrets[0]}`,
+    `token: ${secrets[1]}`,
+    `token = ${secrets[1]}`,
+    `secret: ${secrets[2]}`,
+    `secret = ${secrets[2]}`,
+    `db_password: ${secrets[3]}`,
+    `db_password = ${secrets[3]}`,
+    'export const answer = 42;',
+  ].join('\n'));
+
+  const read = readTextFile(root, 'src/reviewer-secrets.js');
+  const readResult = JSON.stringify(read);
+  assert.equal(read.redacted, true);
+  assert.ok(readResult.includes('[redacted]'));
+  assert.match(read.content, /answer = 42/);
+  for (const secret of secrets) {
+    assert.equal(readResult.includes(secret), false, `read_file leaked ${secret}`);
+  }
+
+  const search = searchWorkspace(root, 'password');
+  const searchResult = JSON.stringify(search);
+  assert.ok(search.results.length > 0);
+  assert.ok(searchResult.includes('[redacted]'));
+  for (const secret of secrets) {
+    assert.equal(searchResult.includes(secret), false, `search_files leaked ${secret}`);
+  }
+});
+
+test('config redaction handles spaces around credential separators', () => {
+  assert.equal(redactSecrets('PASSWORD = spacedPassword123'), 'PASSWORD = [redacted]');
+  assert.equal(redactSecrets('TOKEN : spacedToken123'), 'TOKEN : [redacted]');
+  assert.equal(redactSecrets('SECRET=spacedSecret123'), 'SECRET=[redacted]');
+  assert.equal(redactSecrets('DB_PASSWORD = dbSpaced123'), 'DB_PASSWORD = [redacted]');
+});
+
+test('scan limits are reported and never presented as complete', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-limits-'));
+  tempDirs.push(root);
+  for (let index = 0; index < 4; index += 1) {
+    fs.writeFileSync(path.join(root, `file-${index}.js`), 'ok\n');
+  }
+  const counted = scanDirectory(root, '.', { maxFiles: 2 });
+  assert.equal(counted.files.length, 2);
+  assert.equal(counted.truncated, true);
+  assert.equal(counted.limits.maxFiles, 2);
+  assert.ok(counted.skipped >= 2);
+
+  fs.mkdirSync(path.join(root, 'a', 'b', 'c'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'a', 'b', 'c', 'deep.js'), 'deep\n');
+  const limitedDepth = scanDirectory(root, '.', { maxDepth: 1 });
+  assert.equal(limitedDepth.files.includes('a/b/c/deep.js'), false);
+  assert.equal(limitedDepth.truncated, true);
+  assert.equal(limitedDepth.limits.maxDepth, 1);
+});
+
+test('oversized root .gitignore is ignored with a reported error', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-bigignore-'));
+  tempDirs.push(root);
+  fs.writeFileSync(path.join(root, '.gitignore'), Buffer.alloc(64 * 1024 + 1, 0x61));
+  fs.writeFileSync(path.join(root, 'app.js'), 'ok\n');
+  const scan = scanDirectory(root);
+  assert.ok(scan.files.includes('app.js'));
+  assert.ok(scan.files.includes('.gitignore'));
+  assert.equal(scan.errors.length, 1);
+  assert.match(scan.errors[0], /exceeds/);
+  assert.equal(scan.truncated, false);
+});
+
+test('scanner skips symlinked directories without following them outside the workspace', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-scan-link-'));
+  tempDirs.push(root);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-scan-outside-'));
+  tempDirs.push(outside);
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'TOP SECRET SCAN');
+  fs.writeFileSync(path.join(root, 'app.js'), 'ok\n');
+
+  let linkCreated = false;
+  try {
+    fs.symlinkSync(outside, path.join(root, 'escape'), 'junction');
+    linkCreated = true;
+  } catch {
+    t.diagnostic('symlink/junction creation not permitted on this system - scan link test skipped');
+  }
+  if (!linkCreated) return;
+
+  const scan = scanDirectory(root);
+  assert.deepEqual(scan.files, ['app.js']);
+  assert.equal(JSON.stringify(scan).includes('TOP SECRET SCAN'), false);
+});
+
+test('symlinked root .gitignore is rejected without following the link', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-gitignore-link-'));
+  tempDirs.push(root);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-gitignore-outside-'));
+  tempDirs.push(outside);
+  fs.writeFileSync(path.join(outside, '.gitignore'), '*.js\n');
+  fs.writeFileSync(path.join(root, 'app.js'), 'ok\n');
+
+  let linkCreated = false;
+  try {
+    fs.symlinkSync(path.join(outside, '.gitignore'), path.join(root, '.gitignore'), 'file');
+    linkCreated = true;
+  } catch {
+    t.diagnostic('symlink creation not permitted on this system - .gitignore symlink test skipped');
+  }
+  if (!linkCreated) return;
+
+  const scan = scanDirectory(root);
+  assert.ok(scan.files.includes('app.js'), 'external .gitignore patterns must not be applied');
+  assert.equal(scan.files.includes('.gitignore'), false, 'the symlink itself is skipped');
+  assert.deepEqual(scan.errors, []);
+});
+
+test('scanning and searching never modify workspace files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-readonly-'));
+  tempDirs.push(root);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'app.js'), 'const answer = 42;\n');
+  const snapshot = (directory) => fs.readdirSync(directory, { withFileTypes: true }).map((entry) => {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) return { name: entry.name, type: 'directory', children: snapshot(absolute) };
+    return { name: entry.name, type: 'file', content: fs.readFileSync(absolute, 'utf8') };
+  });
+  const before = snapshot(root);
+
+  scanDirectory(root);
+  searchWorkspace(root, 'answer');
+
+  assert.deepEqual(snapshot(root), before);
 });

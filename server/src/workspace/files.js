@@ -5,6 +5,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { redactSecrets } from '../config.js';
 import { WorkspaceError } from './errors.js';
 import { getWorkspaceDriver, afterWorkspaceWrite } from './storage-driver.js';
 
@@ -15,7 +16,79 @@ export const MAX_LIST_ENTRIES = 1000;
 export const IGNORED_DIRECTORIES = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage']);
 export const MAX_SCAN_FILES = 5000;
 export const MAX_SCAN_DEPTH = 12;
+export const MAX_SCAN_DIRECTORIES = 1000;
+export const MAX_SCAN_HINTS = 25;
 const BINARY_SNIFF_BYTES = 8000;
+const MAX_GITIGNORE_BYTES = 64 * 1024;
+
+// Extra generated/cache directories and private-key stores. These are never
+// affected by .gitignore negations: security exclusions always win.
+const SCAN_IGNORED_DIRECTORIES = new Set([
+  ...IGNORED_DIRECTORIES,
+  '.cache',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  '.ruff_cache',
+  '.turbo',
+  '.parcel-cache',
+  '.svelte-kit',
+  '.angular',
+  '.gradle',
+  '.idea',
+  '.vscode',
+  'out',
+  'tmp',
+  '.ssh',
+  '.aws',
+  '.kube',
+  '.gnupg',
+]);
+
+const MANIFEST_FILES = new Set([
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lockb',
+  'pyproject.toml',
+  'requirements.txt',
+  'pipfile',
+  'poetry.lock',
+  'go.mod',
+  'go.sum',
+  'cargo.toml',
+  'cargo.lock',
+  'pom.xml',
+  'build.gradle',
+  'build.gradle.kts',
+  'gemfile',
+  'gemfile.lock',
+  'composer.json',
+  'composer.lock',
+  'mix.exs',
+  'deno.json',
+  'deno.jsonc',
+]);
+
+const EXTENSION_LANGUAGES = new Map([
+  ['.js', 'JavaScript'], ['.jsx', 'JavaScript'], ['.mjs', 'JavaScript'], ['.cjs', 'JavaScript'],
+  ['.ts', 'TypeScript'], ['.tsx', 'TypeScript'],
+  ['.py', 'Python'], ['.go', 'Go'], ['.rs', 'Rust'], ['.java', 'Java'],
+  ['.kt', 'Kotlin'], ['.rb', 'Ruby'], ['.php', 'PHP'], ['.cs', 'C#'],
+  ['.c', 'C'], ['.h', 'C'], ['.cpp', 'C++'], ['.hpp', 'C++'],
+  ['.swift', 'Swift'], ['.scala', 'Scala'], ['.sh', 'Shell'], ['.sql', 'SQL'],
+]);
+
+const HINT_RULES = {
+  entryPoints: /(^|\/)(?:index|main|app|server|bootstrap)\.[a-z0-9]+$|(?:\/|^)(?:app|main)\.(?:jsx|tsx)$/i,
+  routes: /(?:^|\/)(?:routes?|router|pages|app|controllers?|handlers?)(?:\/|$)|route|handler/i,
+  components: /(?:^|\/)(?:components?|widgets?|views?|ui)(?:\/|$)|\.(?:jsx|tsx)$/i,
+  services: /(?:^|\/)(?:services?|lib|utils?|helpers?|clients?|sdk)(?:\/|$)|service/i,
+  apis: /(?:^|\/)(?:api|apis|graphql|rest|controllers?)(?:\/|$)|endpoint/i,
+  tests: /(?:^|\/)(?:tests?|specs?|__tests__)(?:\/|$)|\.(?:test|spec)\.[a-z0-9]+$/i,
+  docs: /(?:^|\/)(?:docs?|documentation)(?:\/|$)|\.md$/i,
+};
 
 /** Absolute directory that holds all project workspaces. */
 export function projectDir(workspaceRoot, projectId) {
@@ -39,9 +112,32 @@ export function getProjectRoot(db, workspaceRoot, projectId) {
   }
 }
 
+// Narrow, file-specific credential patterns. The old substring rule hid whole
+// source trees such as `src/tokens.js` or `token-service/`. A basename is
+// blocked only when it looks like an actual secret store; content redaction
+// covers embedded credentials in ordinary source files.
+const CREDENTIAL_FILE_EXTENSIONS = 'json|ya?ml|toml|ini|txt|csv|properties|conf';
+const SENSITIVE_FILE_PATTERNS = [
+  /^\.env(?:\..*)?$/i,
+  /^.*\.env(?:\..*)?$/i,
+  /\.(?:pem|key|p12|pfx|p8|jks|keystore|asc)$/i,
+  /^id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?$/i,
+  /^\.(?:npmrc|netrc|htpasswd)$/i,
+  /^(?:credentials?|secrets?|tokens?|passwords?|passwd|shadow|pwd|api[_-]?key|api[_-]?token|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|private[_-]?key|database[_-]?url|db[_-]?password)$/i,
+  new RegExp(`^(?:.*[_-])?credentials\\.(?:${CREDENTIAL_FILE_EXTENSIONS})$`, 'i'),
+  new RegExp(`^application[_-]?default[_-]?credentials\\.(?:${CREDENTIAL_FILE_EXTENSIONS})$`, 'i'),
+  new RegExp(`^(?:client[_-]?secret|service[_-]?account|firebase[_-]?adminsdk)(?:[-_].*)?\\.(?:${CREDENTIAL_FILE_EXTENSIONS})$`, 'i'),
+  new RegExp(`(?:^|[-_.])(?:secrets?|tokens?|passwords?|credentials?)(?:[-_.].*)?\\.(?:${CREDENTIAL_FILE_EXTENSIONS})$`, 'i'),
+];
+
 export function isSensitiveFile(fileName) {
-  return /^(?:\.env(?:\..*)?|.*\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx)|id_rsa|id_ed25519)$/i.test(fileName)
-    || /(?:secret|credential|token|password)/i.test(fileName);
+  if (typeof fileName !== 'string') return false;
+  const base = path.basename(fileName.replace(/\\/g, '/'));
+  return SENSITIVE_FILE_PATTERNS.some((pattern) => pattern.test(base));
+}
+
+export function isIgnoredWorkspaceDirectory(name) {
+  return typeof name === 'string' && SCAN_IGNORED_DIRECTORIES.has(name);
 }
 
 export function isProtectedDeploymentConfig(filePath) {
@@ -57,6 +153,139 @@ export function isProtectedDeploymentConfig(filePath) {
   return false;
 }
 
+/**
+ * Redacts credentials inside otherwise ordinary source files. The shared
+ * config redactor handles configured keys and common provider tokens; these
+ * extra patterns cover YAML/JSON config, private-key blocks, and JWTs.
+ */
+export function redactWorkspaceText(text) {
+  if (typeof text !== 'string' || !text) return text;
+  let safe = redactSecrets(text);
+  safe = safe
+    .replace(/(-----BEGIN [^-]*PRIVATE KEY-----)[\s\S]*?(-----END [^-]*PRIVATE KEY-----)/g, '$1[redacted credential]$2')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[redacted credential]')
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[redacted credential]')
+    .replace(/(Authorization\s*:\s*(?:Basic|Bearer)\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]')
+    .replace(/(["']?)((?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key|auth[_-]?token|session[_-]?token|database[_-]?url|db[_-]?password|password|passwd|pwd|secret|token))\1(\s*[:=]\s*)(["']?)([^\s"',;]+)\4/gi, '$1$2$1$3$4[redacted]$4');
+  return safe;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Converts one root .gitignore line into a workspace-relative matcher. */
+function gitignorePatternToRegExp(pattern) {
+  const anchored = pattern.startsWith('/');
+  const body = pattern.replace(/^\/+/, '').replace(/\/+$/, '');
+  let source = '';
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char === '*') {
+      if (body[index + 1] === '*') {
+        if (body[index + 2] === '/') {
+          source += '(?:.*/)?';
+          index += 2;
+        } else {
+          source += '.*';
+          index += 1;
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else if (char === '?') {
+      source += '[^/]';
+    } else {
+      source += escapeRegExp(char);
+    }
+  }
+  const prefix = anchored || body.includes('/') ? '' : '(?:.*/)?';
+  return new RegExp(`^${prefix}(?:${source})(?:/.*)?$`);
+}
+
+/** Reads only the root .gitignore. Its contents are never returned to the model. */
+function readRootGitignore(rootDir) {
+  const gitignorePath = path.join(rootDir, '.gitignore');
+  try {
+    // lstat (not stat) so a symlink is rejected instead of following it out of
+    // the workspace. Non-regular files are ignored without being read.
+    const stat = fs.lstatSync(gitignorePath);
+    if (!stat.isFile()) return { patterns: [], error: null };
+    if (stat.size > MAX_GITIGNORE_BYTES) {
+      return { patterns: [], error: `Root .gitignore exceeds ${MAX_GITIGNORE_BYTES} bytes and was ignored.` };
+    }
+    const patterns = fs.readFileSync(gitignorePath, 'utf8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'))
+      .map((line) => {
+        const negated = line.startsWith('!');
+        const body = (negated ? line.slice(1) : line).replace(/\\/g, '/');
+        if (!body) return null;
+        try {
+          return { negated, regex: gitignorePatternToRegExp(body) };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    return { patterns, error: null };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { patterns: [], error: null };
+    return { patterns: [], error: 'Root .gitignore could not be read and was ignored.' };
+  }
+}
+
+function isIgnoredByGitignore(relativePath, patterns) {
+  let ignored = false;
+  for (const pattern of patterns) {
+    if (pattern.regex.test(relativePath)) ignored = !pattern.negated;
+  }
+  return ignored;
+}
+
+function buildProjectHints(files, manifests) {
+  const languages = new Set();
+  const frameworks = new Set();
+  const projectTypes = new Set();
+  const projectMap = Object.fromEntries(Object.keys(HINT_RULES).map((key) => [key, []]));
+  const manifestNames = new Set(manifests.map((file) => path.basename(file).toLowerCase()));
+
+  if (manifestNames.has('package.json')) projectTypes.add('Node.js');
+  if (manifestNames.has('pyproject.toml') || manifestNames.has('requirements.txt')) projectTypes.add('Python');
+  if (manifestNames.has('go.mod')) projectTypes.add('Go');
+  if (manifestNames.has('cargo.toml')) projectTypes.add('Rust');
+  if (manifestNames.has('pom.xml') || manifestNames.has('build.gradle') || manifestNames.has('build.gradle.kts')) projectTypes.add('Java');
+  if (manifestNames.has('gemfile')) projectTypes.add('Ruby');
+  if (manifestNames.has('composer.json')) projectTypes.add('PHP');
+  if (manifestNames.has('mix.exs')) projectTypes.add('Elixir');
+  if (manifestNames.has('deno.json') || manifestNames.has('deno.jsonc')) projectTypes.add('Deno');
+
+  for (const file of files) {
+    const lower = file.toLowerCase();
+    const extension = path.extname(lower);
+    const language = EXTENSION_LANGUAGES.get(extension);
+    if (language) languages.add(language);
+    if (lower.includes('react') || /\.(?:jsx|tsx)$/.test(lower)) frameworks.add('React');
+    if (/(?:^|\/)next\.config\.|(?:\/|^)app\//.test(lower)) frameworks.add('Next.js');
+    if (/(?:^|\/)vite\.config\./.test(lower)) frameworks.add('Vite');
+    if (/(?:^|\/)express(?:\/|$)/.test(lower)) frameworks.add('Express');
+    if (/(?:^|\/)fastify(?:\/|$)/.test(lower)) frameworks.add('Fastify');
+    if (/(?:^|\/)django(?:\/|$)/.test(lower)) frameworks.add('Django');
+    if (/(?:^|\/)flask(?:\/|$)/.test(lower)) frameworks.add('Flask');
+    for (const [key, rule] of Object.entries(HINT_RULES)) {
+      if (projectMap[key].length < MAX_SCAN_HINTS && rule.test(file)) projectMap[key].push(file);
+    }
+  }
+
+  return {
+    languageHints: [...languages].sort(),
+    frameworkHints: [...frameworks].sort(),
+    projectTypes: [...projectTypes].sort(),
+    projectMap,
+  };
+}
+
 /** Creates a directory (and parents) if missing. */
 export function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -64,7 +293,12 @@ export function ensureDir(dir) {
 
 function isInside(root, target) {
   const rel = path.relative(root, target);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  // Reject only real parent traversal (".." itself or ".." + separator).
+  // A plain name such as "..notes" is a legal file inside the workspace.
+  return rel === '' || (rel !== '..'
+    && !rel.startsWith(`..${path.sep}`)
+    && !rel.startsWith('../')
+    && !path.isAbsolute(rel));
 }
 
 /**
@@ -198,7 +432,8 @@ export function listDirectory(rootDir, relativePath = '.') {
   }
 
   const items = entries
-    .filter((entry) => !IGNORED_DIRECTORIES.has(entry.name) && !isSensitiveFile(entry.name))
+    .filter((entry) => !isIgnoredWorkspaceDirectory(entry.name)
+      && !(isSensitiveFile(entry.name) && !entry.isDirectory()))
     .map((entry) => {
     const type = entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other';
     let size;
@@ -243,7 +478,12 @@ export function readTextFile(rootDir, relativePath) {
   if (sniff.includes(0)) {
     throw new WorkspaceError(415, 'Binary files cannot be displayed as text.');
   }
-  return { path: target.relative, size: stat.size, content: buffer.toString('utf8') };
+  return {
+    path: target.relative,
+    size: stat.size,
+    content: redactWorkspaceText(buffer.toString('utf8')),
+    redacted: true,
+  };
 }
 
 export function createTextFile(rootDir, relativePath, content, { allowDeployment = false } = {}) {
@@ -420,21 +660,99 @@ export function replaceTextFile(rootDir, relativePath, expectedContent, content,
   return { path: target.relative, size: Buffer.byteLength(content, 'utf8') };
 }
 
-export function scanDirectory(rootDir, relativePath = '.') {
+/**
+ * Recursively maps the selected workspace without ever leaving it.
+ * The optional limits are used by tests; normal callers get the safe defaults.
+ */
+export function scanDirectory(rootDir, relativePath = '.', options = {}) {
   const root = resolveInside(rootDir, relativePath);
+  const projectRoot = fs.realpathSync(rootDir);
+  const maxFiles = Number.isInteger(options.maxFiles) && options.maxFiles > 0 ? options.maxFiles : MAX_SCAN_FILES;
+  const maxDepth = Number.isInteger(options.maxDepth) && options.maxDepth >= 0 ? options.maxDepth : MAX_SCAN_DEPTH;
+  const maxDirectories = Number.isInteger(options.maxDirectories) && options.maxDirectories > 0
+    ? options.maxDirectories
+    : MAX_SCAN_DIRECTORIES;
+  const { patterns, error: gitignoreError } = readRootGitignore(projectRoot);
   const files = [];
+  const directories = [];
+  const errors = gitignoreError ? [gitignoreError] : [];
+  let skipped = 0;
+  let hitLimit = false;
+  let hitDepth = false;
+
+  const relativeToProjectRoot = (absolute) => toPosix(path.relative(projectRoot, absolute));
+  const relativeToScanRoot = (absolute) => toPosix(path.relative(root.absolute, absolute)) || '.';
+
   const visit = (directory, depth) => {
-    if (depth > MAX_SCAN_DEPTH || files.length >= MAX_SCAN_FILES) return;
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (IGNORED_DIRECTORIES.has(entry.name) || isSensitiveFile(entry.name)) continue;
+    if (depth > maxDepth) {
+      hitDepth = true;
+      return;
+    }
+    let entries;
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      errors.push(`Could not read directory: ${relativeToScanRoot(directory)}`);
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
       const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) visit(absolute, depth + 1);
-      else if (entry.isFile()) files.push(toPosix(path.relative(root.absolute, absolute)));
-      if (files.length >= MAX_SCAN_FILES) break;
+      const isDirectory = entry.isDirectory();
+      const isFile = entry.isFile();
+      // Symlinks are neither: they are skipped here and never followed.
+      if (!isDirectory && !isFile) {
+        skipped += 1;
+        continue;
+      }
+      if (isIgnoredWorkspaceDirectory(entry.name)
+        || (isSensitiveFile(entry.name) && !isDirectory)) {
+        skipped += 1;
+        continue;
+      }
+      const projectRelative = relativeToProjectRoot(absolute) || entry.name;
+      if (isIgnoredByGitignore(projectRelative, patterns)) {
+        skipped += 1;
+        continue;
+      }
+      const scanRelative = relativeToScanRoot(absolute);
+      if (isDirectory) {
+        if (directories.length >= maxDirectories) {
+          hitLimit = true;
+          skipped += 1;
+          continue;
+        }
+        directories.push(scanRelative);
+        visit(absolute, depth + 1);
+      } else if (files.length >= maxFiles) {
+        hitLimit = true;
+        skipped += 1;
+      } else {
+        files.push(scanRelative);
+      }
     }
   };
   visit(root.absolute, 0);
-  return { path: root.relative, files, truncated: files.length >= MAX_SCAN_FILES };
+
+  files.sort((a, b) => a.localeCompare(b));
+  directories.sort((a, b) => a.localeCompare(b));
+  const manifests = files.filter((file) => MANIFEST_FILES.has(path.basename(file).toLowerCase()));
+  return {
+    path: root.relative,
+    files,
+    directories,
+    manifests,
+    ...buildProjectHints(files, manifests),
+    skipped,
+    errors,
+    truncated: hitLimit || hitDepth,
+    limits: {
+      maxFiles,
+      maxDepth,
+      maxDirectories,
+      maxHintsPerCategory: MAX_SCAN_HINTS,
+    },
+  };
 }
 
 export function searchWorkspace(rootDir, query, { maxResults = 50 } = {}) {
@@ -447,12 +765,12 @@ export function searchWorkspace(rootDir, query, { maxResults = 50 } = {}) {
   for (const relativePath of scanned.files) {
     if (isSensitiveFile(path.basename(relativePath))) continue;
     const absolute = resolveInside(rootDir, relativePath).absolute;
-    let stat;
     try {
-      stat = fs.statSync(absolute);
-      if (stat.size > MAX_READ_BYTES) continue;
-      const content = fs.readFileSync(absolute, 'utf8');
-      if (content.includes('\0')) continue;
+      const stat = fs.statSync(absolute);
+      if (!stat.isFile() || stat.size > MAX_READ_BYTES) continue;
+      const buffer = fs.readFileSync(absolute);
+      if (buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0)) continue;
+      const content = redactWorkspaceText(buffer.toString('utf8'));
       const lines = content.split(/\r?\n/);
       lines.forEach((line, index) => {
         if (line.toLowerCase().includes(needle)) {
@@ -464,5 +782,10 @@ export function searchWorkspace(rootDir, query, { maxResults = 50 } = {}) {
     }
     if (results.length >= maxResults) break;
   }
-  return { results, truncated: scanned.truncated || results.length >= maxResults };
+  return {
+    results,
+    truncated: scanned.truncated || results.length >= maxResults,
+    limit: maxResults,
+    redacted: true,
+  };
 }

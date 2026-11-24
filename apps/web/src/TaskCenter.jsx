@@ -3,10 +3,12 @@ import {
   diffLines,
   isProposalActionable,
   normalizeDecisionError,
+  nextProviderRetryAt,
   pendingCountForTask,
   proposalDecisionLabel,
   proposalStatusLabel,
   proposalTypeLabel,
+  providerRecoveryLabel,
 } from './taskProposalHelpers.js';
 
 function statusBadgeClass(status) {
@@ -386,6 +388,12 @@ export default function TaskCenter({
                 <span className="task-error">{task.error}</span>
               </div>
             )}
+            {task?.status === 'provider_paused' && providerRecoveryLabel(task?.recovery) && (
+              <div className="task-detail-row">
+                <strong>Retry</strong>
+                <span>{providerRecoveryLabel(task.recovery)}</span>
+              </div>
+            )}
           </div>
 
           <div className="task-detail-section">
@@ -504,7 +512,11 @@ export default function TaskCenter({
               <span className="provider-status-icon">⏸</span>
               <div>
                 <strong>Provider paused</strong>
-                <span>A previous task hit a quota or rate limit. Check the task error for details. New submissions are allowed but may also pause.</span>
+                <span>
+                  A previous task hit a quota or rate limit. {nextProviderRetryAt(tasks)
+                    ? `A retry may run around ${formatTimestamp(nextProviderRetryAt(tasks))} if the provider is available.`
+                    : 'No automatic retry is currently scheduled.'} New submissions are allowed but may also pause.
+                </span>
               </div>
             </div>
           )}
@@ -553,6 +565,9 @@ export default function TaskCenter({
                   <span className="task-meta">
                     {formatTimestamp(task.created_at)}
                     {task.last_step ? ` · ${task.last_step}` : ''}
+                    {task.status === 'provider_paused' && providerRecoveryLabel(task.recovery)
+                      ? ` · ${providerRecoveryLabel(task.recovery)}`
+                      : ''}
                   </span>
                   {needsApproval && (
                     <span className="task-approval-note">

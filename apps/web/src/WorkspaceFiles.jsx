@@ -23,7 +23,20 @@ export default function WorkspaceFiles({
   onRefresh,
   onNewProject,
   loading = false,
+  scan = null,
 }) {
+  const scanView = scan || {
+    status: loading ? 'scanning' : 'idle',
+    message: loading ? 'Scanning project…' : null,
+    summary: null,
+  };
+  const scanClasses = {
+    scanning: 'scan-status scanning',
+    complete: 'scan-status complete',
+    failed: 'scan-status failed',
+    unavailable: 'scan-status unavailable',
+  };
+
   if (!project) {
     return (
       <div className="panel-empty">
@@ -41,8 +54,9 @@ export default function WorkspaceFiles({
         <div>
           <span className="panel-eyebrow">Project files</span>
           <strong title={project.name}>{project.name}</strong>
+          <span className={scanClasses[scanView.status] || 'scan-status'}>{scanView.message}</span>
         </div>
-        <button type="button" className="icon-button" onClick={onRefresh} title="Refresh file list" aria-label="Refresh file list">↻</button>
+        <button type="button" className="icon-button" onClick={onRefresh} title="Rescan project" aria-label="Rescan project">↻</button>
       </header>
 
       <form className="file-search-form" onSubmit={(event) => { event.preventDefault(); onSearch(); }}>
@@ -54,6 +68,21 @@ export default function WorkspaceFiles({
         />
         <button type="submit" className="ghost-button" disabled={search.trim().length < 2}>Find</button>
       </form>
+
+      {scanView.status === 'complete' && scanView.summary && (
+        <div className="scan-summary" aria-label="What the agent learned about this workspace">
+          <span>{scanView.summary.fileCount} files</span>
+          <span>{scanView.summary.directoryCount} folders</span>
+          {scanView.summary.manifestCount > 0 && <span>{scanView.summary.manifestCount} manifests</span>}
+          {scanView.summary.frameworkHints.slice(0, 3).map((hint) => <span key={`framework-${hint}`}>{hint}</span>)}
+          {scanView.summary.languageHints.slice(0, 3).map((hint) => <span key={`language-${hint}`}>{hint}</span>)}
+          {scanView.summary.truncated && <span>Partial scan</span>}
+        </div>
+      )}
+
+      {scanView.status === 'failed' && (
+        <button type="button" className="scan-retry" onClick={onRefresh}>Scan failed — retry</button>
+      )}
 
       {results.length > 0 && (
         <div className="code-search-results" aria-label="Code search results">

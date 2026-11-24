@@ -55,3 +55,6 @@ desktop.ini
 
 # Python virtual environments (local tooling only)
 .venv/
+
+# Locally installed Python runtime/cache used by tests (generated, not app source)
+/server/Python/

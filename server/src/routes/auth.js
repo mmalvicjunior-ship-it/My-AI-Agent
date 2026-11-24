@@ -465,7 +465,14 @@ export function createAuthRouter({ db }) {
         error: 'Authentication required.',
       });
     }
-    return res.json({ ok: true, user: publicUser(user) });
+    // Renewed expiry is metadata only (never a token or secret). The web client
+    // stores it so browser refreshes reflect the current DB-backed session.
+    return res.json({
+      ok: true,
+      user: publicUser(user),
+      expiresAt: user.expiresAt,
+      absoluteExpiresAt: user.absoluteExpiresAt,
+    });
   });
 
   return router;

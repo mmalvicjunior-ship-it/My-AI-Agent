@@ -5,11 +5,16 @@ import { ensureResultColumn } from '../proposals/store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
-import { createPostgresDb, POSTGRES_SCHEMA_SQL } from '../storage/postgres-db.js';
+import {
+  createPostgresDb,
+  ensureSessionAbsoluteExpiryColumn,
+  POSTGRES_SCHEMA_SQL,
+} from '../storage/postgres-db.js';
 
 function openPersistentDb() {
   const db = createPostgresDb(config);
   db.exec(POSTGRES_SCHEMA_SQL);
+  ensureSessionAbsoluteExpiryColumn(db);
   // Roles are never inferred at startup. The first administrator is created
   // only by the owner-only /api/auth/admin/provision endpoint.
   ensurePlanColumn(db);
@@ -131,6 +136,14 @@ export function openDb() {
       last_used_at TEXT
     );
   `);
+  // Additive migration for databases created before bounded sliding renewal.
+  // Existing sessions keep their old hard expiry as the absolute cap; they do
+  // not silently gain a longer lifetime.
+  const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all();
+  if (!sessionColumns.some((column) => column.name === 'absolute_expires_at')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN absolute_expires_at TEXT');
+  }
+  db.exec('UPDATE sessions SET absolute_expires_at = expires_at WHERE absolute_expires_at IS NULL');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id)');
 
   db.exec(`

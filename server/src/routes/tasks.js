@@ -50,15 +50,37 @@ function parseProposalResult(raw) {
   }
 }
 
+function safeRecovery(plan) {
+  const rec = plan?.recovery;
+  if (!rec || typeof rec !== 'object') return null;
+  const reason = typeof rec.reason === 'string' ? rec.reason.slice(0, 120) : null;
+  const nextRetryAt = typeof rec.nextRetryAt === 'string' ? rec.nextRetryAt : null;
+  const pausedAt = typeof rec.pausedAt === 'string' ? rec.pausedAt : null;
+  const retryAttempt = Number.isFinite(Number(rec.retryAttempt)) ? Number(rec.retryAttempt) : null;
+  if (!reason && !nextRetryAt && !pausedAt && retryAttempt === null) return null;
+  return {
+    ...(reason ? { reason } : {}),
+    ...(nextRetryAt ? { nextRetryAt } : {}),
+    ...(pausedAt ? { pausedAt } : {}),
+    ...(retryAttempt !== null ? { retryAttempt } : {}),
+  };
+}
+
 /**
  * Task rows contain the full saved plan, which can include proposed file
  * contents. Never send it over HTTP: expose only the linked proposal ids the
- * Task Center needs to match pending proposals.
+ * Task Center needs to match pending proposals, plus safe recovery metadata.
  */
 function publicTask(db, task) {
   if (!task || typeof task !== 'object') return task;
+  const plan = loadPlan(db, task.id);
   const { plan_json: _planJson, ...safe } = task;
-  return { ...safe, linkedProposalIds: linkedProposalIds(loadPlan(db, task.id)) };
+  const recovery = safeRecovery(plan);
+  return {
+    ...safe,
+    linkedProposalIds: linkedProposalIds(plan),
+    ...(recovery ? { recovery } : {}),
+  };
 }
 
 /**

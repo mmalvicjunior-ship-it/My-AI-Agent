@@ -3,10 +3,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 /**
  * Project creation dialog.
  *
- * Two safe paths:
- *  - "New workspace": the server creates an isolated folder under WORKSPACE_ROOT.
+ * Two safe paths. "Existing folder" is the default because opening a project
+ * the user already has is the normal starting point:
  *  - "Existing folder": the user picks a directory through the server's
  *    read-only browser, which only lists folders inside PROJECT_IMPORT_ROOT.
+ *  - "New workspace": the server creates an isolated folder under WORKSPACE_ROOT.
  *
  * Nothing here bypasses the server's path checks; the dialog only makes the
  * existing validation understandable.
@@ -20,7 +21,7 @@ export default function ProjectDialog({
   busy = false,
   error = null,
 }) {
-  const [mode, setMode] = useState('new');
+  const [mode, setMode] = useState('existing');
   const [name, setName] = useState('');
   const [folder, setFolder] = useState('');
   const [browse, setBrowse] = useState(null);
@@ -52,7 +53,7 @@ export default function ProjectDialog({
 
   useEffect(() => {
     if (!open) return;
-    setMode('new');
+    setMode('existing');
     setName('');
     setFolder('');
     setBrowse(null);
@@ -108,22 +109,13 @@ export default function ProjectDialog({
         <header className="dialog-head">
           <div>
             <span className="dialog-eyebrow">Workspace</span>
-            <h2 id="project-dialog-title">Add a project</h2>
-            <p>The agent can only inspect and change the project you select here.</p>
+            <h2 id="project-dialog-title">Open a project</h2>
+            <p>Choose an existing folder to start scanning, or create a new workspace. The agent can only inspect the project you select here.</p>
           </div>
           <button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="Close">×</button>
         </header>
 
         <div className="dialog-tabs" role="tablist" aria-label="Project source">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={mode === 'new'}
-            className={mode === 'new' ? 'active' : ''}
-            onClick={() => { setMode('new'); setLocalError(null); }}
-          >
-            New workspace
-          </button>
           <button
             type="button"
             role="tab"
@@ -136,6 +128,15 @@ export default function ProjectDialog({
             }}
           >
             Existing folder
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'new'}
+            className={mode === 'new' ? 'active' : ''}
+            onClick={() => { setMode('new'); setLocalError(null); }}
+          >
+            New workspace
           </button>
         </div>
 
@@ -223,7 +224,7 @@ export default function ProjectDialog({
           <footer className="dialog-actions">
             <button type="button" className="ghost-button" onClick={onClose} disabled={busy}>Cancel</button>
             <button type="submit" className="primary-button" disabled={busy}>
-              {busy ? 'Adding…' : mode === 'existing' ? 'Add existing project' : 'Create project'}
+              {busy ? 'Opening…' : mode === 'existing' ? 'Open project' : 'Create project'}
             </button>
           </footer>
         </form>

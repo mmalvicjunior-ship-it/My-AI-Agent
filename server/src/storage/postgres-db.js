@@ -41,11 +41,12 @@ export const POSTGRES_SCHEMA_SQL = `
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
-    token_hash   TEXT PRIMARY KEY,
-    user_id      BIGINT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT (${NOW}),
-    expires_at   TEXT NOT NULL,
-    last_used_at TEXT
+    token_hash           TEXT PRIMARY KEY,
+    user_id              BIGINT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (${NOW}),
+    expires_at           TEXT NOT NULL,
+    absolute_expires_at  TEXT,
+    last_used_at         TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 
@@ -119,6 +120,16 @@ export const POSTGRES_SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_proposals_project_status
     ON proposals (project_id, status, created_at);
 `;
+
+/**
+ * Additive migration for persistent stores created before bounded sliding
+ * renewal. Existing sessions retain their old hard expiry as the cap instead
+ * of being silently extended.
+ */
+export function ensureSessionAbsoluteExpiryColumn(db) {
+  db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS absolute_expires_at TEXT');
+  db.exec('UPDATE sessions SET absolute_expires_at = expires_at WHERE absolute_expires_at IS NULL');
+}
 
 export function createPostgresDb(config) {
   const backend = config.databaseBackend === 'pglite' ? 'pglite' : 'pg';

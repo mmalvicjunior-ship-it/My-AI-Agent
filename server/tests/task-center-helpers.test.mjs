@@ -7,11 +7,13 @@ import {
   diffLines,
   isProposalActionable,
   linkedProposalIds,
+  nextProviderRetryAt,
   normalizeDecisionError,
   pendingCountForTask,
   proposalDecisionLabel,
   proposalStatusLabel,
   proposalTypeLabel,
+  providerRecoveryLabel,
 } from '../../apps/web/src/taskProposalHelpers.js';
 
 test('linkedProposalIds handles plan strings, object entries, and malformed plans', () => {
@@ -86,6 +88,37 @@ test('normalizeDecisionError maps authorization, expiry, server, and network fai
   assert.equal(normalizeDecisionError({ status: 503 }).code, 'server');
   assert.equal(normalizeDecisionError(new Error('custom')).message, 'custom');
   assert.equal(normalizeDecisionError(null).code, 'network');
+});
+
+test('provider recovery helpers present paused tasks with retry timing', () => {
+  const retryAt = '2026-11-23T12:00:00.000Z';
+  const rate = { reason: 'provider_rate_limited', nextRetryAt: retryAt };
+  const quota = { reason: 'provider_quota_exhausted' };
+
+  assert.match(providerRecoveryLabel(rate), /Rate limited/);
+  assert.match(providerRecoveryLabel(rate), /automatic retry/i);
+  assert.match(providerRecoveryLabel(quota), /Quota exhausted/);
+  assert.equal(providerRecoveryLabel(null), null);
+  assert.equal(nextProviderRetryAt([
+    { status: 'provider_paused', recovery: { nextRetryAt: retryAt } },
+    { status: 'provider_paused', recovery: { nextRetryAt: '2026-11-23T11:00:00.000Z' } },
+    { status: 'completed', recovery: { nextRetryAt: '2026-11-23T10:00:00.000Z' } },
+  ]), '2026-11-23T11:00:00.000Z');
+  assert.equal(nextProviderRetryAt([]), null);
+});
+
+test('terminal provider recovery never promises another automatic retry', () => {
+  const exhausted = { reason: 'provider_rate_limited', retryAttempt: 5, nextRetryAt: '2026-11-23T12:00:00.000Z' };
+  const quota = { reason: 'provider_quota_exhausted', terminal: true, nextRetryAt: '2026-11-23T12:00:00.000Z' };
+
+  assert.match(providerRecoveryLabel(exhausted), /automatic retries stopped/i);
+  assert.doesNotMatch(providerRecoveryLabel(exhausted), /automatic retry [^s]/i);
+  assert.match(providerRecoveryLabel(quota), /automatic retries stopped/i);
+  assert.doesNotMatch(providerRecoveryLabel(quota), /automatic retry [^s]/i);
+  assert.equal(nextProviderRetryAt([
+    { status: 'provider_paused', recovery: exhausted },
+    { status: 'provider_paused', recovery: quota },
+  ]), null);
 });
 
 test('diffLines classifies unified diff rows and caps long output', () => {

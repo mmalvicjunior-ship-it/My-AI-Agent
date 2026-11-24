@@ -10,20 +10,22 @@
 // the second, so a hallucinated create_file/propose_file_change/run_command call
 // is refused before it can reach the proposal store or spawn a process.
 //
-// Retry policy: at most three provider attempts (two retries) for transient
-// failures only (HTTP 429, 502, 504). Auth/configuration errors, malformed
-// responses, tool-support failures, and cancellation are never retried.
-import { setTimeout as delay } from 'node:timers/promises';
+// Retry policy: the shared ai/retry-policy.js budget is authoritative. The
+// executor no longer keeps an independent provider retry loop; it threads the
+// same retryState through every adapter call and trusts `retryable: false`.
 import { redactSecrets } from '../config.js';
 import { supportsWorkspaceTools } from '../ai/index.js';
 import { WorkspaceError } from '../workspace/files.js';
+import { rejectProposal } from '../proposals/store.js';
+import {
+  RETRY_POLICY,
+  normalizeRetryState,
+  reportedRetryState,
+} from '../ai/retry-policy.js';
 import { loadPlan, refreshPlanProgress, savePlan } from './store.js';
 import { describePlan, sanitizePlan, buildPlanMetadata, parseJsonReply } from './plan.js';
 
 const READ_ONLY_TOOLS = new Set(['read_file', 'list_files', 'search_files']);
-const MAX_PROVIDER_ATTEMPTS = 3;
-const DEFAULT_RETRY_DELAYS_MS = [2_000, 5_000];
-const MAX_RETRY_DELAY_MS = 30_000;
 const MAX_RESULT_CHARS = 10_000;
 const MAX_STEP_DETAIL_CHARS = 500;
 const MAX_TITLE_VALUE_CHARS = 80;
@@ -70,6 +72,17 @@ function clip(value, max) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+/** Cancellation must not leave a staged proposal that nobody will ever review. */
+function discardStagedProposal(db, projectId, proposal) {
+  const id = proposal?.id || proposal?.proposalId;
+  if (typeof id !== 'string' || !id) return false;
+  try {
+    return rejectProposal(db, projectId, id);
+  } catch {
+    return false;
+  }
+}
+
 /** Public, redacted provider failure text suitable for the task error column. */
 function providerFailureMessage(error) {
   const message = typeof error?.publicMessage === 'string'
@@ -79,8 +92,15 @@ function providerFailureMessage(error) {
 }
 
 function isRetryable(error) {
+  if (error?.retryable === false) return false;
+  // A whole-call retry would re-run tools that already executed.
+  if (Array.isArray(error?.toolActivity) && error.toolActivity.length > 0) return false;
   const status = Number(error?.statusCode);
-  return status === 429 || status === 502 || status === 504;
+  const category = String(error?.category || error?.errorType || '');
+  if (['INVALID_API_KEY', 'REQUEST_ERROR', 'QUOTA_EXHAUSTED'].includes(category)) return false;
+  if ([401, 403, 400, 404, 422].includes(status)) return false;
+  if (status === 429 || status === 502 || status === 503 || status === 504) return true;
+  return ['RATE_LIMITED', 'CAPACITY_UNAVAILABLE', 'PROVIDER_ERROR', 'NETWORK_TIMEOUT', 'NETWORK_ERROR'].includes(category);
 }
 
 function toolTitle(name, args = {}) {
@@ -212,12 +232,13 @@ export function createTaskExecutor({
   db,
   provider = null,
   tools = null,
-  retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
+  retryDelaysMs,
   logger = console,
 } = {}) {
-  const delays = Array.isArray(retryDelaysMs) && retryDelaysMs.length > 0
-    ? retryDelaysMs
-    : DEFAULT_RETRY_DELAYS_MS;
+  // `retryDelaysMs` is kept for caller compatibility. Retry timing is now
+  // owned by the task runner so long provider cooldowns are persisted instead
+  // of being spent as in-process sleeps.
+  void retryDelaysMs;
 
   /**
    * Finalizes a task whose staged proposals have all reached a terminal state.
@@ -366,6 +387,9 @@ export function createTaskExecutor({
     if (!provider || typeof provider.chat !== 'function') {
       const error = new Error('No AI provider is configured for background tasks.');
       error.statusCode = 503;
+      error.category = 'REQUEST_ERROR';
+      error.retryable = false;
+      error.fallbackEligible = false;
       error.publicMessage = 'No AI provider is configured. Select a tool-capable provider and restart the server.';
       throw error;
     }
@@ -375,6 +399,9 @@ export function createTaskExecutor({
       const message = `The configured AI provider (${providerLabel}) does not support workspace tools, so background tasks cannot inspect project files. Configure the OpenAI-compatible or Gemini provider.`;
       const error = new Error(message);
       error.statusCode = 503;
+      error.category = 'REQUEST_ERROR';
+      error.retryable = false;
+      error.fallbackEligible = false;
       error.publicMessage = message;
       throw error;
     }
@@ -408,6 +435,26 @@ export function createTaskExecutor({
     // Load any previously saved plan metadata (decision E: brief redacted
     // summary in the first step) and check whether the plan is complete.
     const savedPlan = loadPlan(db, task.id);
+    // One retry budget for this entire executor run, resumed from a paused task.
+    const persistedRetry = savedPlan?.recovery?.retryState ?? {
+      attemptsUsed: savedPlan?.recovery?.retryAttempt ?? 0,
+      exhausted: savedPlan?.recovery?.retryAttempt >= RETRY_POLICY.maxProviderAttempts,
+    };
+    let retryState = normalizeRetryState(persistedRetry);
+    if (retryState.exhausted) {
+      const message = 'The provider retry budget is already exhausted for this task. No further provider requests were made.';
+      addStep({
+        kind: 'note',
+        title: 'Provider retry budget exhausted',
+        detail: message,
+        status: 'failed',
+      });
+      const error = new Error(message);
+      error.category = 'RETRY_EXHAUSTED';
+      error.retryable = false;
+      error.retryState = retryState;
+      throw error;
+    }
     if (savedPlan && typeof savedPlan === 'object') {
       const metaSummary = (savedPlan.summary || '').trim();
       addStep({
@@ -454,6 +501,7 @@ export function createTaskExecutor({
     }
 
     async function stageOrderedStep(plan) {
+      if (signal?.aborted) throw cancelledError();
       const index = Number(plan.currentStep);
       const step = plan.steps[index];
       if (!step || !['create_file', 'propose_file_change', 'run_command'].includes(step.tool)) {
@@ -502,6 +550,15 @@ export function createTaskExecutor({
         throw new Error(`Ordered plan step ${index + 1} could not be staged: ${detail}`);
       }
 
+      if (signal?.aborted) {
+        discardStagedProposal(db, project.id, proposal);
+        addStep({
+          kind: 'note',
+          title: 'Staged change discarded',
+          detail: 'Cancellation was requested while the proposal was being staged; it was rejected without being applied.',
+        });
+        throw cancelledError();
+      }
       const proposalId = proposal?.id || proposal?.proposalId;
       if (typeof proposalId !== 'string' || !proposalId) {
         const message = `Ordered plan step ${index + 1} did not create a valid approval proposal.`;
@@ -636,9 +693,14 @@ export function createTaskExecutor({
 
     let lastError = null;
 
-    // Helper for the provider call that respects retry budget and cancellation.
+    // Helper for the provider call. The shared retry budget is threaded through
+    // every call so adapter/fallback retries cannot multiply the executor's
+    // attempts. Eligible transient failures are handed to the runner, which
+    // persists the remaining budget and resumes after the provider reset.
     async function safeChat(messages) {
-      for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt += 1) {
+      let attemptsUsed = retryState.attemptsUsed;
+      while (attemptsUsed < RETRY_POLICY.maxProviderAttempts) {
+        const callState = normalizeRetryState({ attemptsUsed, exhausted: false });
         try {
           const result = await provider.chat({
             messages,
@@ -647,38 +709,70 @@ export function createTaskExecutor({
             tools: activeTools,
             projectId: project.id,
             signal,
+            retryState: callState,
           });
           if (signal?.aborted || result?.text === undefined) throw cancelledError();
-          return { result, attempt };
+          const reported = reportedRetryState(result, callState);
+          // A result that explicitly reports the unchanged state made no HTTP
+          // request (for example a cooldown short-circuit). Only assume one
+          // consumed attempt when the provider reported no state at all.
+          const consumed = result?.retryState === undefined || result?.retryState === null
+            ? 1
+            : Math.max(0, reported.attemptsUsed - callState.attemptsUsed);
+          attemptsUsed = Math.min(
+            RETRY_POLICY.maxProviderAttempts,
+            callState.attemptsUsed + consumed,
+          );
+          retryState = normalizeRetryState({ attemptsUsed });
+          return { result, attempt: attemptsUsed };
         } catch (error) {
           if (signal?.aborted || error?.name === 'AbortError') throw cancelledError();
           lastError = error;
+          const reported = reportedRetryState(error, callState);
+          const consumed = error?.retryState === undefined || error?.retryState === null
+            ? 1
+            : Math.max(0, reported.attemptsUsed - callState.attemptsUsed);
+          attemptsUsed = Math.min(
+            RETRY_POLICY.maxProviderAttempts,
+            callState.attemptsUsed + consumed,
+          );
+          retryState = normalizeRetryState({ attemptsUsed });
           const msg = providerFailureMessage(error);
-          if (!isRetryable(error) || attempt >= MAX_PROVIDER_ATTEMPTS) {
+          const retryable = isRetryable(error);
+          const terminal = !retryable || retryState.exhausted;
+          if (terminal) {
             addStep({
               kind: 'note',
               title: 'Agent failed',
               detail: clip(msg, MAX_STEP_DETAIL_CHARS),
               status: 'failed',
             });
-            const failure = new Error(
-              attempt > 1 ? `${msg} (after ${attempt} attempts)` : msg,
-            );
-            failure.statusCode = error?.statusCode;
-            throw failure;
           }
-          const baseDelay = delays[attempt - 1] ?? delays[delays.length - 1] ?? 0;
-          const retryAfter = Number(error?.retryAfterMs);
-          const waitMs = Math.min(
-            MAX_RETRY_DELAY_MS,
-            Math.max(baseDelay, Number.isFinite(retryAfter) ? retryAfter : 0),
-          );
-          addStep({
-            kind: 'note',
-            title: `Retrying provider (${attempt + 1}/${MAX_PROVIDER_ATTEMPTS})`,
-            detail: `${clip(msg, MAX_STEP_DETAIL_CHARS)} Waiting ${waitMs} ms before retrying.`,
-          });
-          await delay(waitMs, undefined, { signal });
+          const finalMessage = attemptsUsed > 1
+            ? `${msg} (after ${attemptsUsed} attempts)`
+            : msg;
+          const failure = new Error(finalMessage);
+          failure.statusCode = error?.statusCode;
+          failure.category = error?.category;
+          failure.errorType = error?.errorType;
+          failure.publicMessage = finalMessage;
+          failure.retryable = retryable && !retryState.exhausted;
+          failure.fallbackEligible = error?.fallbackEligible;
+          failure.retryAfterMs = error?.retryAfterMs;
+          failure.retryAfterSeconds = error?.retryAfterSeconds;
+          failure.retryState = retryState;
+          failure.retryBudgetExhausted = retryState.exhausted;
+          if (Array.isArray(error?.toolActivity)) failure.toolActivity = error.toolActivity;
+          // providerDetails is already redacted by provider-error.js.
+          if (error?.providerDetails && typeof error.providerDetails === 'object') {
+            failure.providerDetails = error.providerDetails;
+          }
+          if (typeof error?.fallbackAttempted === 'boolean') {
+            failure.fallbackAttempted = error.fallbackAttempted;
+          }
+          // Retryable failures with no tool activity reach the runner with
+          // retryable=true so it can persist a schedule and resume later.
+          throw failure;
         }
       }
       throw lastError instanceof Error ? lastError : new Error('Background task failed.');
@@ -727,6 +821,12 @@ export function createTaskExecutor({
       });
       return { status: 'completed' };
     }
+
+    // The read-only inspection and the structured plan are two separate
+    // provider request phases. Tool rounds within each phase still consume the
+    // shared per-phase budget (including fallback), but a successful inspection
+    // must not leave plan generation with an already-exhausted state.
+    retryState = normalizeRetryState({ attemptsUsed: 0, exhausted: false });
 
     // Call 2: ask for the structured plan, informed by the inspection.
     const planMessages = [
@@ -814,6 +914,10 @@ export function createTaskExecutor({
     const stagingFailures = [];
 
     for (const change of sanitized.changes) {
+      if (signal?.aborted) {
+        proposalIds.forEach((entry) => discardStagedProposal(db, project.id, entry));
+        throw cancelledError();
+      }
       try {
         // The server-side staging path stages a proposal (does not write or run it).
         // It uses the existing proposal store and proposal state machine.
@@ -828,6 +932,10 @@ export function createTaskExecutor({
           content: change.content,
         });
         proposalIds.push({ id: proposal.id, kind: change.kind, path: change.path });
+        if (signal?.aborted) {
+          proposalIds.forEach((entry) => discardStagedProposal(db, project.id, entry));
+          throw cancelledError();
+        }
         addStep({
           kind: 'note',
           title: `Staged ${change.kind === 'update' ? 'update' : 'create'}`,
@@ -846,6 +954,10 @@ export function createTaskExecutor({
     }
 
     for (const command of sanitized.commands) {
+      if (signal?.aborted) {
+        proposalIds.forEach((entry) => discardStagedProposal(db, project.id, entry));
+        throw cancelledError();
+      }
       try {
         const proposal = tools.stageCommand ? await tools.stageCommand({
           projectId: project.id,
@@ -857,6 +969,10 @@ export function createTaskExecutor({
           path: command.path,
         });
         proposalIds.push({ id: proposal.id, kind: 'command', command: command.command, path: command.path });
+        if (signal?.aborted) {
+          proposalIds.forEach((entry) => discardStagedProposal(db, project.id, entry));
+          throw cancelledError();
+        }
         addStep({
           kind: 'note',
           title: `Staged command`,
@@ -871,6 +987,11 @@ export function createTaskExecutor({
           status: 'failed',
         });
       }
+    }
+
+    if (signal?.aborted) {
+      proposalIds.forEach((entry) => discardStagedProposal(db, project.id, entry));
+      throw cancelledError();
     }
 
     // Save only metadata (paths, kinds, proposal ids) — never file contents.

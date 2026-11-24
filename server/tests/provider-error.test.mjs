@@ -5,6 +5,7 @@ import {
   createProviderNetworkError,
   isFallbackEligibleProviderError,
   isRetryableProviderError,
+  retryAfterSeconds,
 } from '../src/ai/provider-error.js';
 
 function fakeResponse(status, payload, headers = {}) {
@@ -202,6 +203,42 @@ test('429 diagnostics redact secrets in allowlisted upstream metadata', async ()
   assert.equal(error.providerDetails.metadata.provider_code, '[redacted credential]');
   assert.ok(!JSON.stringify(error.providerDetails).includes(secret));
   assert.ok(!error.publicMessage.includes(secret));
+});
+
+test('429, 502, 503 and 504 are transient while invalid requests are not retried', async () => {
+  const transient = [];
+  for (const status of [429, 502, 503, 504]) {
+    const error = await createProviderHttpError(
+      fakeResponse(status, { error: { message: 'temporary provider problem' } }),
+      'OpenRouter',
+      'test-key',
+    );
+    transient.push(error);
+    assert.equal(error.retryable, true);
+    assert.equal(isRetryableProviderError(error), true);
+    assert.equal(isFallbackEligibleProviderError(error), true);
+  }
+  assert.deepEqual(transient.map((error) => error.category), [
+    'RATE_LIMITED',
+    'PROVIDER_ERROR',
+    'CAPACITY_UNAVAILABLE',
+    'PROVIDER_ERROR',
+  ]);
+
+  const badRequest = await createProviderHttpError(
+    fakeResponse(400, { error: { message: 'invalid request' } }),
+    'OpenRouter',
+    'test-key',
+  );
+  assert.equal(badRequest.category, 'REQUEST_ERROR');
+  assert.equal(isRetryableProviderError(badRequest), false);
+  assert.equal(isFallbackEligibleProviderError(badRequest), false);
+});
+
+test('Retry-After conversion is bounded and never negative', () => {
+  assert.equal(retryAfterSeconds(12_000), 12);
+  assert.equal(retryAfterSeconds(1), 1);
+  assert.equal(retryAfterSeconds(null), null);
 });
 
 test('X-RateLimit-Reset supplies retry timing when Retry-After is absent', async () => {

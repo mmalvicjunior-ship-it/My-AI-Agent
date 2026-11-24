@@ -8,22 +8,41 @@
 // resumed. We cannot know whether its last action landed, so it is marked
 // failed (or cancelled if it was already stopping) and the reason is recorded.
 import { redactSecrets } from '../config.js';
+import { RETRY_POLICY, cappedRetryAfterMs } from '../ai/retry-policy.js';
 import {
   INTERRUPTED_ERROR,
   appendStep,
   claimNextQueued,
   claimReadyWaitingTask,
   claimRecoverableTask,
+  failExhaustedRecoverableTasks,
   finishTask,
   loadPlan,
   savePlan,
   isCancelRequested,
+  rejectTaskProposals,
+  setProviderPaused,
   setWaitingApproval,
   getTask,
 } from './store.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_CANCEL_POLL_MS = 250;
+const DEFAULT_RETRY_DELAY_MS = 60_000;
+const MAX_RETRY_DELAY_MS = 300_000;
+
+function recoveryDelayMs(error) {
+  // Provider-supplied resets are authoritative but bounded separately from
+  // interactive waits so a malicious header cannot pause a task for a year.
+  const resetMs = cappedRetryAfterMs(error?.retryAfterMs, RETRY_POLICY.taskRetryAfterCapMs);
+  if (resetMs !== null) return Math.max(DEFAULT_RETRY_DELAY_MS, resetMs);
+  const retryAttempt = Math.min(
+    Math.max(Number(error?.retryAttempt) || 1, 1),
+    RETRY_POLICY.maxRecoveryAttempts,
+  );
+  const exponential = DEFAULT_RETRY_DELAY_MS * (2 ** (retryAttempt - 1));
+  return Math.min(MAX_RETRY_DELAY_MS, exponential);
+}
 
 /** Safe provider-status check for OpenRouter only (verified endpoint/auth).
  * Never exposes key in logs; uses timeout; never assumes quota is restored.
@@ -71,12 +90,33 @@ export function createTaskRunner({
   const controllers = new Map();
 
   function finishCancelled(taskId) {
+    const current = getTask(db, taskId);
+    if (current?.status === 'cancelled') return current;
+    // Cancellation may land after an executor staged a proposal but before the
+    // waiting_approval transition. Reject it here so nothing remains reviewable.
+    rejectTaskProposals(db, taskId);
     appendStep(db, taskId, {
       kind: 'note',
       title: 'Cancelled',
       detail: 'Stopped at your request. Nothing after the last recorded step was executed.',
     });
     return finishTask(db, taskId, 'cancelled');
+  }
+
+  /** Terminal writes must not overwrite a cancellation that landed mid-race. */
+  function finishTerminal(taskId, status, error = null) {
+    const finished = finishTask(db, taskId, status, error, { requireNoCancel: true });
+    return finished || finishCancelled(taskId);
+  }
+
+  function finishProviderFailure(taskId, title, detail) {
+    appendStep(db, taskId, {
+      kind: 'note',
+      title,
+      detail: redactSecrets(detail).slice(0, 500),
+      status: 'failed',
+    });
+    return finishTerminal(taskId, 'failed', detail);
   }
 
   /**
@@ -148,91 +188,150 @@ export function createTaskRunner({
       }
       if (outcome && outcome.status === 'waiting_approval') {
         const updated = setWaitingApproval(db, task.id);
-        if (updated) appendStep(db, task.id, {
-          kind: 'note',
-          title: 'Waiting for approval',
-          detail: 'Staged proposals are awaiting user review.',
-          status: 'done',
-        });
-        return updated || task;
+        if (updated) {
+          appendStep(db, task.id, {
+            kind: 'note',
+            title: 'Waiting for approval',
+            detail: 'Staged proposals are awaiting user review.',
+            status: 'done',
+          });
+          return updated;
+        }
+        // A cancellation landed between the executor result and this write.
+        return finishCancelled(task.id);
       }
       if (outcome && outcome.status === 'failed') {
-        return finishTask(
-          db,
+        return finishTerminal(
           task.id,
           'failed',
           outcome.error || 'The task could not complete all requested steps.',
         );
       }
-      return finishTask(db, task.id, 'completed');
+      return finishTerminal(task.id, 'completed');
     } catch (error) {
       if (controller.signal.aborted || isCancelRequested(db, task.id)) {
         return finishCancelled(task.id);
       }
       const message = error?.message || String(error);
-      // Quota / provider-capacity pause: persist recovery state instead of hard failure
-      const statusCode = error?.statusCode;
-      const errorType = error?.errorType;
-      const isQuota = statusCode === 429 || statusCode === 402;
-      const isQuotaExhausted = errorType === 'QUOTA_EXHAUSTED' || (isQuota && /quota|credit|budget|insufficient|free-models-per-day/i.test(message || ''));
-      const isRateLimited = errorType === 'RATE_LIMITED' || (statusCode === 429 && !isQuotaExhausted);
+      const statusCode = Number(error?.statusCode);
+      const category = String(error?.category || error?.errorType || '');
+      const isInvalidKey = category === 'INVALID_API_KEY' || [401, 403].includes(statusCode);
+      const isInvalidRequest = category === 'REQUEST_ERROR' || [400, 404, 422].includes(statusCode);
+      const isQuotaExhausted = category === 'QUOTA_EXHAUSTED'
+        || statusCode === 402
+        || (statusCode === 429 && /quota|credit|budget|insufficient|free-models-per-day/i.test(message || ''));
+      const isRateLimited = category === 'RATE_LIMITED' || (statusCode === 429 && !isQuotaExhausted);
+      const isTransientProviderFailure = category === 'CAPACITY_UNAVAILABLE'
+        || category === 'PROVIDER_ERROR'
+        || category === 'NETWORK_TIMEOUT'
+        || category === 'NETWORK_ERROR'
+        || [502, 503, 504].includes(statusCode);
 
-      // Rate-limit: bounded exponential backoff with jitter; honor Retry-After.
-      if (isRateLimited) {
-        const baseDelayMs = error?.retryAfterMs || 60_000; // configurable default 60s when provider gives no Retry-After
-        const maxDelayMs = 300_000; // 5 minutes cap
-        const jitterMs = Math.round(Math.random() * 5000); // small jitter to avoid thundering herd
-        const retryMs = Math.min(maxDelayMs, Math.max(baseDelayMs, baseDelayMs * 2)); // bounded growth on repeated limits
+      if (isInvalidKey || isInvalidRequest) {
+        const clearMsg = (error?.publicMessage || message).slice(0, 500);
+        appendStep(db, task.id, {
+          kind: 'note',
+          title: 'Run failed',
+          detail: redactSecrets(clearMsg),
+          status: 'failed',
+        });
+        return finishTerminal(task.id, 'failed', clearMsg);
+      }
+
+      const clearMsg = redactSecrets((error?.publicMessage || message).slice(0, 500));
+
+      if (isRateLimited || isTransientProviderFailure) {
+        const plan = loadPlan(db, task.id) || {};
+        const sharedState = error?.retryState || plan.recovery?.retryState || null;
+        const usedFromState = Number(sharedState?.attemptsUsed);
+        const previousAttempt = Math.min(
+          Number(plan.recovery?.retryAttempt || 0),
+          RETRY_POLICY.maxRecoveryAttempts,
+        );
+        // A cooldown short-circuit consumes no HTTP attempt, so the shared
+        // attempt count alone cannot bound pause/resume cycles. Use the greater
+        // of the HTTP budget used and the prior recovery cycle + 1.
+        const retryAttempt = Math.min(
+          RETRY_POLICY.maxRecoveryAttempts,
+          Number.isFinite(usedFromState)
+            ? Math.max(usedFromState, previousAttempt + 1)
+            : previousAttempt + 1,
+        );
+
+        if (error?.retryable === false || retryAttempt >= RETRY_POLICY.maxRecoveryAttempts) {
+          const detail = `${clearMsg} Automatic provider recovery reached its limit; the task was not completed.`;
+          plan.recovery = {
+            ...(plan.recovery || {}),
+            reason: 'provider_recovery_exhausted',
+            category: category || 'PROVIDER_ERROR',
+            lastError: redactSecrets(message).slice(0, 500),
+            retryAttempt: RETRY_POLICY.maxRecoveryAttempts,
+            retryState: sharedState || { attemptsUsed: RETRY_POLICY.maxProviderAttempts, exhausted: true },
+            terminal: true,
+            pausedAt: new Date().toISOString(),
+          };
+          savePlan(db, task.id, plan);
+          return finishProviderFailure(
+            task.id,
+            'Provider recovery exhausted',
+            detail,
+          );
+        }
+
+        const jitterMs = Math.round(Math.random() * 5000);
+        const retryMs = recoveryDelayMs({ ...error, retryAttempt }) + jitterMs;
         const recovery = {
           reason: 'provider_rate_limited',
-          lastError: message.slice(0, 500),
-          retryAttempt: Math.min(Number(error?.retryAttempt || 0) + 1, 5),
+          category: category || (isRateLimited ? 'RATE_LIMITED' : 'PROVIDER_ERROR'),
+          lastError: redactSecrets(message).slice(0, 500),
+          retryAttempt,
+          retryState: sharedState || { attemptsUsed: retryAttempt, exhausted: false },
           nextRetryAt: new Date(Date.now() + retryMs).toISOString(),
           pausedAt: new Date().toISOString(),
         };
-        const plan = loadPlan(db, task.id) || {};
         plan.recovery = { ...(plan.recovery || {}), ...recovery };
-        savePlan(db, task.id, plan);
-        const clearMsg = (error?.publicMessage || message).slice(0, 500);
-        db.prepare("UPDATE tasks SET status = 'provider_paused', error = ?, updated_at = datetime('now') WHERE id = ?").run(clearMsg, task.id);
+        const paused = setProviderPaused(db, task.id, {
+          error: clearMsg,
+          recovery: plan.recovery,
+        });
+        if (!paused) return finishCancelled(task.id);
         appendStep(db, task.id, {
           kind: 'note',
-          title: 'Provider rate limited',
-          detail: `Task paused: ${(error?.publicMessage || message).slice(0, 200)}. Retry scheduled (${retryMs}ms).`,
+          title: isRateLimited ? 'Provider rate limited' : 'Provider temporarily unavailable',
+          detail: `Task paused: ${clearMsg.slice(0, 200)}. Automatic retry #${retryAttempt} scheduled in ${retryMs}ms.`,
           status: 'done',
         });
-        return getTask(db, task.id);
+        return paused;
       }
 
-      // Quota exhaustion: stay paused; do not burn more quota with automatic retries.
+      // Quota exhaustion is terminal: retrying only burns more quota. The task
+      // fails with a safe explanation instead of remaining in a paused limbo.
       if (isQuotaExhausted) {
-        const recovery = {
-          reason: 'provider_quota_exhausted',
-          lastError: message.slice(0, 500),
-          retryAttempt: 3,
-          nextRetryAt: error?.retryAfterMs ? new Date(Date.now() + error.retryAfterMs).toISOString() : null,
-          pausedAt: new Date().toISOString(),
-        };
+        const retryAfterMs = cappedRetryAfterMs(error?.retryAfterMs, RETRY_POLICY.taskRetryAfterCapMs);
         const plan = loadPlan(db, task.id) || {};
-        plan.recovery = { ...(plan.recovery || {}), ...recovery };
+        plan.recovery = {
+          ...(plan.recovery || {}),
+          reason: 'provider_quota_exhausted',
+          category: 'QUOTA_EXHAUSTED',
+          lastError: redactSecrets(message).slice(0, 500),
+          retryAttempt: RETRY_POLICY.maxRecoveryAttempts,
+          retryState: error?.retryState || plan.recovery?.retryState
+            || { attemptsUsed: RETRY_POLICY.maxProviderAttempts, exhausted: true },
+          terminal: true,
+          pausedAt: new Date().toISOString(),
+          ...(retryAfterMs === null ? {} : { providerRetryAfterMs: retryAfterMs }),
+        };
         savePlan(db, task.id, plan);
-        const clearMsg = (error?.publicMessage || message).slice(0, 500);
-        db.prepare("UPDATE tasks SET status = 'provider_paused', error = ?, updated_at = datetime('now') WHERE id = ?").run(clearMsg, task.id);
-        appendStep(db, task.id, {
-          kind: 'note',
-          title: 'Provider quota reached',
-          detail: `Task paused: ${(error?.publicMessage || message).slice(0, 200)}. Retry when provider is available (retryAfter: ${error?.retryAfterMs ?? 'unknown'} ms).`,
-          status: 'done',
-        });
-        return getTask(db, task.id);
+        const detail = `${clearMsg} Provider quota is exhausted; automatic retries were stopped to avoid further rejected requests.`;
+        return finishProviderFailure(task.id, 'Provider quota reached', detail);
       }
       appendStep(db, task.id, {
         kind: 'note',
         title: 'Run failed',
-        detail: redactSecrets(message),
+        detail: clearMsg,
         status: 'failed',
       });
-      return finishTask(db, task.id, 'failed', message);
+      return finishTerminal(task.id, 'failed', clearMsg);
     } finally {
       clearInterval(watcher);
       controllers.delete(task.id);
@@ -247,6 +346,7 @@ export function createTaskRunner({
     if (busy || stopped) return null;
     busy = true;
     try {
+      failExhaustedRecoverableTasks(db);
       const waitingTask = claimReadyWaitingTask(db);
       if (waitingTask) {
         logger?.info?.(`[tasks] resuming task ${waitingTask.id} (finalize)`);

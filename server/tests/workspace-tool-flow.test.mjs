@@ -328,7 +328,7 @@ test('web client keeps the workspace signal and hides workspace starters without
   );
   assert.match(source, /workspace: result\.workspace \|\| null/);
   assert.match(source, /workspaceStatusMessage\(message\.workspace\)/);
-  assert.match(source, /\(activeProject \? starters : \[\]\)/);
+  assert.match(source, /\(visibleProject && workspaceSelection\.ready \? starters : \[\]\)/);
   assert.match(source, /activity\.detail/);
 });
 

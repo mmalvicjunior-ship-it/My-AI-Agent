@@ -67,6 +67,78 @@ export function shouldClearWorkspaceForAuthChange(previousUserId, nextUserId) {
   return previousUserId !== nextUserId;
 }
 
+/**
+ * A renewal result may only be applied if the account/token and transition
+ * generation are unchanged. This is what makes sign-out or account switching
+ * during an in-flight renewal safe.
+ */
+export function shouldApplyRenewalResult({
+  result = null,
+  generationAtStart = 0,
+  currentGeneration = 0,
+  requestToken = null,
+  currentToken = null,
+} = {}) {
+  if (!result || result.status === 'in_flight' || result.status === 'superseded' || result.status === 'no_token') return false;
+  if (generationAtStart !== currentGeneration) return false;
+  return Boolean(requestToken) && currentToken === requestToken;
+}
+
+/**
+ * Renews the existing DB-backed session through the already-public /api/auth/me
+ * endpoint. This is not a new token system: the same bearer token is verified,
+ * and the server extends its already-bounded expiry. The single-flight guard
+ * prevents repeated requests on browser refresh/StrictMode, and the identity
+ * check prevents a response for another account from restoring its workspace.
+ */
+export async function renewExistingSession({
+  token,
+  expectedUserId = null,
+  apiBase = '',
+  endpoint = '/api/auth/me',
+  fetchImpl = globalThis.fetch,
+  state = null,
+} = {}) {
+  if (typeof token !== 'string' || !token) return { status: 'no_token' };
+  const guard = state || {};
+  if (guard.inFlightToken === token) return { status: 'in_flight' };
+  if (guard.inFlightToken) return { status: 'superseded' };
+  guard.inFlightToken = token;
+  try {
+    let response;
+    try {
+      response = await fetchImpl(`${apiBase}${endpoint}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // A network failure keeps the stored session for a later user-initiated
+      // retry; it must never trigger an automatic refresh loop.
+      return { status: 'unavailable' };
+    }
+    if (response.status === 401) return { status: 'invalid', reason: 'auth_required' };
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      return { status: 'unavailable' };
+    }
+    if (!response.ok || !data?.ok || !data.user) return { status: 'unavailable' };
+    if (expectedUserId !== null && expectedUserId !== undefined
+      && data.user.id !== null && data.user.id !== undefined
+      && String(expectedUserId) !== String(data.user.id)) {
+      return { status: 'invalid', reason: 'identity_mismatch' };
+    }
+    return {
+      status: 'authenticated',
+      user: data.user,
+      expiresAt: data.expiresAt ?? undefined,
+      absoluteExpiresAt: data.absoluteExpiresAt ?? undefined,
+    };
+  } finally {
+    guard.inFlightToken = null;
+  }
+}
+
 // Module-level dedupe keeps React StrictMode's development remount from
 // verifying/consuming the same one-time callback token twice. It is reset only
 // by a full page load or by the exported test helper.
@@ -89,6 +161,7 @@ export function createAuthCallbackRunner({
   onAuthenticated = () => {},
   onError = () => {},
   clearHash = () => {},
+  getTransitionGeneration = () => 0,
 } = {}) {
   return {
     async run(hash) {
@@ -102,9 +175,11 @@ export function createAuthCallbackRunner({
         return { status: 'duplicate' };
       }
       activeCallbackKey = key;
+      const transitionGeneration = getTransitionGeneration();
 
       try {
         if (callback.error) {
+          if (getTransitionGeneration() !== transitionGeneration) return { status: 'stale' };
           onError(googleErrorMessage(callback.error));
           if (shouldClearAuthHash({ error: callback.error })) clearHash();
           completedCallbackKeys.add(key);
@@ -123,6 +198,7 @@ export function createAuthCallbackRunner({
           return { status: 'verification_failed' };
         }
 
+        if (getTransitionGeneration() !== transitionGeneration) return { status: 'stale' };
         if (!response.ok || !data?.ok || !data.user) {
           onError('Could not verify the Google session.');
           return { status: 'verification_failed' };

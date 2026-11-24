@@ -17,6 +17,7 @@ function tempDb() {
   const db = new DatabaseSync(p);
   db.exec(`CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, instruction TEXT NOT NULL, autonomy TEXT NOT NULL DEFAULT 'allow_writes_and_commands', status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'waiting_approval', 'provider_paused', 'completed', 'failed', 'cancelled')), last_step TEXT, error TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0, plan_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), started_at TEXT, finished_at TEXT)`);
   db.exec(`CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, root_path TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS task_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, detail TEXT, status TEXT NOT NULL DEFAULT 'done', created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
   return db;
 }
 
@@ -53,4 +54,31 @@ test('claimRecoverableTask resumes only when retryAfter passed', async () => {
   savePlan(db, task.id, plan);
   const claimed = claimRecoverableTask(db);
   assert.equal(claimed, null, 'should not resume when retry time is future');
+});
+
+test('legacy paused quota rows are terminalized and cannot be claimed', async () => {
+  const db = tempDb();
+  const proj = makeProject('quota-legacy', db);
+  const task = createTask(db, { projectId: proj.id, instruction: 'legacy quota row' });
+  db.prepare("UPDATE tasks SET status = 'provider_paused' WHERE id = ?").run(task.id);
+  // Old-format persisted pause: quota reason, high retryAttempt and a reset
+  // time that has already passed. Resuming it would burn more quota.
+  savePlan(db, task.id, {
+    recovery: {
+      reason: 'provider_quota_exhausted',
+      retryAttempt: 3,
+      nextRetryAt: new Date(Date.now() - 1000).toISOString(),
+      pausedAt: new Date(Date.now() - 3600000).toISOString(),
+    },
+  });
+
+  assert.equal(claimRecoverableTask(db), null, 'legacy quota rows must never be claimed');
+
+  const failed = getTask(db, task.id);
+  assert.equal(failed.status, 'failed');
+  const recovery = loadPlan(db, task.id).recovery;
+  assert.equal(recovery.reason, 'provider_quota_exhausted');
+  assert.equal(recovery.terminal, true);
+  assert.equal(recovery.nextRetryAt, undefined);
+  assert.equal(claimRecoverableTask(db), null, 'a terminal row stays terminal');
 });

@@ -8,8 +8,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { openDb } from '../src/db/index.js';
+import { consumeProviderAttempt, normalizeRetryState } from '../src/ai/retry-policy.js';
 import { createWorkspaceTools } from '../src/ai/tools.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
 import { createTaskRunner } from '../src/tasks/runner.js';
@@ -64,31 +66,138 @@ function makePlanProvider(plan) {
 }
 
 function makeExecutor(provider, options = {}) {
+  const { db: executorDb = db, ...rest } = options;
   return createTaskExecutor({
-    db,
+    db: executorDb,
     provider,
-    tools: createWorkspaceTools({ db }),
+    tools: createWorkspaceTools({ db: executorDb }),
     logger: silentLogger,
     retryDelaysMs: [0, 0],
-    ...options,
+    ...rest,
   });
 }
 
 function makeRunner(executor, options = {}) {
+  const { db: runnerDb = db, ...rest } = options;
   const runner = createTaskRunner({
-    db,
+    db: runnerDb,
     executor,
     logger: silentLogger,
     cancelPollMs: 10,
     pollIntervalMs: 10,
-    ...options,
+    ...rest,
   });
   runners.push(runner);
   return runner;
 }
 
+/** Isolated SQLite queue for tests that must not observe other top-level tests. */
+function makeIsolatedDb() {
+  const localDb = new DatabaseSync(':memory:');
+  localDb.exec(`
+    CREATE TABLE projects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      root_path TEXT,
+      owner_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      instruction TEXT NOT NULL,
+      autonomy TEXT NOT NULL DEFAULT 'propose',
+      autonomous INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'queued',
+      last_step TEXT,
+      error TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
+      plan_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      started_at TEXT,
+      finished_at TEXT
+    );
+    CREATE TABLE task_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      seq INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      detail TEXT,
+      status TEXT NOT NULL DEFAULT 'done',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE proposals (
+      id TEXT PRIMARY KEY,
+      project_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      path TEXT,
+      content TEXT,
+      original_content TEXT,
+      diff TEXT,
+      command TEXT,
+      command_path TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      error TEXT,
+      result_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT
+    );
+  `);
+  return localDb;
+}
+
+function makeLocalProject(localDb, prefix) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  tempRoots.push(root);
+  const inserted = localDb
+    .prepare('INSERT INTO projects (name, root_path) VALUES (?, ?)')
+    .run(prefix, root);
+  return { id: Number(inserted.lastInsertRowid), root };
+}
+
 function proposalCount(projectId) {
   return db.prepare('SELECT COUNT(*) AS c FROM proposals WHERE project_id = ?').get(projectId).c;
+}
+
+/** Deterministically expire a persisted recovery schedule without sleeping. */
+function makeRecoveryReady(taskId) {
+  makeRecoveryReadyIn(db, taskId);
+}
+
+function makeRecoveryReadyIn(localDb, taskId) {
+  const plan = loadPlan(localDb, taskId);
+  assert.ok(plan?.recovery?.nextRetryAt, 'the task must have a persisted retry time');
+  plan.recovery.nextRetryAt = new Date(Date.now() - 1).toISOString();
+  savePlan(localDb, taskId, plan);
+}
+
+function transientProviderError({
+  statusCode = 429,
+  category = 'RATE_LIMITED',
+  publicMessage = 'Provider rate limit was reached.',
+  retryAfterMs,
+  attemptsUsed = 1,
+  toolActivity,
+} = {}) {
+  const error = new Error(publicMessage);
+  error.statusCode = statusCode;
+  error.category = category;
+  error.publicMessage = publicMessage;
+  error.retryable = true;
+  error.fallbackEligible = false;
+  error.retryState = {
+    attemptsUsed,
+    exhausted: attemptsUsed >= 5,
+  };
+  if (retryAfterMs !== undefined) {
+    error.retryAfterMs = retryAfterMs;
+    error.retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
+  }
+  if (toolActivity) error.toolActivity = toolActivity;
+  return error;
 }
 
 beforeEach(() => {
@@ -214,55 +323,90 @@ test('fails honestly before calling a provider that cannot use workspace tools',
   assert.equal(listSteps(db, task.id).some((step) => step.kind === 'result'), false);
 });
 
-test('retries a rate limit once and completes', async () => {
+test('a 429 with a long Retry-After pauses and resumes after the scheduled time', async () => {
   const project = makeProject();
-  let attempts = 0;
-  const provider = makeProvider(async () => {
-    attempts += 1;
-    if (attempts === 1) {
-      const error = new Error('rate limited');
-      error.statusCode = 429;
-      error.publicMessage = 'Provider rate limit was reached.';
-      error.retryAfterMs = 0;
-      throw error;
+  let calls = 0;
+  const provider = makeProvider(async ({ retryState }) => {
+    calls += 1;
+    if (calls === 1) {
+      assert.equal(retryState.attemptsUsed, 0);
+      throw transientProviderError({
+        publicMessage: 'Provider rate limit was reached.',
+        retryAfterMs: 120_000,
+      });
     }
-    return { text: 'Recovered after the retry.', provider: 'fake', model: 'fake-1' };
+    assert.equal(retryState.attemptsUsed, 1, 'the resumed task must reload the persisted budget');
+    return {
+      text: JSON.stringify({ summary: 'Recovered after the scheduled retry.', needsChanges: false }),
+      provider: 'fake',
+      model: 'fake-1',
+      retryState: { attemptsUsed: 2, exhausted: false },
+    };
   });
 
   const task = createTask(db, { projectId: project.id, instruction: 'Summarise the project.' });
-  const result = await makeRunner(makeExecutor(provider)).tick();
+  const runner = makeRunner(makeExecutor(provider));
 
-  assert.equal(result.status, 'completed');
-  assert.equal(attempts, 2);
+  const paused = await runner.tick();
+  assert.equal(paused.status, 'provider_paused');
+  assert.equal(calls, 1, 'the long cooldown must not be spent in-process');
+
+  const recovery = loadPlan(db, task.id).recovery;
+  assert.equal(recovery.reason, 'provider_rate_limited');
+  assert.equal(recovery.category, 'RATE_LIMITED');
+  assert.equal(recovery.retryAttempt, 1);
+  assert.deepEqual(recovery.retryState, { attemptsUsed: 1, exhausted: false });
+  const scheduledMs = new Date(recovery.nextRetryAt).getTime() - Date.now();
+  assert.ok(
+    scheduledMs > 118_000 && scheduledMs <= 126_000,
+    `the original 120s Retry-After must be persisted (got ${scheduledMs}ms)`,
+  );
+  assert.equal(await runner.tick(), null, 'the task must not resume before its retry time');
+
+  makeRecoveryReady(task.id);
+  const resumed = await runner.tick();
+  assert.equal(resumed.status, 'completed');
+  assert.equal(calls, 2);
   const steps = listSteps(db, task.id);
-  const retry = steps.find((step) => step.title === 'Retrying provider (2/3)');
-  assert.ok(retry);
-  assert.match(retry.detail, /rate limit/i);
+  assert.equal(steps.some((step) => /^Retrying provider/.test(step.title)), false);
+  assert.ok(steps.some((step) => step.title === 'Provider rate limited'));
   assert.equal(steps.find((step) => step.kind === 'result').title, 'Result ready');
 });
 
-test('stops after three attempts and reports the rate limit honestly', async () => {
+test('persistent 503 failures follow bounded recovery and terminate at the limit', async () => {
   const project = makeProject();
-  let attempts = 0;
-  const provider = makeProvider(async () => {
-    attempts += 1;
-    const error = new Error('rate limited');
-    error.statusCode = 429;
-    error.publicMessage = 'Provider rate limit was reached.';
-    throw error;
+  const seenAttempts = [];
+  const provider = makeProvider(async ({ retryState }) => {
+    const attemptsUsed = (retryState?.attemptsUsed ?? 0) + 1;
+    seenAttempts.push(attemptsUsed);
+    throw transientProviderError({
+      statusCode: 503,
+      category: 'CAPACITY_UNAVAILABLE',
+      publicMessage: 'Provider is temporarily at capacity.',
+      attemptsUsed,
+    });
   });
 
   const task = createTask(db, { projectId: project.id, instruction: 'Summarise the project.' });
-  const result = await makeRunner(makeExecutor(provider)).tick();
+  const runner = makeRunner(makeExecutor(provider));
 
-  assert.equal(attempts, 3);
-  assert.equal(result.status, 'provider_paused');
-  assert.match(result.error, /rate limit/i);
-  assert.match(result.error, /after 3 attempts/);
-  const retrySteps = listSteps(db, task.id)
-    .filter((step) => /^Retrying provider/.test(step.title));
-  assert.equal(retrySteps.length, 2);
-  assert.equal(listSteps(db, task.id).some((step) => step.kind === 'result'), false);
+  for (let expected = 1; expected <= 4; expected += 1) {
+    const paused = await runner.tick();
+    assert.equal(paused.status, 'provider_paused');
+    assert.equal(loadPlan(db, task.id).recovery.retryAttempt, expected);
+    makeRecoveryReady(task.id);
+  }
+
+  const failed = await runner.tick();
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /recovery reached its limit/i);
+  assert.deepEqual(seenAttempts, [1, 2, 3, 4, 5]);
+  const recovery = loadPlan(db, task.id).recovery;
+  assert.equal(recovery.reason, 'provider_recovery_exhausted');
+  assert.equal(recovery.retryAttempt, 5);
+  assert.equal(recovery.terminal, true);
+  assert.equal(await runner.tick(), null);
+  assert.equal(seenAttempts.length, 5, 'a failed task must never be retried again');
 });
 
 test('does not retry a non-transient provider error', async () => {
@@ -283,6 +427,163 @@ test('does not retry a non-transient provider error', async () => {
   assert.equal(result.status, 'failed');
   assert.match(result.error, /rejected the API key/);
   assert.equal(listSteps(db, task.id).some((step) => /^Retrying provider/.test(step.title)), false);
+});
+
+test('quota exhaustion terminates without repeated provider requests', async () => {
+  const project = makeProject();
+  let calls = 0;
+  const provider = makeProvider(async () => {
+    calls += 1;
+    const error = new Error('quota reached');
+    error.statusCode = 429;
+    error.category = 'QUOTA_EXHAUSTED';
+    error.publicMessage = 'OpenRouter daily quota reached.';
+    error.retryable = false;
+    error.fallbackEligible = false;
+    error.retryState = { attemptsUsed: 1, exhausted: false };
+    throw error;
+  });
+
+  const task = createTask(db, { projectId: project.id, instruction: 'Inspect the project.' });
+  const runner = makeRunner(makeExecutor(provider));
+
+  const failed = await runner.tick();
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /quota is exhausted/i);
+  assert.equal(calls, 1);
+  const recovery = loadPlan(db, task.id).recovery;
+  assert.equal(recovery.reason, 'provider_quota_exhausted');
+  assert.equal(recovery.terminal, true);
+  assert.equal(recovery.nextRetryAt, undefined);
+
+  assert.equal(await runner.tick(), null);
+  assert.equal(calls, 1, 'quota exhaustion must not burn more requests');
+});
+
+test('a failure after read-only tool activity does not re-run the tool', async () => {
+  const project = makeProject();
+  let providerCalls = 0;
+  let toolCalls = 0;
+  const tools = {
+    declarations: [],
+    async execute(name) {
+      toolCalls += 1;
+      assert.equal(name, 'list_files');
+      return [{ path: 'src/app.js' }];
+    },
+  };
+  const provider = makeProvider(async ({ tools: activeTools }) => {
+    providerCalls += 1;
+    await activeTools.execute('list_files', {});
+    throw transientProviderError({
+      statusCode: 503,
+      category: 'CAPACITY_UNAVAILABLE',
+      publicMessage: 'Provider failed after tool execution.',
+      toolActivity: [{ tool: 'list_files', status: 'completed' }],
+    });
+  });
+
+  const task = createTask(db, { projectId: project.id, instruction: 'Inspect the project.' });
+  const failed = await makeRunner(makeExecutor(provider, { tools })).tick();
+
+  assert.equal(failed.status, 'failed');
+  assert.equal(providerCalls, 1);
+  assert.equal(toolCalls, 1, 'the read-only tool must never execute twice for one task');
+  assert.equal(listSteps(db, task.id).filter((step) => step.kind === 'tool').length, 1);
+  assert.equal(loadPlan(db, task.id)?.recovery?.nextRetryAt, undefined);
+});
+
+test('a resumed ordered plan keeps completed steps and does not stage duplicates', async () => {
+  const project = makeProject();
+  const proposalId = 'resume-completed-step';
+  db.prepare(
+    `INSERT INTO proposals (id, project_id, kind, path, status) VALUES (?, ?, 'create', ?, 'applied')`,
+  ).run(proposalId, project.id, 'src/first.js');
+
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Continue the saved plan.',
+    autonomy: 'propose',
+  });
+  savePlan(db, task.id, {
+    version: 1,
+    summary: 'Two-step ordered plan',
+    mode: 'ordered',
+    steps: [
+      { tool: 'create_file', path: 'src/first.js', content: 'first' },
+      { tool: 'create_file', path: 'src/second.js', content: 'second' },
+    ],
+    currentStep: 1,
+    repairAttempt: 0,
+    currentProposalId: proposalId,
+    proposals: [{ id: proposalId }],
+    recovery: {
+      reason: 'provider_rate_limited',
+      category: 'RATE_LIMITED',
+      retryAttempt: 2,
+      retryState: { attemptsUsed: 2, exhausted: false },
+      nextRetryAt: new Date(Date.now() - 1).toISOString(),
+    },
+  });
+  db.prepare("UPDATE tasks SET status = 'provider_paused', error = ? WHERE id = ?")
+    .run('Rate limit reached.', task.id);
+
+  let providerCalls = 0;
+  const provider = makeProvider(async () => {
+    providerCalls += 1;
+    return { text: 'should not be called', provider: 'fake', model: 'fake-1' };
+  });
+
+  const resumed = await makeRunner(makeExecutor(provider)).tick();
+  assert.equal(resumed.status, 'completed');
+  assert.equal(providerCalls, 0, 'a saved ordered plan must resume from storage, not re-plan');
+  assert.equal(proposalCount(project.id), 1, 'a completed step must not be staged again');
+  const plan = loadPlan(db, task.id);
+  assert.equal(plan.currentStep, 2);
+  assert.deepEqual(plan.proposals, [{ id: proposalId }]);
+});
+
+test('multiple eligible tasks progress independently', async () => {
+  const project = makeProject();
+  const states = new Map([
+    ['First task', { calls: 0 }],
+    ['Second task', { calls: 0 }],
+  ]);
+  const provider = makeProvider(async ({ messages }) => {
+    const instruction = messages.find((message) => message.role === 'user')?.content;
+    const state = states.get(instruction);
+    assert.ok(state, `unexpected task instruction: ${instruction}`);
+    state.calls += 1;
+    if (state.calls === 1) {
+      throw transientProviderError({ retryAfterMs: 120_000 });
+    }
+    return {
+      text: JSON.stringify({ summary: 'Done.', needsChanges: false }),
+      provider: 'fake',
+      model: 'fake-1',
+    };
+  });
+  const runner = makeRunner(makeExecutor(provider));
+
+  const first = createTask(db, { projectId: project.id, instruction: 'First task' });
+  const second = createTask(db, { projectId: project.id, instruction: 'Second task' });
+
+  assert.equal((await runner.tick()).status, 'provider_paused');
+  assert.equal((await runner.tick()).status, 'provider_paused');
+  assert.equal(getTask(db, first.id).status, 'provider_paused');
+  assert.equal(getTask(db, second.id).status, 'provider_paused');
+
+  makeRecoveryReady(second.id);
+  const secondResult = await runner.tick();
+  assert.equal(secondResult.id, second.id);
+  assert.equal(secondResult.status, 'completed');
+  assert.equal(getTask(db, first.id).status, 'provider_paused');
+
+  makeRecoveryReady(first.id);
+  const firstResult = await runner.tick();
+  assert.equal(firstResult.id, first.id);
+  assert.equal(firstResult.status, 'completed');
+  assert.deepEqual([...states.values()].map((state) => state.calls), [2, 2]);
 });
 
 test('cancellation aborts the in-flight provider call and records cancelled', async () => {
@@ -604,6 +905,49 @@ test('autonomous task leaves a staged file create pending and unapplied', async 
   assert.ok(steps.some((step) => step.title === 'Waiting for approval'));
 });
 
+test('cancellation during staging discards the staged proposal', async () => {
+  const project = makeProject('cancel-staging');
+  const provider = makePlanProvider({
+    summary: 'Create a file',
+    changes: [{ kind: 'create', path: 'cancel-me.js', content: 'export const x = 1;\n', goal: 'create' }],
+    commands: [],
+  });
+  const task = createTask(db, {
+    projectId: project.id,
+    instruction: 'Create cancel-me.js.',
+    autonomy: 'approved_autonomous',
+    autonomous: true,
+  });
+  const controller = new AbortController();
+
+  const tools = createWorkspaceTools({ db });
+  const originalStageFileChange = tools.stageFileChange;
+  tools.stageFileChange = async (...args) => {
+    const proposal = await originalStageFileChange(...args);
+    controller.abort();
+    return proposal;
+  };
+  const executor = createTaskExecutor({
+    db,
+    provider,
+    tools,
+    logger: silentLogger,
+    retryDelaysMs: [0, 0],
+  });
+
+  await assert.rejects(
+    executor({ task, signal: controller.signal, addStep: () => {}, phase: 'plan' }),
+    /cancelled/i,
+  );
+
+  const proposal = db
+    .prepare('SELECT status FROM proposals WHERE project_id = ?')
+    .get(project.id);
+  assert.ok(proposal, 'a proposal was staged');
+  assert.equal(proposal.status, 'rejected', 'staged proposal must be discarded on cancellation');
+  assert.equal(fs.existsSync(path.join(project.root, 'cancel-me.js')), false);
+});
+
 test('autonomous task leaves a staged file edit pending and does not modify the file', async () => {
   const project = makeProject('phase2-edit');
   const original = 'export const value = 0;\n';
@@ -764,4 +1108,274 @@ test('empty recovery-only plan does not strand a paused task in waiting_approval
   assert.notEqual(result.status, 'waiting_approval');
   const steps = listSteps(db, task.id);
   assert.equal(steps.some((step) => step.title === 'Continuation'), false);
+});
+
+test('offline end-to-end: real adapter tool rounds run through executor, runner and SQLite', async () => {
+  const localDb = makeIsolatedDb();
+  const project = makeLocalProject(localDb, 'e2e-tools');
+  fs.mkdirSync(path.join(project.root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(project.root, 'src', 'app.js'), 'export const value = 1;\n');
+
+  let calls = 0;
+  let toolExecutions = 0;
+  let lastResult;
+  const realProvider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/e2e-tools:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
+    retryDelaysMs: [0],
+    jitterMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'e2e-call-1',
+                type: 'function',
+                function: {
+                  name: 'read_file',
+                  arguments: JSON.stringify({ path: 'src/app.js' }),
+                },
+              }],
+            },
+          }],
+        });
+      }
+      if (calls === 2) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'e2e-call-2',
+                type: 'function',
+                function: {
+                  name: 'list_files',
+                  arguments: JSON.stringify({ path: '.' }),
+                },
+              }],
+            },
+          }],
+        });
+      }
+      return Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({ summary: 'Inspected app.js and the project root.', needsChanges: false }),
+          },
+        }],
+      });
+    },
+  });
+  const provider = {
+    ...realProvider,
+    async chat(args) {
+      const result = await realProvider.chat(args);
+      lastResult = result;
+      return result;
+    },
+  };
+  const executor = makeExecutor(provider, {
+    db: localDb,
+    tools: {
+      declarations: [{
+        functionDeclarations: [
+          { name: 'read_file' },
+          { name: 'list_files' },
+        ],
+      }],
+      async execute(name) {
+        toolExecutions += 1;
+        if (name === 'read_file') return { content: 'export const value = 1;' };
+        return { files: ['src/app.js'] };
+      },
+    },
+  });
+
+  const task = createTask(localDb, {
+    projectId: project.id,
+    instruction: 'Inspect the project and summarize it.',
+  });
+  const result = await makeRunner(executor, { db: localDb }).tick();
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls, 3, 'two tool rounds plus the final answer are three HTTP requests');
+  assert.equal(toolExecutions, 2);
+  assert.deepEqual(lastResult.retryState, { attemptsUsed: 3, exhausted: false });
+  assert.equal(lastResult.toolActivity.length, 2);
+  const steps = listSteps(localDb, task.id);
+  assert.ok(steps.some((step) => step.title === 'Read src/app.js'));
+  assert.ok(steps.some((step) => step.title === 'Listed .'));
+  assert.ok(steps.some((step) => step.title === 'Inspection complete'));
+});
+
+test('a successful tool-heavy inspection leaves a fresh budget for plan generation', async () => {
+  const localDb = makeIsolatedDb();
+  const project = makeLocalProject(localDb, 'budget-two-phases');
+  let calls = 0;
+  let planBudget = null;
+  const provider = makeProvider(async ({ retryState }) => {
+    calls += 1;
+    const state = normalizeRetryState(retryState);
+    if (state.exhausted) throw new Error('safeChat started with an exhausted budget');
+    if (calls === 2) planBudget = { ...state };
+    if (calls === 1) {
+      // Simulate a successful adapter call whose four tool rounds plus final
+      // answer consumed the entire shared budget.
+      let inspectionBudget = state;
+      for (let i = 0; i < 5; i += 1) inspectionBudget = consumeProviderAttempt(inspectionBudget);
+      return {
+        text: JSON.stringify({ summary: 'Inspected project.', needsChanges: true }),
+        toolActivity: Array.from({ length: 4 }, (_, index) => ({ name: 'read_file', summary: `read-${index}` })),
+        retryState: inspectionBudget,
+      };
+    }
+    return {
+      text: JSON.stringify({
+        summary: 'Create a small file.',
+        changes: [{
+          kind: 'create',
+          path: 'created-by-budget.js',
+          content: 'export const ok = true;\n',
+          goal: 'verify second-phase budget',
+        }],
+        commands: [],
+      }),
+      retryState: consumeProviderAttempt(state),
+    };
+  });
+
+  const executor = makeExecutor(provider, { db: localDb });
+  const task = createTask(localDb, {
+    projectId: project.id,
+    instruction: 'Inspect and then create a small file.',
+    autonomy: 'approved_autonomous',
+    autonomous: true,
+  });
+  const result = await executor({
+    task,
+    addStep: () => {},
+    phase: 'continue',
+  });
+
+  assert.equal(calls, 2, 'one inspection call and one plan call reach the provider');
+  assert.deepEqual(planBudget, { attemptsUsed: 0, exhausted: false });
+  assert.equal(result.status, 'waiting_approval');
+});
+
+test('offline end-to-end: a real adapter failure after tools stays terminal', async () => {
+  const localDb = makeIsolatedDb();
+  const project = makeLocalProject(localDb, 'e2e-tool-failure');
+  let calls = 0;
+  let toolExecutions = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/e2e-tool-failure:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
+    retryDelaysMs: [0],
+    jitterMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'e2e-fail-call',
+                type: 'function',
+                function: {
+                  name: 'read_file',
+                  arguments: JSON.stringify({ path: 'src/app.js' }),
+                },
+              }],
+            },
+          }],
+        });
+      }
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '3600' } },
+      );
+    },
+  });
+  const executor = makeExecutor(provider, {
+    db: localDb,
+    tools: {
+      declarations: [{ functionDeclarations: [{ name: 'read_file' }] }],
+      async execute() {
+        toolExecutions += 1;
+        return { content: 'export const value = 1;' };
+      },
+    },
+  });
+
+  const task = createTask(localDb, {
+    projectId: project.id,
+    instruction: 'Inspect the project after a tool call.',
+  });
+  const result = await makeRunner(executor, { db: localDb }).tick();
+
+  assert.equal(result.status, 'failed');
+  assert.equal(calls, 2, 'the failed request must not be replayed');
+  assert.equal(toolExecutions, 1, 'the read-only tool must not run twice');
+  assert.equal(loadPlan(localDb, task.id)?.recovery?.nextRetryAt, undefined);
+  assert.equal(await makeRunner(executor, { db: localDb }).tick(), null);
+  assert.equal(calls, 2);
+});
+
+test('multiple tasks share a real model cooldown without burning HTTP attempts', async () => {
+  const localDb = makeIsolatedDb();
+  const cooldownStore = new Map();
+  const cooldownKey = 'https://openrouter.ai/api/v1::test/shared-task-cooldown:free';
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/shared-task-cooldown:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json(
+          { error: { message: 'too many requests' } },
+          { status: 429, headers: { 'Retry-After': '3600' } },
+        );
+      }
+      return Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({ summary: 'Recovered after the shared cooldown.', needsChanges: false }),
+          },
+        }],
+      });
+    },
+  });
+  const executor = makeExecutor(provider, { db: localDb });
+  const runner = makeRunner(executor, { db: localDb });
+  const project = makeLocalProject(localDb, 'shared-cooldown');
+  const first = createTask(localDb, { projectId: project.id, instruction: 'First task.' });
+  const second = createTask(localDb, { projectId: project.id, instruction: 'Second task.' });
+
+  const firstPause = await runner.tick();
+  const secondPause = await runner.tick();
+
+  assert.equal(firstPause.status, 'provider_paused');
+  // The second queued task is short-circuited immediately and paused with the
+  // same future retry time; its persisted state proves no HTTP attempt burned.
+  assert.equal(secondPause.status, 'provider_paused');
+  assert.equal(getTask(localDb, second.id).status, 'provider_paused');
+  assert.equal(calls, 1, 'the second task must be short-circuited by the shared cooldown');
+  assert.equal(loadPlan(localDb, first.id).recovery.retryState.attemptsUsed, 1);
+  assert.deepEqual(loadPlan(localDb, second.id).recovery.retryState, { attemptsUsed: 0, exhausted: false });
+  assert.equal(loadPlan(localDb, second.id).recovery.retryAttempt, 1);
+
+  cooldownStore.delete(cooldownKey);
+  makeRecoveryReadyIn(localDb, first.id);
+  makeRecoveryReadyIn(localDb, second.id);
+  assert.equal((await runner.tick()).status, 'completed');
+  assert.equal((await runner.tick()).status, 'completed');
+  assert.equal(calls, 3, 'each resumed task makes exactly one real HTTP request');
 });

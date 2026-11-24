@@ -398,6 +398,7 @@ test('OpenAI adapter names OpenRouter in upstream errors', async () => {
     apiKey: 'test-openrouter-key',
     model: 'particle-ai/particle-1:free',
     baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
     fetchImpl: async () => Response.json({
       error: { message: 'Rate limit exceeded: free-models-per-day.' },
     }, { status: 429 }),
@@ -423,6 +424,7 @@ test('OpenAI adapter logs redacted OpenRouter diagnostics without the API key', 
     apiKey: secret,
     model: 'particle-ai/particle-1:free',
     baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
     fetchImpl: async () => Response.json({
       error: {
         message: 'Rate limit exceeded',
@@ -1448,6 +1450,7 @@ test('OpenAI adapter gives clear authentication and quota errors', async (t) => 
     await t.test(`${status} ${code}`, async () => {
       const provider = createOpenAIProvider({
         apiKey: 'test-key',
+        cooldownStore: new Map(),
         fetchImpl: async () => Response.json(
           { error: { code, message: 'private upstream detail' } },
           { status },
@@ -1482,6 +1485,168 @@ test('Gemini adapter uses supported default model gemini-3.8-flash', async () =>
   const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
   assert.ok(request.url.includes('gemini-3.8-flash'), 'Default model should be gemini-3.8-flash');
   assert.equal(result.text, 'Hello from Gemini 3.8 Flash.');
+});
+
+test('OpenRouter retries transient 429 and 502 responses with bounded attempts', async () => {
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/retry-model:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 3,
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({ error: { message: 'too many requests' } }, { status: 429 });
+      }
+      if (calls === 2) {
+        return Response.json({ error: { message: 'temporary gateway failure' } }, { status: 502 });
+      }
+      return Response.json({ choices: [{ message: { content: 'Recovered.' } }] });
+    },
+  });
+
+  const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+  assert.equal(result.text, 'Recovered.');
+  assert.equal(calls, 3);
+});
+
+test('OpenRouter retries 503 and 504 but never retries authentication or invalid requests', async () => {
+  for (const status of [503, 504]) {
+    let calls = 0;
+    const provider = createOpenAIProvider({
+      apiKey: 'test-key',
+      model: `test/transient-${status}:free`,
+      baseUrl: 'https://openrouter.ai/api/v1',
+      maxAttempts: 2,
+      retryDelaysMs: [0],
+      jitterMs: 0,
+      cooldownStore: new Map(),
+      fetchImpl: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return Response.json({ error: { message: 'temporary failure' } }, { status });
+        }
+        return Response.json({ choices: [{ message: { content: 'Recovered.' } }] });
+      },
+    });
+    const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }] });
+    assert.equal(result.text, 'Recovered.');
+    assert.equal(calls, 2);
+  }
+
+  for (const status of [401, 400]) {
+    let calls = 0;
+    const provider = createOpenAIProvider({
+      apiKey: 'test-key',
+      model: `test/permanent-${status}:free`,
+      baseUrl: 'https://openrouter.ai/api/v1',
+      retryDelaysMs: [0],
+      jitterMs: 0,
+      cooldownStore: new Map(),
+      fetchImpl: async () => {
+        calls += 1;
+        return Response.json({ error: { message: 'rejected' } }, { status });
+      },
+    });
+    await assert.rejects(provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }));
+    assert.equal(calls, 1);
+  }
+});
+
+test('OpenRouter records model cooldowns and honors Retry-After', async () => {
+  const cooldownStore = new Map();
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/cooldown-model:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 2,
+    retryDelaysMs: [0],
+    jitterMs: 0,
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '60' } },
+      );
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }] }),
+    (error) => {
+      assert.equal(error.category, 'RATE_LIMITED');
+      assert.equal(error.retryAfterMs, 60_000);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'long Retry-After must not be ignored');
+  assert.ok(cooldownStore.has('https://openrouter.ai/api/v1::test/cooldown-model:free'));
+
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi again' }] }),
+    (error) => {
+      assert.equal(error.category, 'RATE_LIMITED');
+      assert.match(error.publicMessage, /cooling down/i);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'cooldown must prevent repeated provider calls');
+});
+
+test('OpenRouter retries never repeat a tool that already executed', async () => {
+  let calls = 0;
+  const executed = [];
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/tool-retry-model:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 3,
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({ error: { message: 'too many requests' } }, { status: 429 });
+      }
+      if (calls === 2) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'call-read',
+                type: 'function',
+                function: { name: 'read_file', arguments: JSON.stringify({ path: 'a.txt' }) },
+              }],
+            },
+          }],
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'Done.' } }] });
+    },
+  });
+
+  const result = await provider.chat({
+    messages: [{ role: 'user', content: 'Read the file.' }],
+    tools: {
+      declarations: [{ functionDeclarations: [{ name: 'read_file' }] }],
+      execute: async (name, args) => {
+        executed.push({ name, args });
+        return { path: args.path, size: 1 };
+      },
+    },
+    projectId: 42,
+  });
+
+  assert.equal(result.text, 'Done.');
+  assert.equal(executed.length, 1, 'tool execution must not be replayed');
+  assert.equal(calls, 3);
 });
 
 test('Gemini registry default is gemini-3.8-flash while OpenRouter stays optional', () => {
@@ -1742,4 +1907,543 @@ test('explicit fallback is disabled after tool execution or for invalid credenti
   );
 
   assert.equal(fallbackCalls, 0);
+});
+
+test('Gemini primary and OpenRouter fallback share one caller retry budget', async () => {
+  let geminiCalls = 0;
+  let openRouterCalls = 0;
+  const primary = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    model: 'gemini-3.8-flash',
+    cooldownStore: new Map(),
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    fetchImpl: async () => {
+      geminiCalls += 1;
+      return Response.json(
+        { error: { message: 'This model is currently experiencing high demand.' } },
+        { status: 503 },
+      );
+    },
+  });
+  const fallback = createOpenAIProvider({
+    apiKey: 'test-openrouter-key',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'test/fallback-budget:free',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      openRouterCalls += 1;
+      return Response.json({
+        choices: [{ message: { content: 'Fallback reply.' } }],
+      });
+    },
+  });
+  const wrapped = createFallbackProvider({
+    primary,
+    fallback,
+    log: { warn() {} },
+  });
+
+  const result = await wrapped.chat({
+    messages: [{ role: 'user', content: 'Hi' }],
+    retryState: { attemptsUsed: 0, exhausted: false },
+  });
+
+  assert.equal(geminiCalls, 1);
+  assert.equal(openRouterCalls, 1);
+  assert.equal(result.text, 'Fallback reply.');
+  assert.deepEqual(result.retryState, { attemptsUsed: 2, exhausted: false });
+  assert.equal(result.fallback.from, 'gemini');
+});
+
+test('an exhausted caller retry state prevents fallback HTTP calls', async () => {
+  let geminiCalls = 0;
+  let openRouterCalls = 0;
+  const primary = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    model: 'gemini-3.8-flash',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      geminiCalls += 1;
+      return Response.json(
+        { error: { message: 'This model is currently experiencing high demand.' } },
+        { status: 503 },
+      );
+    },
+  });
+  const fallback = createOpenAIProvider({
+    apiKey: 'test-openrouter-key',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'test/fallback-exhausted:free',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      openRouterCalls += 1;
+      return Response.json({ choices: [{ message: { content: 'Should not happen.' } }] });
+    },
+  });
+  const wrapped = createFallbackProvider({
+    primary,
+    fallback,
+    log: { warn() {} },
+  });
+
+  await assert.rejects(
+    wrapped.chat({
+      messages: [{ role: 'user', content: 'Hi' }],
+      retryState: { attemptsUsed: 4, exhausted: false },
+    }),
+    (error) => {
+      assert.deepEqual(error.retryState, { attemptsUsed: 5, exhausted: true });
+      assert.equal(error.retryBudgetExhausted, true);
+      return true;
+    },
+  );
+  assert.equal(geminiCalls, 1);
+  assert.equal(openRouterCalls, 0, 'an exhausted budget must not trigger fallback HTTP');
+});
+
+test('a stale concurrent success cannot clear a newer OpenRouter failure cooldown', async () => {
+  const cooldownStore = new Map();
+  const key = 'https://openrouter.ai/api/v1::test/concurrent:free';
+  let signalSlowFetchStarted;
+  const slowFetchStarted = new Promise((resolve) => { signalSlowFetchStarted = resolve; });
+  let releaseSlowFetch;
+  const slowFetchGate = new Promise((resolve) => { releaseSlowFetch = resolve; });
+
+  const slowProvider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/concurrent:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 1,
+    cooldownStore,
+    fetchImpl: async () => {
+      signalSlowFetchStarted();
+      await slowFetchGate;
+      return Response.json({ choices: [{ message: { content: 'Slow success.' } }] });
+    },
+  });
+  const failingProvider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/concurrent:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 1,
+    cooldownStore,
+    fetchImpl: async () => Response.json(
+      { error: { message: 'too many requests' } },
+      { status: 429, headers: { 'Retry-After': '60' } },
+    ),
+  });
+
+  const slowCall = slowProvider.chat({ messages: [{ role: 'user', content: 'Slow' }] });
+  await slowFetchStarted;
+  await assert.rejects(failingProvider.chat({ messages: [{ role: 'user', content: 'Fail' }] }));
+  assert.ok(cooldownStore.has(key), 'the failure must record a cooldown');
+
+  releaseSlowFetch();
+  const slowResult = await slowCall;
+  assert.equal(slowResult.text, 'Slow success.');
+  assert.ok(
+    cooldownStore.has(key),
+    'a stale success must not clear a newer failure cooldown',
+  );
+});
+
+test('a caller-supplied retryState limits the adapter to one HTTP attempt per call', async () => {
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/caller-retries:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    maxAttempts: 5,
+    retryDelaysMs: [0, 0, 0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({ error: { message: 'too many requests' } }, { status: 429 });
+    },
+  });
+
+  const retryState = { attemptsUsed: 0, exhausted: false };
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }], retryState }),
+    (error) => {
+      assert.ok(error.retryState, 'the adapter must report its retry state to the caller');
+      assert.equal(error.retryState.attemptsUsed, 1, 'the caller-owned HTTP attempt must be counted');
+      assert.equal(error.retryState.exhausted, false);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'the executor owns retries; the adapter makes one HTTP attempt');
+  assert.deepEqual(retryState, { attemptsUsed: 0, exhausted: false }, 'caller state must not be mutated');
+});
+
+test('the adapter refuses HTTP calls when the caller retry budget is exhausted', async () => {
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/exhausted-caller:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({ choices: [{ message: { content: 'Should not happen.' } }] });
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({
+      messages: [{ role: 'user', content: 'Hi' }],
+      retryState: { attemptsUsed: 5, exhausted: true },
+    }),
+    (error) => {
+      assert.equal(error.retryBudgetExhausted, true);
+      return true;
+    },
+  );
+  assert.equal(calls, 0, 'an exhausted budget must not consume provider quota');
+});
+
+test('Gemini honors a caller-supplied retryState with one HTTP attempt per call', async () => {
+  let calls = 0;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    maxAttempts: 3,
+    retryDelaysMs: [0, 0],
+    jitterMs: 0,
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json(
+        { error: { message: 'This model is currently experiencing high demand.' } },
+        { status: 503 },
+      );
+    },
+  });
+
+  const retryState = { attemptsUsed: 0, exhausted: false };
+  await assert.rejects(
+    provider.chat({ messages: [{ role: 'user', content: 'Hi' }], retryState }),
+    (error) => {
+      assert.ok(error.retryState, 'the adapter must report its retry state to the caller');
+      assert.equal(error.retryState.attemptsUsed, 1, 'the caller-owned HTTP attempt must be counted');
+      return true;
+    },
+  );
+  assert.equal(calls, 1, 'the executor owns retries; Gemini makes one HTTP attempt');
+  assert.deepEqual(retryState, { attemptsUsed: 0, exhausted: false });
+});
+
+test('Gemini refuses HTTP calls when the caller retry budget is exhausted', async () => {
+  let calls = 0;
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({
+        candidates: [{ content: { parts: [{ text: 'Should not happen.' }] } }],
+      });
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({
+      messages: [{ role: 'user', content: 'Hi' }],
+      retryState: { attemptsUsed: 5, exhausted: true },
+    }),
+    (error) => {
+      assert.equal(error.retryBudgetExhausted, true);
+      return true;
+    },
+  );
+  assert.equal(calls, 0);
+});
+
+test('Gemini preserves the strongest cooldown when concurrent failures arrive out of order', async () => {
+  const cooldownStore = new Map();
+  const key = 'gemini:gemini-3.8-flash';
+  let signalQuotaFetchStarted;
+  const quotaFetchStarted = new Promise((resolve) => { signalQuotaFetchStarted = resolve; });
+  let releaseQuotaFetch;
+  const quotaFetchGate = new Promise((resolve) => { releaseQuotaFetch = resolve; });
+  let signalCapacityFetchStarted;
+  const capacityFetchStarted = new Promise((resolve) => { signalCapacityFetchStarted = resolve; });
+  let releaseCapacityFetch;
+  const capacityFetchGate = new Promise((resolve) => { releaseCapacityFetch = resolve; });
+
+  const quotaProvider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    maxAttempts: 1,
+    cooldownStore,
+    fetchImpl: async () => {
+      signalQuotaFetchStarted();
+      await quotaFetchGate;
+      return Response.json({
+        error: {
+          code: 429,
+          status: 'RESOURCE_EXHAUSTED',
+          message: 'Resource has been exhausted (e.g. check quota).',
+        },
+      }, { status: 429 });
+    },
+  });
+  const capacityProvider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    maxAttempts: 1,
+    cooldownStore,
+    fetchImpl: async () => {
+      signalCapacityFetchStarted();
+      await capacityFetchGate;
+      return Response.json(
+        { error: { message: 'This model is currently experiencing high demand.' } },
+        { status: 503 },
+      );
+    },
+  });
+
+  const quotaCall = quotaProvider.chat({ messages: [{ role: 'user', content: 'Quota' }] });
+  const capacityCall = capacityProvider.chat({ messages: [{ role: 'user', content: 'Capacity' }] });
+  await Promise.all([quotaFetchStarted, capacityFetchStarted]);
+
+  // The long quota cooldown lands first.
+  releaseQuotaFetch();
+  await assert.rejects(quotaCall);
+  const quotaCooldown = cooldownStore.get(key);
+  assert.ok(quotaCooldown);
+  assert.equal(quotaCooldown.category, 'QUOTA_EXHAUSTED');
+
+  // A shorter capacity cooldown arrives later and must not replace it.
+  releaseCapacityFetch();
+  await assert.rejects(capacityCall);
+  assert.equal(
+    cooldownStore.get(key),
+    quotaCooldown,
+    'a shorter capacity cooldown must not replace a longer quota cooldown',
+  );
+});
+
+test('every caller-owned OpenAI tool round consumes one shared attempt', async () => {
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/tool-budget:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
+    retryDelaysMs: [0],
+    jitterMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json({
+        choices: [{
+          message: {
+            tool_calls: [{
+              id: `call-${calls}`,
+              type: 'function',
+              function: {
+                name: 'read_file',
+                arguments: JSON.stringify({ path: `file-${calls}` }),
+              },
+            }],
+          },
+        }],
+      });
+    },
+  });
+
+  await assert.rejects(
+    provider.chat({
+      messages: [{ role: 'user', content: 'Inspect every file.' }],
+      tools: {
+        declarations: [{ functionDeclarations: [{ name: 'read_file' }] }],
+        execute: async () => ({ status: 'ok' }),
+      },
+      retryState: { attemptsUsed: 0, exhausted: false },
+    }),
+    (error) => {
+      assert.equal(error.retryState.attemptsUsed, 5, 'five HTTP rounds consume five shared attempts');
+      assert.equal(error.retryState.exhausted, true);
+      assert.equal(error.toolActivity.length, 5, 'tool activity must travel with a terminal failure');
+      return true;
+    },
+  );
+  assert.equal(calls, 5, 'no sixth HTTP round may start after the budget is exhausted');
+});
+
+test('Gemini primary plus OpenRouter fallback tool rounds share one caller budget', async () => {
+  let geminiCalls = 0;
+  let openRouterCalls = 0;
+  const primary = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      geminiCalls += 1;
+      return Response.json(
+        { error: { message: 'Quota exceeded for today.' } },
+        { status: 429 },
+      );
+    },
+  });
+  const fallback = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/fallback-tools:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore: new Map(),
+    fetchImpl: async () => {
+      openRouterCalls += 1;
+      if (openRouterCalls === 1) {
+        return Response.json({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: 'fallback-call-1',
+                type: 'function',
+                function: {
+                  name: 'read_file',
+                  arguments: JSON.stringify({ path: 'src/app.js' }),
+                },
+              }],
+            },
+          }],
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'Fallback finished after tools.' } }] });
+    },
+  });
+  const wrapped = createFallbackProvider({ primary, fallback, log: { warn() {} } });
+
+  const result = await wrapped.chat({
+    messages: [{ role: 'user', content: 'Inspect the project.' }],
+    tools: {
+      declarations: [{ functionDeclarations: [{ name: 'read_file' }] }],
+      execute: async () => ({ status: 'ok' }),
+    },
+    retryState: { attemptsUsed: 0, exhausted: false },
+  });
+
+  assert.equal(geminiCalls, 1, 'the primary request consumes one attempt');
+  assert.equal(openRouterCalls, 2, 'each fallback tool round consumes one attempt');
+  assert.deepEqual(result.retryState, { attemptsUsed: 3, exhausted: false });
+});
+
+test('a shared OpenAI cooldown short-circuits without consuming a caller attempt', async () => {
+  const cooldownStore = new Map();
+  let calls = 0;
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/shared-cooldown:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '3600' } },
+      );
+    },
+  });
+  const args = { messages: [{ role: 'user', content: 'Hi' }], retryState: { attemptsUsed: 0, exhausted: false } };
+
+  await assert.rejects(provider.chat(args), (error) => {
+    assert.equal(error.retryState.attemptsUsed, 1, 'the real HTTP request consumes one attempt');
+    assert.ok(error.retryAfterMs > 3_500_000, 'the error must report the persisted cooldown');
+    return true;
+  });
+  assert.equal(calls, 1);
+
+  await assert.rejects(provider.chat(args), (error) => {
+    assert.equal(error.providerCooldownShortCircuit, true);
+    assert.equal(error.retryState.attemptsUsed, 0, 'no HTTP request means no attempt consumed');
+    return true;
+  });
+  assert.equal(calls, 1, 'a cooldown short-circuit must not call the provider');
+});
+
+test('a shorter Retry-After cannot shorten a stronger OpenAI cooldown', async () => {
+  const cooldownStore = new Map();
+  const key = 'https://openrouter.ai/api/v1::test/strong-cooldown:free';
+  let calls = 0;
+  let signalFetchStarted;
+  const fetchStarted = new Promise((resolve) => { signalFetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/strong-cooldown:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      signalFetchStarted();
+      await fetchGate;
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '1' } },
+      );
+    },
+  });
+
+  const pending = provider.chat({
+    messages: [{ role: 'user', content: 'Hi' }],
+    retryState: { attemptsUsed: 0, exhausted: false },
+  });
+  await fetchStarted;
+  // A concurrent failure established a stronger cooldown while this request was
+  // in flight; the later, weaker Retry-After must not shorten it.
+  cooldownStore.set(key, { until: Date.now() + 3_600_000, token: 99 });
+  releaseFetch();
+
+  await assert.rejects(pending, (error) => {
+    assert.ok(
+      error.retryAfterMs > 3_500_000,
+      'the error must report the effective cooldown, not the shorter upstream header',
+    );
+    assert.equal(cooldownStore.get(key).token, 99, 'the stronger cooldown must be preserved');
+    return true;
+  });
+  assert.equal(calls, 1);
+});
+
+test('a shorter Retry-After cannot shorten a stronger Gemini cooldown', async () => {
+  const cooldownStore = new Map();
+  const key = 'gemini:test/strong-cooldown';
+  let calls = 0;
+  let signalFetchStarted;
+  const fetchStarted = new Promise((resolve) => { signalFetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  const provider = createGeminiProvider({
+    apiKey: 'test-gemini-key',
+    model: 'test/strong-cooldown',
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      signalFetchStarted();
+      await fetchGate;
+      return Response.json(
+        { error: { message: 'This model is currently experiencing high demand.' } },
+        { status: 503, headers: { 'Retry-After': '1' } },
+      );
+    },
+  });
+
+  const pending = provider.chat({
+    messages: [{ role: 'user', content: 'Hi' }],
+    retryState: { attemptsUsed: 0, exhausted: false },
+  });
+  await fetchStarted;
+  cooldownStore.set(key, {
+    until: Date.now() + 3_600_000,
+    category: 'QUOTA_EXHAUSTED',
+  });
+  releaseFetch();
+
+  await assert.rejects(pending, (error) => {
+    assert.ok(
+      error.retryAfterMs > 3_500_000,
+      'Gemini must report the effective cooldown it persisted',
+    );
+    return true;
+  });
+  assert.equal(calls, 1);
 });

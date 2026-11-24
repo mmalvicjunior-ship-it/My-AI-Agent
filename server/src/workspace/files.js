@@ -100,10 +100,18 @@ export function getProjectRoot(db, workspaceRoot, projectId) {
   if (!project) throw new WorkspaceError(404, 'Project not found.');
   const driver = getWorkspaceDriver();
   if (driver.mode !== 'local') return driver.prepare(project.id);
-  const root = project.root_path || projectDir(workspaceRoot, project.id);
+  const storedRoot = project.root_path;
+  const root = storedRoot || projectDir(workspaceRoot, project.id);
   try {
     const resolved = fs.realpathSync(root);
     if (!fs.statSync(resolved).isDirectory()) throw new WorkspaceError(400, 'Project root is not a directory.');
+    // Imported roots are stored as their canonical real path. If that path now
+    // resolves somewhere else (for example a directory was swapped for a
+    // symlink or junction), refuse it instead of silently adopting the new
+    // target as this project's authorized workspace.
+    if (storedRoot && path.resolve(resolved) !== path.resolve(storedRoot)) {
+      throw new WorkspaceError(403, 'Project root changed after import; reopen the project.');
+    }
     return resolved;
   } catch (error) {
     if (error instanceof WorkspaceError) throw error;

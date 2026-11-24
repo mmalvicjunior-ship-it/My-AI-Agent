@@ -4,6 +4,11 @@ import {
   isRetryableProviderError,
 } from './provider-error.js';
 import {
+  consumeProviderAttempt,
+  normalizeRetryState,
+  remainingProviderAttempts,
+} from './retry-policy.js';
+import {
   FINAL_ANSWER_INSTRUCTION,
   NO_WORKSPACE_SYSTEM_INSTRUCTION,
   WORKSPACE_SYSTEM_INSTRUCTION,
@@ -25,6 +30,27 @@ const DEFAULT_JITTER_MS = 250;
 const DEFAULT_CAPACITY_COOLDOWN_MS = 60_000;
 const DEFAULT_NETWORK_COOLDOWN_MS = 30_000;
 const MAX_DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function attachRetryState(error, retryState) {
+  if (error && typeof error === 'object') {
+    error.retryState = normalizeRetryState(retryState);
+    if (error.retryState.exhausted) {
+      error.retryBudgetExhausted = true;
+      error.retryable = false;
+      error.fallbackEligible = false;
+    }
+  }
+  return error;
+}
+
+function exhaustedRetryError(retryState) {
+  const error = new Error('Gemini provider retry budget exhausted.');
+  error.statusCode = 429;
+  error.category = 'RATE_LIMITED';
+  error.errorType = 'RATE_LIMITED';
+  error.publicMessage = 'The provider retry budget was exhausted. The task was not completed.';
+  return attachRetryState(error, retryState);
+}
 
 // Shared across provider instances so a quota cooldown still applies when the
 // chat route resolves a fresh Gemini adapter for a per-request provider switch.
@@ -77,6 +103,9 @@ function cooldownError(model, entry, nowMs) {
   error.fallbackEligible = true;
   error.retryAfterMs = remainingMs;
   error.retryAfterSeconds = seconds;
+  // The cooldown check happens before any HTTP request, so this error consumed
+  // no shared attempt. Fallback wrappers must not assume one was used.
+  error.providerCooldownShortCircuit = true;
   error.publicMessage = entry.category === 'QUOTA_EXHAUSTED'
     ? `Google Gemini daily quota is exhausted. No further Gemini requests will be made for about ${seconds} second(s). Select OpenRouter to continue.`
     : `Google Gemini is temporarily unavailable for about ${seconds} second(s). Select OpenRouter to continue if it does not recover.`;
@@ -126,11 +155,24 @@ export function createGeminiProvider({
       return;
     }
 
+    // Concurrent failures can arrive out of order. Never let a shorter
+    // capacity/network cooldown replace a longer quota cooldown (or any other
+    // currently stronger cooldown). The error must report the effective wait so
+    // a persisted nextRetryAt cannot be earlier than the cooldown still in force.
+    const existing = cooldownStore.get(cooldownKey);
+    if (existing && Number(existing.until) >= until) {
+      const remaining = Math.max(0, Number(existing.until) - currentMs);
+      error.retryAfterMs = remaining;
+      error.retryAfterSeconds = Math.max(1, Math.ceil(remaining / 1000));
+      return;
+    }
     cooldownStore.set(cooldownKey, {
       until,
       category: error.category === 'QUOTA_EXHAUSTED' ? 'QUOTA_EXHAUSTED' : error.category,
       publicMessage: error.publicMessage,
     });
+    error.retryAfterMs = Math.max(0, until - currentMs);
+    error.retryAfterSeconds = Math.max(1, Math.ceil((until - currentMs) / 1000));
   }
 
   async function pauseBeforeRetry(attempt, retryAfterMs, signal) {
@@ -144,11 +186,26 @@ export function createGeminiProvider({
     return true;
   }
 
-  async function requestGenerate(body, signal) {
+  async function requestGenerate(body, signal, retryState = null) {
     const url = `${API_URL}/${encodeURIComponent(model)}:generateContent`;
+    const callerOwnsRetries = Boolean(retryState);
+    // When the executor supplies a retryState it owns the whole budget, so
+    // this adapter makes exactly one HTTP attempt per call. Without one, the
+    // adapter keeps its existing bounded local retries for interactive chat.
+    const maxAttemptsThisCall = callerOwnsRetries ? 1 : attempts;
 
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttemptsThisCall; attempt += 1) {
       if (signal?.aborted) throw cancelledRequestError();
+
+      // The shared budget is consumed here, immediately before the HTTP call.
+      // `retryState` is the caller's object so both success and error paths
+      // report the same consumed state without another accounting layer.
+      if (callerOwnsRetries) {
+        if (retryState.exhausted) throw exhaustedRetryError(retryState);
+        const next = consumeProviderAttempt(retryState);
+        retryState.attemptsUsed = next.attemptsUsed;
+        retryState.exhausted = next.exhausted;
+      }
 
       let response;
       try {
@@ -168,26 +225,26 @@ export function createGeminiProvider({
       } catch (error) {
         if (signal?.aborted) throw cancelledRequestError();
         const networkError = createProviderNetworkError('Gemini', error);
-        if (!isRetryableProviderError(networkError) || attempt >= attempts) {
+        if (!isRetryableProviderError(networkError) || attempt >= maxAttemptsThisCall) {
           setCooldown(networkError);
-          throw networkError;
+          throw callerOwnsRetries ? attachRetryState(networkError, retryState) : networkError;
         }
         if (!await pauseBeforeRetry(attempt, null, signal)) {
           setCooldown(networkError);
-          throw networkError;
+          throw callerOwnsRetries ? attachRetryState(networkError, retryState) : networkError;
         }
         continue;
       }
 
       if (!response.ok) {
         const error = await createProviderHttpError(response, 'Gemini', apiKey);
-        if (!isRetryableProviderError(error) || attempt >= attempts) {
+        if (!isRetryableProviderError(error) || attempt >= maxAttemptsThisCall) {
           setCooldown(error);
-          throw error;
+          throw callerOwnsRetries ? attachRetryState(error, retryState) : error;
         }
         if (!await pauseBeforeRetry(attempt, error.retryAfterMs, signal)) {
           setCooldown(error);
-          throw error;
+          throw callerOwnsRetries ? attachRetryState(error, retryState) : error;
         }
         continue;
       }
@@ -201,7 +258,7 @@ export function createGeminiProvider({
         error.retryable = false;
         error.fallbackEligible = false;
         error.publicMessage = 'Google Gemini returned an invalid response. Please try again.';
-        throw error;
+        throw callerOwnsRetries ? attachRetryState(error, retryState) : error;
       }
     }
 
@@ -218,7 +275,7 @@ export function createGeminiProvider({
     name: 'gemini',
     model,
 
-    async chat({ messages, tools, projectId, signal }) {
+    async chat({ messages, tools, projectId, signal, retryState = null }) {
       if (!apiKey) {
         const error = new Error('Gemini is selected, but AI_API_KEY is not configured.');
         error.statusCode = 503;
@@ -230,14 +287,14 @@ export function createGeminiProvider({
         throw error;
       }
 
-      const currentMs = now();
-      const activeCooldown = cooldownStore.get(cooldownKey);
-      if (activeCooldown) {
-        if (activeCooldown.until > currentMs) {
-          throw cooldownError(model, activeCooldown, currentMs);
-        }
-        cooldownStore.delete(cooldownKey);
+      const callerOwnsRetries = Boolean(retryState);
+      let activeRetryState = callerOwnsRetries ? normalizeRetryState(retryState) : null;
+      if (activeRetryState?.exhausted) {
+        throw exhaustedRetryError(activeRetryState);
       }
+      // Caller-owned attempts are consumed immediately before each HTTP request
+      // in requestGenerate(). A cooldown short-circuit below therefore consumes
+      // no shared budget.
 
       const hasTools = Boolean(tools?.declarations?.length && typeof tools.execute === 'function');
       const baseInstruction = hasTools ? WORKSPACE_SYSTEM_INSTRUCTION : NO_WORKSPACE_SYSTEM_INSTRUCTION;
@@ -252,8 +309,30 @@ export function createGeminiProvider({
         }));
       const activity = [];
 
+      // A cooldown can be set by another task between tool rounds, so it must be
+      // checked before every HTTP round, not just once at chat entry.
+      function assertNoCooldown() {
+        const currentMs = now();
+        const entry = cooldownStore.get(cooldownKey);
+        if (!entry) return;
+        if (Number(entry.until) > currentMs) {
+          const error = cooldownError(model, entry, currentMs);
+          // Interactive chat treats an active cooldown as terminal. A task
+          // caller can persist the remaining budget and resume after reset.
+          if (callerOwnsRetries && remainingProviderAttempts(activeRetryState) > 0) {
+            error.retryable = true;
+          }
+          throw callerOwnsRetries ? attachRetryState(error, activeRetryState) : error;
+        }
+        cooldownStore.delete(cooldownKey);
+      }
+
       try {
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+          assertNoCooldown();
+          if (callerOwnsRetries && activeRetryState.exhausted) {
+            throw exhaustedRetryError(activeRetryState);
+          }
           // On the final round the model is asked once for an answer without
           // tools, matching the OpenRouter adapter's round-limit behaviour.
           const forceFinalAnswer = round === MAX_TOOL_ROUNDS;
@@ -274,7 +353,7 @@ export function createGeminiProvider({
               : {}),
           };
 
-          const result = await requestGenerate(body, signal);
+          const result = await requestGenerate(body, signal, activeRetryState);
           const candidate = result?.candidates?.[0];
           const parts = candidate?.content?.parts || [];
           const functionCalls = parts.filter((part) => part.functionCall?.name);
@@ -289,14 +368,19 @@ export function createGeminiProvider({
                 provider: this.name,
                 model,
                 toolActivity: activity,
+                ...(callerOwnsRetries ? { retryState: normalizeRetryState(activeRetryState) } : {}),
               };
             }
-            if (!text) throw new Error('Gemini returned a response without message text.');
+            if (!text) {
+              const error = new Error('Gemini returned a response without message text.');
+              throw callerOwnsRetries ? attachRetryState(error, activeRetryState) : error;
+            }
             return {
               text: withApprovalNotice(text, activity),
               provider: this.name,
               model,
               toolActivity: activity,
+              ...(callerOwnsRetries ? { retryState: normalizeRetryState(activeRetryState) } : {}),
             };
           }
 

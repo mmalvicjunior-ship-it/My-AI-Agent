@@ -4,6 +4,7 @@
 // tokens are random 256-bit values, and only the SHA-256 hash of each token is
 // stored in SQLite. Raw tokens never touch the database or any log line.
 import crypto from 'node:crypto';
+import { config } from '../config.js';
 
 export const MIN_PASSWORD_LENGTH = 8;
 export const MAX_PASSWORD_LENGTH = 200;
@@ -15,6 +16,18 @@ const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 64;
 const SCRYPT_MAXMEM = 64 * 1024 * 1024;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Existing architecture has one opaque DB-backed token per sign-in. We renew
+// that same session on activity, bounded by an absolute lifetime so continuous
+// use cannot keep a token alive forever. No new token type is introduced.
+const SESSION_ABSOLUTE_MULTIPLIER = 3;
+const SESSION_ABSOLUTE_MAX_DAYS = 90;
+
+function absoluteSessionDays(days) {
+  const configured = Number.isFinite(days) && days > 0 ? days : 30;
+  return Math.max(configured, Math.min(configured * SESSION_ABSOLUTE_MULTIPLIER, SESSION_ABSOLUTE_MAX_DAYS));
+}
 
 // Stand-in hash used when an email is unknown, so a failed login costs the same
 // scrypt work as a wrong password and does not reveal whether the account exists.
@@ -95,34 +108,68 @@ export function hashToken(token) {
 }
 
 /** Creates a session and returns the raw token exactly once. */
-export function createSession(db, userId, days = 30) {
+export function createSession(db, userId, days = config.authSessionDays) {
   const token = crypto.randomBytes(32).toString('base64url');
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+  const sessionDays = Number.isFinite(days) && days > 0 ? days : config.authSessionDays;
+  const expiresAt = new Date(now.getTime() + sessionDays * DAY_MS).toISOString();
+  // Legacy rows migrated with absolute_expires_at = expires_at, so they never
+  // gain extra lifetime. New sessions get a bounded sliding window.
+  const absoluteExpiresAt = new Date(
+    now.getTime() + absoluteSessionDays(sessionDays) * DAY_MS,
+  ).toISOString();
   db.prepare(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?, ?)',
-  ).run(hashToken(token), userId, now.toISOString(), expiresAt, now.toISOString());
-  return { token, expiresAt };
+    `INSERT INTO sessions
+       (token_hash, user_id, created_at, expires_at, absolute_expires_at, last_used_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    hashToken(token),
+    userId,
+    now.toISOString(),
+    expiresAt,
+    absoluteExpiresAt,
+    now.toISOString(),
+  );
+  return { token, expiresAt, absoluteExpiresAt };
 }
 
-/** Resolves a raw bearer token to its user, deleting expired sessions. */
+/**
+ * Resolves a raw bearer token to its user. A live session is renewed for the
+ * configured window on each authenticated request, but never past its absolute
+ * expiry. Expired, malformed, or unknown tokens are rejected and never renewed.
+ */
 export function findSessionUser(db, token) {
   if (typeof token !== 'string' || token.length < 20) return null;
   const tokenHash = hashToken(token);
   const row = db.prepare(`
-    SELECT s.token_hash, s.expires_at, u.id, u.email, u.created_at, u.is_admin
+    SELECT s.token_hash, s.expires_at, s.absolute_expires_at,
+           u.id, u.email, u.created_at, u.is_admin
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ?
   `).get(tokenHash);
   if (!row) return null;
-  if (Date.parse(row.expires_at) <= Date.now()) {
+  const now = Date.now();
+  const absoluteMs = Date.parse(row.absolute_expires_at || row.expires_at);
+  if (Date.parse(row.expires_at) <= now || absoluteMs <= now) {
     db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
     return null;
   }
-  db.prepare('UPDATE sessions SET last_used_at = ? WHERE token_hash = ?')
-    .run(new Date().toISOString(), tokenHash);
-  return { id: row.id, email: row.email, createdAt: row.created_at, isAdmin: Boolean(row.is_admin) };
+  const renewedMs = Math.min(
+    now + config.authSessionDays * DAY_MS,
+    Number.isFinite(absoluteMs) ? absoluteMs : now,
+  );
+  const renewedExpiresAt = new Date(renewedMs).toISOString();
+  db.prepare('UPDATE sessions SET expires_at = ?, last_used_at = ? WHERE token_hash = ?')
+    .run(renewedExpiresAt, new Date(now).toISOString(), tokenHash);
+  return {
+    id: row.id,
+    email: row.email,
+    createdAt: row.created_at,
+    isAdmin: Boolean(row.is_admin),
+    expiresAt: renewedExpiresAt,
+    absoluteExpiresAt: row.absolute_expires_at || row.expires_at,
+  };
 }
 
 export function deleteSession(db, token) {
@@ -131,7 +178,12 @@ export function deleteSession(db, token) {
 }
 
 export function deleteExpiredSessions(db) {
-  return db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(new Date().toISOString()).changes;
+  const now = new Date().toISOString();
+  return db.prepare(`
+    DELETE FROM sessions
+    WHERE expires_at <= ?
+       OR (absolute_expires_at IS NOT NULL AND absolute_expires_at <= ?)
+  `).run(now, now).changes;
 }
 
 /** Reads `Authorization: Bearer <token>` without logging or echoing it. */

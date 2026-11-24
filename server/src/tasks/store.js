@@ -2,6 +2,8 @@
 // Kept separate from the routes and the runner so both share one definition of
 // the status transitions and never disagree about what a task is allowed to do.
 import { redactSecrets } from '../config.js';
+import { RETRY_POLICY } from '../ai/retry-policy.js';
+import { rejectProposal } from '../proposals/store.js';
 
 export const TASK_STATUSES = Object.freeze([
   'queued',
@@ -230,17 +232,55 @@ export function appendStep(db, taskId, { kind = 'note', title, detail = null, st
 // caller (or another runner) already claimed it.
 export const TERMINAL_PROPOSAL_STATUSES = new Set(['applied', 'rejected', 'failed', 'interrupted']);
 
+/** Rejects every still-pending proposal staged by a task.
+ *  Used when cancellation wins a race after proposals were staged. */
+export function rejectTaskProposals(db, taskId) {
+  const task = getTask(db, taskId);
+  if (!task) return 0;
+  const plan = loadPlan(db, taskId);
+  const proposalIds = Array.isArray(plan?.proposals)
+    ? plan.proposals
+      .map((entry) => (entry && typeof entry === 'object' ? entry.id : entry))
+      .filter(Boolean)
+    : [];
+  let rejected = 0;
+  for (const id of proposalIds) {
+    try {
+      if (rejectProposal(db, task.project_id, id)) rejected += 1;
+    } catch {
+      // Missing or already-terminal proposals need no cleanup.
+    }
+  }
+  return rejected;
+}
+
 export function setWaitingApproval(db, taskId) {
+  // A cancellation that lands while an executor is finishing must win. Without
+  // the cancel guard this transition could revive a cancelled task into a
+  // permanently recoverable waiting state.
   const result = db
-    .prepare("UPDATE tasks SET status = 'waiting_approval', error = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'running'")
+    .prepare("UPDATE tasks SET status = 'waiting_approval', error = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'running' AND COALESCE(cancel_requested, 0) = 0")
     .run(taskId);
   if (result.changes === 0) return null;
   return getTask(db, taskId);
 }
 
+/** Moves a running task to provider_paused only if cancellation has not won.
+ *  Recovery metadata is persisted only after the guarded transition succeeds. */
+export function setProviderPaused(db, taskId, { error, recovery } = {}) {
+  const result = db
+    .prepare("UPDATE tasks SET status = 'provider_paused', error = ?, updated_at = datetime('now') WHERE id = ? AND status = 'running' AND COALESCE(cancel_requested, 0) = 0")
+    .run(error ?? null, taskId);
+  if (result.changes === 0) return null;
+  if (recovery) saveRecoveryInfo(db, taskId, recovery);
+  return getTask(db, taskId);
+}
+
 export function claimReadyWaitingTask(db) {
+  // Inspect every waiting task so an old task with a pending proposal cannot
+  // starve younger tasks whose approvals are already terminal.
   const rows = db
-    .prepare("SELECT id, plan_json FROM tasks WHERE status = 'waiting_approval' ORDER BY id LIMIT 1")
+    .prepare("SELECT id, plan_json FROM tasks WHERE status = 'waiting_approval' ORDER BY id")
     .all();
   for (const row of rows) {
     let proposalIds = [];
@@ -248,7 +288,16 @@ export function claimReadyWaitingTask(db) {
       const plan = JSON.parse(row.plan_json || '{}');
       proposalIds = Array.isArray(plan.proposals) ? plan.proposals.map(p => p?.id || p).filter(Boolean) : [];
     } catch {}
-    if (!proposalIds.length) continue;
+    // A plan with no proposals has nothing to approve. Executor H3 no longer
+    // creates this state, but legacy rows still need a way to reach a terminal
+    // status; the finalize phase resolves them safely.
+    if (proposalIds.length === 0) {
+      const update = db
+        .prepare("UPDATE tasks SET status = 'running', updated_at = datetime('now') WHERE id = ? AND status = 'waiting_approval'")
+        .run(row.id);
+      if (update.changes === 1) return getTask(db, row.id);
+      continue;
+    }
     const placeholders = proposalIds.map(() => '?').join(',');
     const statusRows = db
       .prepare(`SELECT id, status FROM proposals WHERE id IN (${placeholders})`)
@@ -282,16 +331,18 @@ export function claimNextQueued(db) {
   return getTask(db, candidate.id);
 }
 
-export function finishTask(db, taskId, status, error = null) {
+export function finishTask(db, taskId, status, error = null, { requireNoCancel = false } = {}) {
   const safeError = error ? redactSecrets(String(error)) : null;
-  db.prepare(`
+  const guard = requireNoCancel ? ' AND COALESCE(cancel_requested, 0) = 0' : '';
+  const result = db.prepare(`
     UPDATE tasks
     SET status = ?,
         error = ?,
         finished_at = datetime('now'),
         updated_at = datetime('now')
-    WHERE id = ?
+    WHERE id = ?${guard}
   `).run(status, safeError, taskId);
+  if (result.changes === 0) return null;
   return getTask(db, taskId);
 }
 
@@ -320,6 +371,11 @@ export function requestCancel(db, task) {
       WHERE id = ?
     `).run(task.id);
     return { task: getTask(db, task.id), accepted: true };
+  }
+  // Cancelling a waiting task must not leave staged proposals pending for a
+  // review that can never happen. Reject them so they cannot be applied later.
+  if (task.status === 'waiting_approval') {
+    rejectTaskProposals(db, task.id);
   }
   db.prepare(`
     UPDATE tasks
@@ -351,10 +407,91 @@ export function loadRecoveryInfo(db, taskId) {
   return plan?.recovery || null;
 }
 
+export function failExhaustedRecoverableTasks(db) {
+  const rows = db.prepare(`
+    SELECT id, project_id, plan_json, cancel_requested FROM tasks
+    WHERE status = 'provider_paused' ORDER BY id
+  `).all();
+  const exhaustedMessage = 'Automatic provider recovery stopped after the maximum number of attempts. The task was not completed; review the provider status before starting it again.';
+  const quotaMessage = 'Provider quota is exhausted; automatic retries were stopped to avoid further rejected requests.';
+  let failedCount = 0;
+  for (const row of rows) {
+    let rec = null;
+    try {
+      rec = JSON.parse(row.plan_json || '{}').recovery || null;
+    } catch {}
+
+    // A paused row with a cancellation flag is a lost race, not a resumable
+    // task. Finalize it as cancelled and discard any staged proposals.
+    if (Number(row.cancel_requested || 0)) {
+      const cancelled = db.prepare(`
+        UPDATE tasks
+        SET status = 'cancelled', error = NULL,
+            finished_at = datetime('now'), updated_at = datetime('now')
+        WHERE id = ? AND status = 'provider_paused' AND COALESCE(cancel_requested, 0) = 1
+      `).run(row.id);
+      if (cancelled.changes === 1) {
+        rejectTaskProposals(db, row.id);
+        appendStep(db, row.id, {
+          kind: 'note',
+          title: 'Cancelled',
+          detail: 'Stopped at your request while provider recovery was pending.',
+        });
+      }
+      continue;
+    }
+
+    const retryAttempt = Number(rec?.retryAttempt ?? rec?.retryState?.attemptsUsed);
+    const stateExhausted = Boolean(rec?.retryState?.exhausted)
+      || Number(rec?.retryState?.attemptsUsed) >= RETRY_POLICY.maxProviderAttempts;
+    const reason = String(rec?.reason || '');
+    const category = String(rec?.category || rec?.errorType || '');
+    // Old-format rows could persist a quota pause with a future nextRetryAt.
+    // They must be terminal now; resuming them only burns more quota.
+    const quotaExhausted = rec?.terminal === true
+      || reason === 'provider_quota_exhausted'
+      || category === 'QUOTA_EXHAUSTED';
+    if (
+      !quotaExhausted
+      && (!Number.isFinite(retryAttempt) || retryAttempt < RETRY_POLICY.maxRecoveryAttempts)
+      && !stateExhausted
+    ) continue;
+
+    const detail = quotaExhausted ? quotaMessage : exhaustedMessage;
+    const failed = db.prepare(`
+      UPDATE tasks
+      SET status = 'failed', error = ?, finished_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND status = 'provider_paused' AND COALESCE(cancel_requested, 0) = 0
+    `).run(redactSecrets(detail), row.id);
+    if (failed.changes === 1) {
+      if (quotaExhausted && rec) {
+        saveRecoveryInfo(db, row.id, {
+          ...rec,
+          reason: 'provider_quota_exhausted',
+          terminal: true,
+          nextRetryAt: undefined,
+        });
+      }
+      appendStep(db, row.id, {
+        kind: 'note',
+        title: quotaExhausted ? 'Provider quota reached' : 'Recovery attempts exhausted',
+        detail,
+        status: 'failed',
+      });
+      failedCount += 1;
+    }
+  }
+  return failedCount;
+}
+
 export function claimRecoverableTask(db) {
   const now = Date.now();
+  failExhaustedRecoverableTasks(db);
+  // Check every paused task: an old task with a distant cooldown must not block
+  // a younger task whose retry time has already arrived.
   const rows = db.prepare(`
-    SELECT id, plan_json FROM tasks WHERE status = 'provider_paused' ORDER BY id LIMIT 1
+    SELECT id, plan_json, cancel_requested FROM tasks
+    WHERE status = 'provider_paused' ORDER BY id
   `).all();
   for (const row of rows) {
     let rec = null;
@@ -363,16 +500,23 @@ export function claimRecoverableTask(db) {
       rec = plan.recovery || null;
     } catch {}
     const retryAt = rec?.nextRetryAt ? Number(new Date(rec.nextRetryAt).getTime()) : null;
+    const retryAttempt = Number(rec?.retryAttempt ?? rec?.retryState?.attemptsUsed);
     // Cancellation takes priority over recovery scheduling. A task that was
     // cancelled while paused is not resumed, even if its retry time passed.
     if (Number(row.cancel_requested || 0)) continue;
-    // Conservative: resume only if retry time is known and passed, or unknown but
-    // we allow one bounded availability check (avoids repeated quota-consuming requests).
-    if (retryAt !== null && retryAt <= now) {
+    // Terminal recovery metadata is never resumed, even if an old row still
+    // carries a nextRetryAt timestamp.
+    if (
+      rec?.terminal === true
+      || rec?.reason === 'provider_quota_exhausted'
+      || String(rec?.category || rec?.errorType || '') === 'QUOTA_EXHAUSTED'
+    ) continue;
+
+    // Unknown resets stay paused until a reset is known.
+    if (retryAt !== null && retryAt <= now && Number.isFinite(retryAttempt) && retryAttempt >= 0) {
       const update = db.prepare("UPDATE tasks SET status = 'running', updated_at = datetime('now') WHERE id = ? AND status = 'provider_paused'").run(row.id);
       if (update.changes === 1) return getTask(db, row.id);
     }
-    // Unknown reset: do not resume automatically to avoid consuming quota.
   }
   return null;
 }

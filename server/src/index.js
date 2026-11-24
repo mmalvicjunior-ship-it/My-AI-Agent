@@ -262,6 +262,23 @@ export function createApp(options = {}) {
       }
     }
     const ownerId = isBypassUser(req.user) ? null : req.user.id;
+    // Idempotent import: retrying "Open existing project" reopens the existing
+    // owned record for that real path instead of silently accumulating
+    // duplicate projects. Managed new workspaces keep their existing behavior
+    // (same name may be created more than once). Matching is scoped to this
+    // owner only, so one account can never discover or reuse another account's
+    // project.
+    const existing = rootPath === null ? null : (ownerId === null
+      ? db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id IS NULL AND root_path = ? ORDER BY id LIMIT 1').get(rootPath)
+      : db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id = ? AND root_path = ? ORDER BY id LIMIT 1').get(ownerId, rootPath));
+    if (existing) {
+      return res.json({
+        ok: true,
+        existing: true,
+        project: { id: existing.id, name: existing.name },
+      });
+    }
+
     const result = db
       .prepare('INSERT INTO projects (name, root_path, owner_id) VALUES (?, ?, ?)')
       .run(name, rootPath, ownerId);

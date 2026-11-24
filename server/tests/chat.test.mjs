@@ -564,6 +564,81 @@ test('chat exposes quota error category and Retry-After without exposing secrets
   assert.ok(!JSON.stringify(data).includes(secret));
 });
 
+test('chat caps Retry-After exposed to the client', async () => {
+  const provider = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat() {
+      const error = new Error('rate limited');
+      error.statusCode = 429;
+      error.category = 'RATE_LIMITED';
+      error.retryAfterMs = 90 * 24 * 60 * 60 * 1000;
+      error.publicMessage = 'Rate limited. Please retry later.';
+      throw error;
+    },
+  };
+  const api = await startServer(createApp({ auth: false, provider, providerName: 'gemini' }).app);
+
+  const { status, data } = await api.post('/api/chat', { message: 'hi' });
+  assert.equal(status, 429);
+  assert.ok(data.retryAfterSeconds > 0);
+  assert.ok(
+    data.retryAfterSeconds <= 24 * 60 * 60,
+    'the client Retry-After must be capped at 24 hours',
+  );
+});
+
+test('chat propagates a client disconnect to the provider via AbortSignal', async () => {
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  let signalObserved = false;
+
+  const provider = {
+    name: 'gemini',
+    model: 'gemini-3.8-flash',
+    async chat({ signal }) {
+      signalStarted();
+      return new Promise((resolve, reject) => {
+        if (!signal) return resolve({ text: 'No signal.' });
+        if (signal.aborted) {
+          signalObserved = true;
+          return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        }
+        signal.addEventListener('abort', () => {
+          signalObserved = true;
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    },
+  };
+
+  const app = createApp({ auth: false, provider, providerName: 'gemini' }).app;
+  const server = app.listen(0);
+  await once(server, 'listening');
+  servers.push(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const controller = new AbortController();
+  const request = fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message: 'hi' }),
+    signal: controller.signal,
+  }).catch(() => null);
+
+  await started;
+  controller.abort();
+  await request;
+
+  // The client sees the disconnect immediately; allow the server a moment to
+  // propagate the abort into the provider call before asserting.
+  const deadline = Date.now() + 2000;
+  while (!signalObserved && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(signalObserved, true, 'provider must observe the client disconnect signal');
+});
+
 test('health exposes explicit fallback configuration without exposing keys', async () => {
   const savedFallback = config.aiFallbackProvider;
   const savedAiKey = config.aiApiKey;

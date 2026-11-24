@@ -53,6 +53,17 @@ export function quickActionsFor({ hasProject = false, npmScriptsEnabled = false,
   return actions;
 }
 
+/** Inserts or refreshes one project by ID without duplicating an existing row. */
+export function upsertProject(projects, project) {
+  const list = Array.isArray(projects) ? projects : [];
+  if (project === null || project === undefined || project.id === null || project.id === undefined) return list;
+  const index = list.findIndex((item) => String(item?.id) === String(project.id));
+  if (index === -1) return [project, ...list];
+  const next = [...list];
+  next[index] = { ...next[index], ...project };
+  return next;
+}
+
 /** Positive numeric ID for a project that exists in the current list. */
 export function matchingProjectId(projects, projectId) {
   const wanted = projectId === null || projectId === undefined || projectId === '' ? null : String(projectId);
@@ -98,12 +109,15 @@ export function validatedChatProjectId({
 } = {}) {
   if (!projectsLoaded) return null;
   const candidate = activeProject || null;
-  const validated = candidate
-    ? matchingProjectId([candidate], candidate.id)
-    : matchingProjectId(projects, projectId);
-  if (validated === null) return null;
-  if (candidate && projectId && String(candidate.id) !== String(projectId)) return null;
-  return validated;
+  if (candidate) {
+    const candidateId = matchingProjectId([candidate], candidate.id);
+    // The active project must also be present in the account's loaded list.
+    // Validating the object alone would let a stale or foreign project through.
+    if (candidateId === null || matchingProjectId(projects, candidateId) === null) return null;
+    if (projectId && String(candidateId) !== String(projectId)) return null;
+    return candidateId;
+  }
+  return matchingProjectId(projects, projectId);
 }
 
 /** Chat request context: always current auth/project state, never retry state. */
@@ -122,6 +136,198 @@ export function chatRequestContext({
     token: authToken || null,
     projectId: validatedChatProjectId({ projects, projectId, activeProject, projectsLoaded }),
   };
+}
+
+/**
+ * User-visible workspace selection state. Keep loading, load failure, empty
+ * ownership, stale restoration, missing selection, and ready states distinct
+ * so none of them are mistaken for a provider or backend failure.
+ */
+export function workspaceSelectionState({
+  loading = false,
+  loadError = null,
+  projects = [],
+  projectId = '',
+  activeProject = null,
+  staleRestoredProjectId = '',
+} = {}) {
+  if (loading) {
+    return {
+      status: 'loading',
+      ready: false,
+      projectId: null,
+      message: 'Loading your authorized projects…',
+    };
+  }
+  if (loadError) {
+    return {
+      status: 'load_error',
+      ready: false,
+      projectId: null,
+      message: 'Could not load your authorized projects. Retry or reload the page.',
+    };
+  }
+
+  const list = Array.isArray(projects) ? projects : [];
+  if (list.length === 0) {
+    return {
+      status: 'no_projects',
+      ready: false,
+      projectId: null,
+      message: 'No authorized projects are available. Add a project or ask an administrator to assign one.',
+    };
+  }
+
+  const stale = Boolean(staleRestoredProjectId)
+    && matchingProjectId(list, staleRestoredProjectId) === null;
+  const validated = validatedChatProjectId({
+    projects: list,
+    projectId,
+    activeProject,
+    projectsLoaded: true,
+  });
+  if (validated === null) {
+    return {
+      status: stale ? 'stale_selection' : 'needs_selection',
+      ready: false,
+      projectId: null,
+      message: stale
+        ? 'Your previously selected project is no longer available. Select an authorized project.'
+        : 'Select an authorized project to let the agent inspect its files.',
+    };
+  }
+
+  const project = list.find((item) => String(item.id) === String(validated)) || activeProject;
+  const projectName = project?.name || String(validated);
+  return {
+    status: stale ? 'stale_selection' : 'ready',
+    ready: true,
+    projectId: validated,
+    message: stale
+      ? `Your previously selected project is no longer available. Using ${projectName}; you can change it in the project list.`
+      : `Workspace ready: ${projectName}`,
+  };
+}
+
+/** Only a verified selection may be shown as the currently active workspace. */
+export function verifiedWorkspaceProject({ projects = [], selection = null } = {}) {
+  if (!selection?.ready || selection.projectId === null || selection.projectId === undefined) return null;
+  const list = Array.isArray(projects) ? projects : [];
+  return list.find((project) => String(project?.id) === String(selection.projectId)) || null;
+}
+
+/** Shared message for send paths that are temporarily blocked by project loading. */
+export function workspaceLoadingMessage(loading = false) {
+  return loading ? 'Loading your authorized projects. Try again in a moment.' : null;
+}
+
+/**
+ * Guards an async project creation against an account switch, a newer project
+ * load, a scope change, or sign-out that happened while the request was in
+ * flight. A stale response must be discarded rather than applied.
+ */
+export function isCurrentProjectCreationScope({
+  authenticated = false,
+  currentUserId = null,
+  requestUserId = null,
+  currentGeneration = 0,
+  requestGeneration = 0,
+  currentScope = null,
+  requestScope = null,
+} = {}) {
+  return Boolean(authenticated)
+    && currentUserId === requestUserId
+    && currentGeneration === requestGeneration
+    && currentScope === requestScope;
+}
+
+/**
+ * Turns the existing path-safe /tree response into a small, user-visible
+ * summary of what the agent can see. Missing metadata stays absent; no extra
+ * scan is started by the UI.
+ */
+export function workspaceScanSummary(result = null) {
+  const files = Array.isArray(result?.files) ? result.files : [];
+  const directories = Array.isArray(result?.directories) ? result.directories : [];
+  const manifests = Array.isArray(result?.manifests) ? result.manifests : [];
+  const errors = Array.isArray(result?.errors) ? result.errors : [];
+  return {
+    fileCount: files.length,
+    directoryCount: directories.length,
+    manifestCount: manifests.length,
+    languageHints: Array.isArray(result?.languageHints) ? result.languageHints : [],
+    frameworkHints: Array.isArray(result?.frameworkHints) ? result.frameworkHints : [],
+    skipped: Number.isFinite(result?.skipped) ? result.skipped : 0,
+    truncated: Boolean(result?.truncated),
+    errorCount: errors.length,
+  };
+}
+
+/** Scanning progress/result state shared by the welcome banner and files dock. */
+export function workspaceScanStatus({
+  hasProject = false,
+  loading = false,
+  error = null,
+  result = null,
+} = {}) {
+  if (!hasProject) {
+    return {
+      status: 'unavailable',
+      message: 'Select an authorized project to let the agent inspect its files.',
+      summary: null,
+    };
+  }
+  if (loading) {
+    return {
+      status: 'scanning',
+      message: 'Scanning the selected workspace with the safe file scanner…',
+      summary: null,
+    };
+  }
+  if (error) {
+    return {
+      status: 'failed',
+      message: 'Workspace scan failed. Retry to let the agent inspect the files.',
+      summary: null,
+    };
+  }
+  if (result) {
+    const summary = workspaceScanSummary(result);
+    const hints = [...summary.frameworkHints, ...summary.languageHints].slice(0, 4);
+    const details = [`${summary.fileCount} files`, `${summary.directoryCount} folders`];
+    if (hints.length) details.push(hints.join(', '));
+    if (summary.truncated) details.push('partial scan');
+    return {
+      status: 'complete',
+      message: `Workspace ready: ${details.join(' · ')}.`,
+      summary,
+    };
+  }
+  return {
+    status: 'idle',
+    message: 'Workspace selected. Preparing the safe file scan…',
+    summary: null,
+  };
+}
+
+/**
+ * Only a verified, authenticated selection may start the existing safe scan.
+ * This prevents scans during project loading, after sign-out, or for a stale
+ * project ID that belongs to another account.
+ */
+export function shouldStartWorkspaceScan({
+  authenticated = false,
+  projectId = '',
+  workspaceReady = false,
+} = {}) {
+  const id = Number(projectId);
+  return Boolean(
+    authenticated
+    && workspaceReady
+    && projectId !== ''
+    && Number.isInteger(id)
+    && id > 0,
+  );
 }
 
 /** Human-readable workspace banner text derived from the backend reason. */

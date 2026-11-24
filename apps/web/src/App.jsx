@@ -11,6 +11,8 @@ import {
   createAuthCallbackRunner,
   googleErrorMessage,
   parseAuthFragment,
+  renewExistingSession,
+  shouldApplyRenewalResult,
   shouldClearWorkspaceForAuthChange,
   shouldSignOutFor401,
 } from './authFlow.js';
@@ -19,9 +21,17 @@ import {
   activeProjectIdForPersistence,
   buildPromptWithAttachment,
   chatRequestContext,
+  isCurrentProjectCreationScope,
+  matchingProjectId,
   quickActionsFor,
   responseScopeKey,
   selectRestoredProjectId,
+  shouldStartWorkspaceScan,
+  upsertProject,
+  verifiedWorkspaceProject,
+  workspaceLoadingMessage,
+  workspaceScanStatus,
+  workspaceSelectionState,
   workspaceStatusMessage,
 } from './workspaceUiHelpers.js';
 
@@ -449,11 +459,16 @@ function App() {
   });
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState('');
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsLoadError, setProjectsLoadError] = useState(null);
+  const [staleRestoredProjectId, setStaleRestoredProjectId] = useState('');
   const [toast, setToast] = useState(null);
   const [retryRequest, setRetryRequest] = useState(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceScan, setWorkspaceScan] = useState({ status: 'idle', error: null, result: null });
+  const [scanRequest, setScanRequest] = useState(0);
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileContent, setFileContent] = useState('');
   const [fileSearch, setFileSearch] = useState('');
@@ -484,10 +499,30 @@ function App() {
     () => (initialAuthFragment.error ? googleErrorMessage(initialAuthFragment.error) : null),
   );
   const authRef = useRef(auth);
+  // Incremented on every sign-out/account switch and on a newly accepted auth
+  // result. Async callbacks compare it before touching workspace state.
+  const authTransitionGenerationRef = useRef(0);
+  const renewalStateRef = useRef({ inFlightToken: null });
   const authUserId = auth?.user?.id ?? null;
   const activeProject = projects.find((project) => String(project.id) === String(projectId)) || null;
+  const workspaceSelection = workspaceSelectionState({
+    loading: projectsLoading,
+    loadError: projectsLoadError,
+    projects,
+    projectId,
+    activeProject,
+    staleRestoredProjectId,
+  });
+  const visibleProject = verifiedWorkspaceProject({ projects, selection: workspaceSelection });
+  const workspaceScanView = workspaceScanStatus({
+    hasProject: Boolean(visibleProject),
+    loading: workspaceLoading,
+    error: workspaceScan.error,
+    result: workspaceScan.result,
+  });
   const projectsLoadedRef = useRef(false);
   const projectsScopeRef = useRef(null);
+  const projectsLoadGenerationRef = useRef(0);
   const previousAuthUserIdRef = useRef(authUserId);
   const waitingTaskCount = tasks.filter((task) => task.status === 'waiting_approval').length;
   // Keep the latest task query inputs available to the stable loadTasks
@@ -523,15 +558,21 @@ function App() {
     persistActiveProjectId(userId, '');
     projectsLoadedRef.current = false;
     projectsScopeRef.current = null;
+    projectsLoadGenerationRef.current += 1;
     setProjects([]);
     setProjectId('');
+    setProjectsLoading(true);
+    setProjectsLoadError(null);
+    setStaleRestoredProjectId('');
     setWorkspaceFiles([]);
     setWorkspaceLoading(false);
+    setWorkspaceScan({ status: 'idle', error: null, result: null });
     setSelectedFile(null);
     setFileContent('');
     setFileSearch('');
     setCodeSearchResults([]);
     setProjectDialogOpen(false);
+    setProjectBusy(false);
     setProjectError(null);
     setTasks([]);
     setProjectProposals([]);
@@ -546,6 +587,7 @@ function App() {
   }, []);
 
   const clearSession = useCallback((userId = null, { keepError = false } = {}) => {
+    authTransitionGenerationRef.current += 1;
     clearWorkspaceState(userId);
     if (!keepError) setAuthError(null);
     applyAuth(null);
@@ -610,6 +652,7 @@ function App() {
     authCallbackRunnerRef.current = createAuthCallbackRunner({
       apiBase: API_BASE,
       fetchImpl: (...args) => globalThis.fetch(...args),
+      getTransitionGeneration: () => authTransitionGenerationRef.current,
       clearHash: () => {
         if (window.history?.replaceState) {
           window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
@@ -618,6 +661,7 @@ function App() {
       onAuthenticated: (token, user, expiresAt) => {
         setAuthError(null);
         setAuthChecking(false);
+        authTransitionGenerationRef.current += 1;
         applyAuthRef.current({ token, user, expiresAt });
       },
       onError: (message) => {
@@ -640,6 +684,7 @@ function App() {
     }
 
     let cancelled = false;
+    const generation = authTransitionGenerationRef.current;
     const stored = readStoredAuth();
     const token = chooseAuthTokenForInitialization({
       callbackToken: null,
@@ -652,18 +697,37 @@ function App() {
     setAuthChecking(true);
     (async () => {
       try {
-        const response = await globalThis.fetch(`${API_BASE}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${token}` },
+        const result = await renewExistingSession({
+          token,
+          expectedUserId: stored?.user?.id ?? null,
+          apiBase: API_BASE,
+          endpoint: '/api/auth/me',
+          fetchImpl: globalThis.fetch,
+          state: renewalStateRef.current,
         });
-        const data = await response.json().catch(() => null);
-        if (cancelled) return;
-        if (response.status === 401) {
-          clearSession(stored?.user?.id ?? null);
-        } else if (response.ok && data?.ok && data.user) {
+        // A sign-out or account switch during renewal must discard the result.
+        if (cancelled || !shouldApplyRenewalResult({
+          result,
+          generationAtStart: generation,
+          currentGeneration: authTransitionGenerationRef.current,
+          requestToken: token,
+          currentToken: authRef.current?.token ?? null,
+        })) return;
+        if (result.status === 'invalid') {
+          if (result.reason === 'identity_mismatch') {
+            setAuthError('Your saved session did not match this account. Sign in again.');
+          }
+          clearSession(stored?.user?.id ?? null, { keepError: result.reason === 'identity_mismatch' });
+        } else if (result.status === 'authenticated') {
           setAuthError(null);
-          applyAuth({ ...stored, token, user: data.user });
+          applyAuth({
+            ...stored,
+            token,
+            user: result.user,
+            expiresAt: result.expiresAt ?? stored?.expiresAt,
+          });
         }
-        // A 5xx or network failure keeps the stored session for implicit retry.
+        // "unavailable"/"in_flight" keep the stored session without retrying.
       } catch {
         /* Server unreachable: keep the stored session. */
       } finally {
@@ -749,12 +813,22 @@ function App() {
   useEffect(() => {
     if (!auth || !projectsLoadedRef.current) return;
     if (projectsScopeRef.current !== responseScopeKey(authUserId, null)) return;
+    const storedProjectId = readActiveProjectId(authUserId);
+    const hasUsableStoredProject = matchingProjectId(projects, storedProjectId) !== null;
     const next = selectRestoredProjectId({
       projects,
       currentProjectId: projectId,
-      storedProjectId: readActiveProjectId(authUserId),
+      storedProjectId,
       projectsLoaded: true,
     });
+    if (storedProjectId && !hasUsableStoredProject) {
+      setStaleRestoredProjectId(storedProjectId);
+      // A deleted or foreign saved project must not survive in this account's
+      // storage, even when no replacement is available yet.
+      if (!next) persistActiveProjectId(authUserId, '');
+    } else {
+      setStaleRestoredProjectId('');
+    }
     if (next !== projectId) setProjectId(next);
   }, [auth, authUserId, projects, projectId]);
 
@@ -797,6 +871,47 @@ function App() {
     }
   }, [selectedProvider]);
 
+  const loadProjects = useCallback(async () => {
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, null);
+    const generation = ++projectsLoadGenerationRef.current;
+    const isCurrent = () => generation === projectsLoadGenerationRef.current
+      && responseScopeKey(authRef.current?.user?.id ?? null, null) === scope;
+
+    if (!authRef.current) {
+      if (!isCurrent()) return;
+      projectsLoadedRef.current = true;
+      projectsScopeRef.current = null;
+      setProjects([]);
+      setProjectId('');
+      setStaleRestoredProjectId('');
+      setProjectsLoadError(null);
+      setProjectsLoading(false);
+      return;
+    }
+
+    projectsLoadedRef.current = false;
+    projectsScopeRef.current = scope;
+    setProjectsLoading(true);
+    setProjectsLoadError(null);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects`);
+      if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
+      const data = await response.json();
+      if (!isCurrent()) return;
+      setProjects(Array.isArray(data.projects) ? data.projects : []);
+      projectsLoadedRef.current = true;
+      setProjectsLoading(false);
+    } catch (error) {
+      if (!isCurrent()) return;
+      console.warn('Could not load projects.', error);
+      // A failed load is never "loaded": chat scope stays blocked, but the UI
+      // can now distinguish this from an empty authorized project list.
+      projectsLoadedRef.current = false;
+      setProjectsLoadError('Could not load your authorized projects.');
+      setProjectsLoading(false);
+    }
+  }, [apiFetch]);
+
   useEffect(() => {
     let cancelled = false;
     const accountScope = () => responseScopeKey(authRef.current?.user?.id ?? null, null);
@@ -830,44 +945,27 @@ function App() {
         });
       }
     };
-    const loadProjects = async () => {
-      if (!authRef.current) {
-        if (!cancelled) {
-          projectsLoadedRef.current = true;
-          projectsScopeRef.current = null;
-          setProjects([]);
-          setProjectId('');
-        }
-        return;
-      }
-      const scope = accountScope();
-      projectsLoadedRef.current = false;
-      projectsScopeRef.current = scope;
-      try {
-        const response = await apiFetch(`${API_BASE}/api/projects`);
-        if (!response.ok) throw new Error(`Projects request returned ${response.status}`);
-        const data = await response.json();
-        if (!cancelled && accountScope() === scope) {
-          setProjects(Array.isArray(data.projects) ? data.projects : []);
-          projectsLoadedRef.current = true;
-        }
-      } catch (error) {
-        if (!cancelled && accountScope() === scope) console.warn('Could not load projects.', error);
-      }
-    };
     checkHealth();
     loadProjects();
     const timer = window.setInterval(checkHealth, 15000);
     return () => {
       cancelled = true;
+      projectsLoadGenerationRef.current += 1;
       window.clearInterval(timer);
     };
-  }, [apiFetch, auth?.token]);
+  }, [apiFetch, auth?.token, loadProjects]);
 
+  // A verified selection (including a restored one after browser refresh)
+  // starts the existing safe /tree scan automatically. `scanRequest` also lets
+  // an explicit "open" of the same project rescan without changing selection.
   useEffect(() => {
-    if (!authRef.current) return;
+    if (!shouldStartWorkspaceScan({
+      authenticated: Boolean(authRef.current),
+      projectId,
+      workspaceReady: workspaceSelection.ready,
+    })) return;
     loadWorkspaceFiles(projectId);
-  }, [projectId, auth?.token]);
+  }, [projectId, auth?.token, scanRequest, workspaceSelection.ready]);
 
   useEffect(() => {
     const list = messageListRef.current;
@@ -897,6 +995,13 @@ function App() {
 
   const requestReply = useCallback(async ({ sessionId, prompt, history, attachment: requestAttachment = null }) => {
     if (generating) return;
+    // Shared final guard for every send path, including regenerate and the
+    // toast Retry button, so no caller can silently send without workspace scope.
+    const loadingMessage = workspaceLoadingMessage(projectsLoading);
+    if (loadingMessage) {
+      setToast({ message: loadingMessage });
+      return;
+    }
     if (!health.online) {
       setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
       setToast({ message: 'The API is offline. Check that the server is running, then retry.' });
@@ -917,7 +1022,7 @@ function App() {
       projects,
       projectId,
       activeProject,
-      projectsLoaded: projectsLoadedRef.current,
+      projectsLoaded: !projectsLoading && !projectsLoadError,
       retryRequest,
     });
     try {
@@ -975,13 +1080,18 @@ function App() {
       }
     }
   }, [activeProject, generating, health.online, health.provider, projects, projectId,
-    retryRequest, selectedProvider, updateSession]);
+    projectsLoading, projectsLoadError, retryRequest, selectedProvider, updateSession]);
 
   const sendMessage = useCallback(async (value = input) => {
     const rawPrompt = typeof value === 'string' ? value : '';
     const displayPrompt = attachment ? `${rawPrompt}\n\n📎 ${attachment.name}` : rawPrompt;
     const prompt = buildPromptWithAttachment(rawPrompt, attachment);
     if (!rawPrompt.trim() || generating || !activeSession) return;
+    const loadingMessage = workspaceLoadingMessage(projectsLoading);
+    if (loadingMessage) {
+      setToast({ message: loadingMessage });
+      return;
+    }
     if (prompt.length > MAX_CHARS) {
       setToast({ message: `Messages must be ${MAX_CHARS.toLocaleString()} characters or fewer.` });
       return;
@@ -1007,7 +1117,7 @@ function App() {
     setDiffPreview(false);
     setRetryRequest(null);
     await requestReply({ sessionId: activeSession.id, prompt: rawPrompt, history, attachment });
-  }, [activeSession, attachment, generating, input, requestReply, updateSession]);
+  }, [activeSession, attachment, generating, input, projectsLoading, requestReply, updateSession]);
 
   const stopGeneration = () => {
     controllerRef.current?.abort();
@@ -1077,6 +1187,21 @@ function App() {
     }
     setProjectBusy(true);
     setProjectError(null);
+    const requestUserId = authRef.current?.user?.id ?? null;
+    const requestScope = responseScopeKey(requestUserId, null);
+    // A `let` allows the successful POST to adopt a fresh generation: that
+    // invalidates any older GET already in flight before it can erase the new
+    // project, while keeping this request's later steps valid.
+    let requestGeneration = projectsLoadGenerationRef.current;
+    const isCurrentRequest = () => isCurrentProjectCreationScope({
+      authenticated: Boolean(authRef.current),
+      currentUserId: authRef.current?.user?.id ?? null,
+      requestUserId,
+      currentGeneration: projectsLoadGenerationRef.current,
+      requestGeneration,
+      currentScope: projectsScopeRef.current,
+      requestScope,
+    });
     try {
       const response = await apiFetch(`${API_BASE}/api/projects`, {
         method: 'POST',
@@ -1086,29 +1211,52 @@ function App() {
           ...(existingPath ? { path: existingPath } : {}),
         }),
       });
+      // A response belonging to an account or load generation that is no
+      // longer current must be discarded without touching newer UI state.
+      if (!isCurrentRequest()) return;
       const result = await response.json();
+      if (!isCurrentRequest()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not add the project.');
-      setProjects((current) => [result.project, ...current]);
+      setProjects((current) => upsertProject(current, result.project));
       setProjectId(String(result.project.id));
+      // Invalidate older project-list loads now that the POST succeeded. Their
+      // stale responses will fail the generation check in loadProjects().
+      projectsLoadGenerationRef.current += 1;
+      requestGeneration = projectsLoadGenerationRef.current;
+      projectsLoadedRef.current = true;
+      projectsScopeRef.current = requestScope;
+      setProjectsLoading(false);
+      setProjectsLoadError(null);
+      setStaleRestoredProjectId('');
       // The next scoped file load starts before React commits the new project.
       projectIdRef.current = String(result.project.id);
-      persistActiveProjectId(authUserId, String(result.project.id));
+      persistActiveProjectId(requestUserId, String(result.project.id));
       setProjectDialogOpen(false);
       setWorkspaceTab('files');
       setWorkspaceOpen(true);
-      await loadWorkspaceFiles(String(result.project.id));
-      setToast({ message: `Project “${result.project.name}” is ready.` });
+      // Selection effect owns the scan, so one open produces exactly one scan.
+      // Bump the request in case the idempotent POST reopened the same project.
+      setScanRequest((value) => value + 1);
+      if (!isCurrentRequest()) return;
+      setToast({
+        message: result.existing
+          ? `Project “${result.project.name}” is already in your workspace.`
+          : `Project “${result.project.name}” is ready.`,
+      });
     } catch (error) {
-      setProjectError(error.message);
+      if (isCurrentRequest()) setProjectError(error.message);
     } finally {
-      setProjectBusy(false);
+      if (isCurrentRequest()) setProjectBusy(false);
     }
   };
 
   const selectProject = (id) => {
+    if (matchingProjectId(projects, id) === null) return;
     setProjectId(String(id));
+    setStaleRestoredProjectId('');
     setWorkspaceTab('files');
     setCodeSearchResults([]);
+    setScanRequest((value) => value + 1);
   };
 
   const resumeTask = (taskId) => {
@@ -1213,17 +1361,22 @@ function App() {
       setSelectedFile(null);
       setFileContent('');
       setWorkspaceLoading(false);
+      setWorkspaceScan({ status: 'idle', error: null, result: null });
       return;
     }
     setWorkspaceLoading(true);
+    setWorkspaceScan({ status: 'scanning', error: null, result: null });
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not scan the project.');
       if (!isCurrent()) return;
       setWorkspaceFiles(Array.isArray(result.files) ? result.files : []);
+      setWorkspaceScan({ status: 'complete', error: null, result });
     } catch (error) {
-      if (isCurrent()) setToast({ message: error.message });
+      if (!isCurrent()) return;
+      setWorkspaceScan({ status: 'failed', error: error.message, result: null });
+      setToast({ message: `Workspace scan failed: ${error.message}` });
     } finally {
       if (isCurrent()) setWorkspaceLoading(false);
     }
@@ -1450,6 +1603,11 @@ function App() {
 
   const regenerate = (messageIndex) => {
     if (generating || !activeSession) return;
+    const loadingMessage = workspaceLoadingMessage(projectsLoading);
+    if (loadingMessage) {
+      setToast({ message: loadingMessage });
+      return;
+    }
     let lastUserIndex = -1;
     for (let i = messageIndex - 1; i >= 0; i -= 1) {
       if (messages[i].role === 'user') {
@@ -1500,8 +1658,13 @@ function App() {
 
   const createTask = useCallback(async () => {
     const prompt = taskInput.trim();
-    if (!projectId) {
-      setToast({ message: 'Select or create a project before starting a task.' });
+    const loadingMessage = workspaceLoadingMessage(projectsLoading);
+    if (loadingMessage) {
+      setToast({ message: loadingMessage });
+      return;
+    }
+    if (!workspaceSelection.ready || !visibleProject) {
+      setToast({ message: workspaceSelection.message || 'Select an authorized project before starting a task.' });
       return;
     }
     if (!prompt) {
@@ -1517,7 +1680,7 @@ function App() {
       const response = await apiFetch(`${API_BASE}/api/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId: projectId ? Number(projectId) : undefined, instruction: prompt }),
+        body: JSON.stringify({ projectId: Number(visibleProject.id), instruction: prompt }),
       });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not create task.');
@@ -1530,12 +1693,13 @@ function App() {
       setFocusTaskId(result.task.id);
       setWorkspaceTab('tasks');
       setWorkspaceOpen(true);
-      setToast({ message: `Task created in ${activeProject?.name || 'this project'}.` });
+      setToast({ message: `Task created in ${visibleProject.name}.` });
     } catch (error) {
       setTaskSubmitting(false);
       setToast({ message: error.message });
     }
-  }, [projectId, taskInput, loadTasks, loadTaskDetail, activeProject?.name]);
+  }, [projectsLoading, workspaceSelection.ready, workspaceSelection.message, visibleProject,
+    taskInput, loadTasks, loadTaskDetail]);
 
   const cancelTask = useCallback(async (taskId) => {
     try {
@@ -1618,10 +1782,10 @@ function App() {
   }, [postTaskProposalDecision, refreshAfterProposalDecision]);
 
   const quickActions = useMemo(() => quickActionsFor({
-    hasProject: Boolean(activeProject),
+    hasProject: workspaceSelection.ready,
     npmScriptsEnabled: health.npmScriptsEnabled,
     selectedFile,
-  }), [activeProject, health.npmScriptsEnabled, selectedFile]);
+  }), [workspaceSelection.ready, health.npmScriptsEnabled, selectedFile]);
 
   const sortedSessions = useMemo(
     () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
@@ -1663,19 +1827,22 @@ function App() {
 
           <div className="sidebar-section-heading">
             <span>Projects</span>
-            <button className="text-icon-button" onClick={openProjectDialog} title="Add project" aria-label="Add project"><Icon name="plus" size={15} /></button>
+            <button className="text-icon-button" onClick={openProjectDialog} title="Open existing project" aria-label="Open existing project"><Icon name="folder" size={15} /></button>
           </div>
           <div className="project-list">
             {projects.length === 0 ? (
               <button type="button" className="project-empty" onClick={openProjectDialog}>
                 <span className="project-empty-icon"><Icon name="folder" size={16} /></span>
                 <span>
-                  <strong>Add your first project</strong>
-                  <small>Create a workspace or choose a folder</small>
+                  <strong>Open your first project</strong>
+                  <small>Choose an existing folder or create a workspace</small>
                 </span>
               </button>
             ) : projects.map((project) => {
-              const isActive = String(project.id) === String(projectId);
+              const isActive = Boolean(visibleProject && String(project.id) === String(visibleProject.id));
+              const isUnavailable = !visibleProject
+                && String(project.id) === String(projectId)
+                && workspaceSelection.status === 'load_error';
               return (
                 <button
                   type="button"
@@ -1688,7 +1855,11 @@ function App() {
                   <span className="project-avatar">{(project.name || '?').charAt(0).toUpperCase()}</span>
                   <span className="project-copy">
                     <strong>{project.name}</strong>
-                    <small>{isActive ? 'Active project' : 'Switch project'}</small>
+                    <small>
+                      {isActive
+                        ? `Active · ${workspaceScanView.status === 'scanning' ? 'Scanning' : workspaceScanView.status === 'failed' ? 'Scan failed' : workspaceScanView.status === 'complete' ? 'Scanned' : 'Preparing'}`
+                        : isUnavailable ? 'Unverified — retry' : 'Switch project'}
+                    </small>
                   </span>
                   {isActive && <span className="project-active-dot" aria-label="Active" />}
                 </button>
@@ -1696,7 +1867,7 @@ function App() {
             })}
             {projects.length > 0 && (
               <button type="button" className="project-add" onClick={openProjectDialog}>
-                <Icon name="plus" size={14} /> Add project
+                <Icon name="folder" size={14} /> Open project
               </button>
             )}
           </div>
@@ -1724,7 +1895,7 @@ function App() {
               <span className="avatar">{(auth.user?.email || '?').charAt(0).toUpperCase()}</span>
               <span className="profile-copy">
                 <span className="profile-name" title={auth.user?.email || ''}>{auth.user?.email || 'Signed in'}</span>
-                <span className="profile-plan">{activeProject ? activeProject.name : 'No project selected'}</span>
+                <span className="profile-plan">{visibleProject ? visibleProject.name : workspaceSelection.status === 'load_error' ? 'Workspace unavailable' : 'No project selected'}</span>
               </span>
               <span className={`profile-role${auth.user?.isAdmin ? ' is-admin' : ''}`}>{auth.user?.isAdmin ? 'Admin' : 'User'}</span>
               <button type="button" className="profile-logout" onClick={signOut} title="Sign out">Sign out</button>
@@ -1742,12 +1913,16 @@ function App() {
                 type="button"
                 className="topbar-project"
                 onClick={() => { setWorkspaceTab('files'); setWorkspaceOpen(true); }}
-                title={activeProject ? `Open ${activeProject.name}` : 'Add a project'}
+                title={visibleProject ? `Open ${visibleProject.name}` : workspaceSelection.status === 'load_error' ? 'Workspace unavailable — retry project loading' : 'Add a project'}
               >
                 <span className="topbar-project-icon"><Icon name="folder" size={15} /></span>
                 <span className="topbar-project-copy">
-                  <small>Active project</small>
-                  <strong>{activeProject?.name || 'No project selected'}</strong>
+                  <small>
+                    {workspaceSelection.ready
+                      ? `Active · ${workspaceScanView.status === 'scanning' ? 'Scanning' : workspaceScanView.status === 'failed' ? 'Scan failed' : workspaceScanView.status === 'complete' ? 'Scanned' : 'Preparing'}`
+                      : workspaceSelection.status === 'load_error' ? 'Workspace unavailable' : 'No project selected'}
+                  </small>
+                  <strong>{visibleProject?.name || (workspaceSelection.status === 'load_error' ? 'Workspace unavailable' : 'No project selected')}</strong>
                 </span>
                 <Icon name="chevron" size={14} />
               </button>
@@ -1801,34 +1976,37 @@ function App() {
                 <div className="welcome-eyebrow"><span className="eyebrow-line" /> AI CODING WORKSPACE <span className="eyebrow-line" /></div>
                 <div className="welcome-orb"><Icon name="spark" size={26} /></div>
                 <h1>
-                  {activeProject
-                    ? <>Build in <span>{activeProject.name}</span></>
+                  {visibleProject
+                    ? <>Build in <span>{visibleProject.name}</span></>
                     : <>What are we <span>building?</span></>}
                 </h1>
                 <p className="welcome-description">
-                  {activeProject
+                  {visibleProject
                     ? 'Describe a change in plain language. The agent can inspect this project, plan the work, and ask for approval before writing or running anything.'
-                    : 'Add a project to give the agent a workspace, or ask a general question below. Files stay isolated to the project you choose.'}
+                    : workspaceSelection.status === 'load_error'
+                      ? 'The last project check failed. Retry to verify your workspace before asking the agent to inspect files.'
+                      : 'Open an existing project to give the agent a workspace, or ask a general question below. Files stay isolated to the project you choose.'}
                 </p>
 
-                {activeProject ? (
+                {visibleProject ? (
                   <div className="welcome-project">
                     <span className="welcome-project-icon"><Icon name="folder" size={16} /></span>
                     <div>
                       <small>Agent is working in</small>
-                      <strong>{activeProject.name}</strong>
+                      <strong>{visibleProject.name}</strong>
+                      <span className="welcome-project-scan">{workspaceScanView.message}</span>
                     </div>
                     <button type="button" onClick={() => { setWorkspaceTab('files'); setWorkspaceOpen(true); }}>View files</button>
                   </div>
                 ) : (
                   <div className="welcome-actions">
-                    <button type="button" className="primary-button" onClick={openProjectDialog}><Icon name="plus" size={15} /> Add a project</button>
-                    <span>or ask a general question below</span>
+                    <button type="button" className="primary-button" onClick={openProjectDialog}><Icon name="folder" size={15} /> Open existing project</button>
+                    <span>{workspaceSelection.status === 'load_error' ? 'use Retry above to verify the saved workspace, or ask a general question' : 'or switch to “New workspace” in the dialog'}</span>
                   </div>
                 )}
 
                 <div className="starter-grid">
-                  {(activeProject ? starters : []).map((starter) => (
+                  {(visibleProject && workspaceSelection.ready ? starters : []).map((starter) => (
                     <button key={starter.title} className="starter-card" onClick={() => sendMessage(starter.prompt)}>
                       <span className="starter-icon">{starter.icon}</span>
                       <span className="starter-title">{starter.title}</span>
@@ -1895,6 +2073,16 @@ function App() {
           )}
 
           <div className="composer-dock">
+            {workspaceSelection.message && (
+              <div className="tool-activity" aria-label="Workspace selection status">
+                <span className={`tool-activity-item ${workspaceSelection.ready ? 'completed' : workspaceSelection.status === 'loading' ? 'running' : 'failed'}`}>
+                  {workspaceSelection.message}
+                  {workspaceSelection.status === 'load_error' && (
+                    <button type="button" onClick={loadProjects}>Retry</button>
+                  )}
+                </span>
+              </div>
+            )}
             {toast && (
               <div className="toast" role="status">
                 <span className="toast-message">{toast.message}</span>
@@ -1934,9 +2122,11 @@ function App() {
                     sendMessage();
                   }
                 }}
-                placeholder={activeProject
-                  ? `Describe what to build or change in ${activeProject.name}…`
-                  : 'Ask anything, or add a project to start coding…'}
+                placeholder={visibleProject
+                  ? `Describe what to build or change in ${visibleProject.name}…`
+                  : workspaceSelection.status === 'load_error'
+                    ? 'Workspace unavailable — retry project loading, or ask a general question…'
+                    : 'Ask anything, or add a project to start coding…'}
                 rows={1}
                 aria-label="Message"
               />
@@ -1964,7 +2154,7 @@ function App() {
                 </div>
               </div>
             </form>
-            {activeProject && (
+            {visibleProject && workspaceSelection.ready && (
               <div className="quick-actions" aria-label="Quick actions">
                 {quickActions.map((action) => (
                   <button key={action.label} type="button" onClick={() => runQuickAction(action)}>{action.label}</button>
@@ -2006,7 +2196,7 @@ function App() {
           <div className="workspace-dock-body">
             {workspaceTab === 'files' ? (
               <WorkspaceFiles
-                project={activeProject}
+                project={visibleProject}
                 files={workspaceFiles}
                 selectedFile={selectedFile}
                 content={fileContent}
@@ -2018,11 +2208,12 @@ function App() {
                 onRefresh={() => loadWorkspaceFiles()}
                 onNewProject={openProjectDialog}
                 loading={workspaceLoading}
+                scan={workspaceScanView}
               />
             ) : (
               <TaskCenter
-                projectId={projectId}
-                activeProjectName={activeProject?.name || ''}
+                projectId={visibleProject?.id ?? ''}
+                activeProjectName={visibleProject?.name || ''}
                 taskInput={taskInput}
                 setTaskInput={setTaskInput}
                 taskSubmitting={taskSubmitting}

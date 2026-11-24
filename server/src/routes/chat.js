@@ -1,6 +1,7 @@
 import express from 'express';
 import { config, redactSecrets } from '../config.js';
 import { findOwnedProject } from '../auth/index.js';
+import { RETRY_POLICY, cappedRetryAfterMs } from '../ai/retry-policy.js';
 
 export const MAX_MESSAGE_CHARS = 20_000;
 export const MAX_MESSAGES = 50;
@@ -141,6 +142,13 @@ export function createChatRouter({
       });
     }
 
+    // Cancel provider retry waits if the browser disconnects.
+    const abortController = new AbortController();
+    const abortProviderCall = () => abortController.abort();
+    if (req.aborted || res.destroyed) abortProviderCall();
+    req.once('aborted', abortProviderCall);
+    res.once('close', abortProviderCall);
+
     try {
       // The client sends prior user/assistant turns in this array so providers
       // can answer with conversation context instead of treating each prompt alone.
@@ -158,6 +166,7 @@ export function createChatRouter({
         messages: normalized.messages,
         tools: selectedProject ? tools : null,
         projectId: selectedProject ? projectId : null,
+        signal: abortController.signal,
       });
       if (!result || typeof result.text !== 'string') {
         throw new Error('Provider returned a malformed result (missing text).');
@@ -207,8 +216,9 @@ export function createChatRouter({
         logParts.push(`classificationSource=${details.classificationSource}`);
       }
       if (details.retryAfterSource) logParts.push(`retryAfterSource=${details.retryAfterSource}`);
-      if (Number.isFinite(err.retryAfterMs) && err.retryAfterMs > 0) {
-        logParts.push(`retryAfterSeconds=${Math.ceil(err.retryAfterMs / 1000)}`);
+      const safeRetryAfterMs = cappedRetryAfterMs(err.retryAfterMs, RETRY_POLICY.clientRetryAfterCapMs);
+      if (safeRetryAfterMs !== null) {
+        logParts.push(`retryAfterSeconds=${Math.ceil(safeRetryAfterMs / 1000)}`);
       }
       if (err.fallbackAttempted) {
         logParts.push(`fallbackAttempted=true fallbackFrom=${err.fallbackFrom ?? 'unknown'}`);
@@ -218,15 +228,15 @@ export function createChatRouter({
 
       const body = {
         ok: false,
-        error: typeof err.publicMessage === 'string'
+        error: redactSecrets(typeof err.publicMessage === 'string'
           ? err.publicMessage
-          : 'AI provider request failed. Details were logged on the server (secrets redacted).',
+          : 'AI provider request failed. Details were logged on the server (secrets redacted).'),
       };
       if (err.category || err.errorType) {
         body.errorCategory = err.category || err.errorType;
       }
-      if (Number.isFinite(err.retryAfterMs) && err.retryAfterMs > 0) {
-        body.retryAfterSeconds = Math.ceil(err.retryAfterMs / 1000);
+      if (safeRetryAfterMs !== null) {
+        body.retryAfterSeconds = Math.ceil(safeRetryAfterMs / 1000);
       }
       if (err.fallbackAttempted) {
         body.fallbackAttempted = true;
@@ -234,6 +244,9 @@ export function createChatRouter({
         if (typeof err.fallbackReason === 'string') body.fallbackReason = err.fallbackReason;
       }
       return res.status(status).json(body);
+    } finally {
+      req.off('aborted', abortProviderCall);
+      res.off('close', abortProviderCall);
     }
   });
 

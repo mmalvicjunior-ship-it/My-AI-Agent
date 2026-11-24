@@ -102,6 +102,39 @@ export function normalizeDecisionError(error, responseStatus = null) {
   return { code: 'network', message: 'Could not reach the server. No change was made.' };
 }
 
+const MAX_RECOVERY_ATTEMPTS = 5;
+
+function hasRetryStopped(recovery) {
+  const attempt = Number(recovery?.retryAttempt);
+  return Boolean(recovery?.terminal)
+    || (Number.isFinite(attempt) && attempt >= MAX_RECOVERY_ATTEMPTS);
+}
+
+export function providerRecoveryLabel(recovery) {
+  if (!recovery || typeof recovery !== 'object') return null;
+  const reason = typeof recovery.reason === 'string' ? recovery.reason : '';
+  let label;
+  if (reason === 'provider_quota_exhausted') label = 'Quota exhausted';
+  else if (reason === 'provider_rate_limited') label = 'Rate limited';
+  else label = 'Provider paused';
+  if (hasRetryStopped(recovery)) return `${label} · automatic retries stopped`;
+  const retryAt = typeof recovery.nextRetryAt === 'string' ? recovery.nextRetryAt : null;
+  const retryTime = retryAt && Number.isFinite(Date.parse(retryAt))
+    ? new Date(retryAt).toLocaleString()
+    : 'when the provider is available';
+  return `${label} · automatic retry ${retryTime}`;
+}
+
+export function nextProviderRetryAt(tasks) {
+  const retryTimes = (Array.isArray(tasks) ? tasks : [])
+    .filter((task) => task?.status === 'provider_paused' && !hasRetryStopped(task?.recovery))
+    .map((task) => task?.recovery?.nextRetryAt)
+    .filter((value) => typeof value === 'string' && Number.isFinite(Date.parse(value)))
+    .map((value) => Date.parse(value));
+  if (retryTimes.length === 0) return null;
+  return new Date(Math.min(...retryTimes)).toISOString();
+}
+
 export function diffLines(diff = '', limit = 400) {
   const rows = String(diff ?? '').split('\n').map((line) => line.replace(/\r$/, ''));
   const lines = rows.slice(0, limit).map((text) => {

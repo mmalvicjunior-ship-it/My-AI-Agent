@@ -2404,6 +2404,60 @@ test('a shorter Retry-After cannot shorten a stronger OpenAI cooldown', async ()
   assert.equal(calls, 1);
 });
 
+test('a rethrown cooldown error is not applied twice when the clock advances', async () => {
+  const cooldownStore = new Map();
+  const key = 'https://openrouter.ai/api/v1::test/double-cooldown:free';
+  let calls = 0;
+  let signalFetchStarted;
+  const fetchStarted = new Promise((resolve) => { signalFetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  const provider = createOpenAIProvider({
+    apiKey: 'test-key',
+    model: 'test/double-cooldown:free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    cooldownStore,
+    fetchImpl: async () => {
+      calls += 1;
+      signalFetchStarted();
+      await fetchGate;
+      return Response.json(
+        { error: { message: 'too many requests' } },
+        { status: 429, headers: { 'Retry-After': '1' } },
+      );
+    },
+  });
+
+  const pending = provider.chat({
+    messages: [{ role: 'user', content: 'Hi' }],
+    retryState: { attemptsUsed: 0, exhausted: false },
+  });
+  await fetchStarted;
+  cooldownStore.set(key, { until: Date.now() + 3_600_000, token: 123 });
+
+  // Force a measurable gap between the first and any second cooldown write.
+  // The old double-apply bug replaced the stronger entry with a fresh, weaker
+  // until value because time had advanced; the fix skips the second write.
+  const realNow = Date.now;
+  let nowCalls = 0;
+  Date.now = () => {
+    nowCalls += 1;
+    return realNow() + (nowCalls > 2 ? 25 : 0);
+  };
+  try {
+    releaseFetch();
+    await assert.rejects(pending, (error) => {
+      assert.equal(cooldownStore.get(key).token, 123, 'the stronger cooldown entry must remain untouched');
+      assert.equal(error.cooldownApplied, true);
+      assert.ok(error.retryAfterMs > 3_500_000);
+      return true;
+    });
+    assert.equal(calls, 1);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 test('a shorter Retry-After cannot shorten a stronger Gemini cooldown', async () => {
   const cooldownStore = new Map();
   const key = 'gemini:test/strong-cooldown';

@@ -54,7 +54,15 @@ export function openDb() {
   if (!projectColumns.some((column) => column.name === 'owner_id')) {
     db.exec('ALTER TABLE projects ADD COLUMN owner_id INTEGER');
   }
+  // Concurrent imports need a database-level guard. Existing rows keep
+  // import_key = NULL (NULLs are distinct in a UNIQUE index), so no legacy
+  // project or managed workspace is modified or deleted by this migration.
+  const projectColumnsFinal = db.prepare('PRAGMA table_info(projects)').all();
+  if (!projectColumnsFinal.some((column) => column.name === 'import_key')) {
+    db.exec('ALTER TABLE projects ADD COLUMN import_key TEXT');
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects (owner_id, id)');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_import_key ON projects (import_key)');
 
   // Accounts. Passwords are scrypt hashes; the raw password is never stored.
   db.exec(`

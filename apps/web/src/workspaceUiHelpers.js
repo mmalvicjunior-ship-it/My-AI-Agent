@@ -64,6 +64,87 @@ export function upsertProject(projects, project) {
   return next;
 }
 
+/** Root-level instructions/manifests read after a safe scan, in priority order. */
+export const PROJECT_UNDERSTANDING_FILES = Object.freeze([
+  'README.md',
+  'AGENTS.md',
+  'CLAUDE.md',
+  'CONTRIBUTING.md',
+  'package.json',
+  'pyproject.toml',
+  'Cargo.toml',
+  'go.mod',
+  'pom.xml',
+  'build.gradle',
+]);
+
+function fileName(filePath) {
+  return String(filePath || '').split('/').pop() || '';
+}
+
+/** Filters and dedupes server discovery results before they reach the picker. */
+export function normalizeDiscoveredProjects(projects = []) {
+  const seen = new Set();
+  return (Array.isArray(projects) ? projects : []).filter((project) => {
+    const id = typeof project?.discoveryId === 'string' ? project.discoveryId.trim() : '';
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  }).map((project) => ({
+    discoveryId: project.discoveryId,
+    name: typeof project.name === 'string' && project.name.trim() ? project.name.trim() : 'Project',
+    description: typeof project.description === 'string' ? project.description : '',
+    technologies: Array.isArray(project.technologies)
+      ? project.technologies.filter((item) => typeof item === 'string' && item).slice(0, 4)
+      : [],
+    markers: Array.isArray(project.markers)
+      ? project.markers.filter((item) => typeof item === 'string' && item).slice(0, 6)
+      : [],
+    alreadyOpenedProjectId: project.alreadyOpenedProjectId ?? null,
+  }));
+}
+
+/** Picker rows: previously opened projects first, then alphabetical order. */
+export function discoveredProjectRows(projects = []) {
+  return normalizeDiscoveredProjects(projects).sort((a, b) => {
+    const openedA = a.alreadyOpenedProjectId !== null ? 0 : 1;
+    const openedB = b.alreadyOpenedProjectId !== null ? 0 : 1;
+    return openedA - openedB || a.name.localeCompare(b.name);
+  });
+}
+
+/** Chooses only allowlisted root files that the scan actually found. */
+export function projectUnderstandingPaths({ files = [], manifests = [] } = {}) {
+  const available = [...(Array.isArray(files) ? files : []), ...(Array.isArray(manifests) ? manifests : [])]
+    .filter((file) => typeof file === 'string' && file && !file.includes('/'));
+  const paths = [];
+  for (const wanted of PROJECT_UNDERSTANDING_FILES) {
+    const match = available.find((file) => fileName(file).toLowerCase() === wanted.toLowerCase());
+    if (match && !paths.includes(match)) paths.push(match);
+    if (paths.length >= 6) break;
+  }
+  return paths;
+}
+
+/** Brief completion summary from the existing scan result and safe doc reads. */
+export function workspaceUnderstandingSummary({ result = null, readPaths = [] } = {}) {
+  const summary = workspaceScanSummary(result);
+  const hints = [
+    ...(Array.isArray(summary.projectTypes) ? summary.projectTypes : []),
+    ...summary.frameworkHints,
+    ...summary.languageHints,
+  ].slice(0, 4);
+  const docs = (Array.isArray(readPaths) ? readPaths : [])
+    .map(fileName)
+    .filter(Boolean)
+    .slice(0, 6);
+  const parts = [`${summary.fileCount} files indexed`];
+  if (hints.length) parts.push(hints.join(', '));
+  if (docs.length) parts.push(`read ${docs.join(', ')}`);
+  if (summary.truncated) parts.push('partial scan');
+  return `Understood project: ${parts.join(' · ')}.`;
+}
+
 /** Positive numeric ID for a project that exists in the current list. */
 export function matchingProjectId(projects, projectId) {
   const wanted = projectId === null || projectId === undefined || projectId === '' ? null : String(projectId);
@@ -88,6 +169,9 @@ export function selectRestoredProjectId({
   projectsLoaded = false,
 } = {}) {
   if (!projectsLoaded || !Array.isArray(projects) || projects.length === 0) return '';
+  // A saved ID that is gone or belongs to another account must force an
+  // explicit choice. Silently adopting another project hides the stale state.
+  if (storedProjectId && matchingProjectId(projects, storedProjectId) === null) return '';
   if (matchingProjectId(projects, currentProjectId) !== null) return String(currentProjectId);
   const stored = matchingProjectId(projects, storedProjectId);
   if (stored !== null) return String(stored);
@@ -180,6 +264,15 @@ export function workspaceSelectionState({
 
   const stale = Boolean(staleRestoredProjectId)
     && matchingProjectId(list, staleRestoredProjectId) === null;
+  if (stale) {
+    return {
+      status: 'stale_selection',
+      ready: false,
+      projectId: null,
+      message: 'Your previously selected project is no longer available. Choose a project from the list or open one.',
+    };
+  }
+
   const validated = validatedChatProjectId({
     projects: list,
     projectId,
@@ -188,24 +281,20 @@ export function workspaceSelectionState({
   });
   if (validated === null) {
     return {
-      status: stale ? 'stale_selection' : 'needs_selection',
+      status: 'needs_selection',
       ready: false,
       projectId: null,
-      message: stale
-        ? 'Your previously selected project is no longer available. Select an authorized project.'
-        : 'Select an authorized project to let the agent inspect its files.',
+      message: 'Select an authorized project to let the agent inspect its files.',
     };
   }
 
   const project = list.find((item) => String(item.id) === String(validated)) || activeProject;
   const projectName = project?.name || String(validated);
   return {
-    status: stale ? 'stale_selection' : 'ready',
+    status: 'ready',
     ready: true,
     projectId: validated,
-    message: stale
-      ? `Your previously selected project is no longer available. Using ${projectName}; you can change it in the project list.`
-      : `Workspace ready: ${projectName}`,
+    message: `Workspace ready: ${projectName}`,
   };
 }
 
@@ -255,8 +344,10 @@ export function workspaceScanSummary(result = null) {
     fileCount: files.length,
     directoryCount: directories.length,
     manifestCount: manifests.length,
+    manifestNames: manifests.map((file) => fileName(file)),
     languageHints: Array.isArray(result?.languageHints) ? result.languageHints : [],
     frameworkHints: Array.isArray(result?.frameworkHints) ? result.frameworkHints : [],
+    projectTypes: Array.isArray(result?.projectTypes) ? result.projectTypes : [],
     skipped: Number.isFinite(result?.skipped) ? result.skipped : 0,
     truncated: Boolean(result?.truncated),
     errorCount: errors.length,

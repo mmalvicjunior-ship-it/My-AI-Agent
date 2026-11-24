@@ -3,13 +3,17 @@
 // mocked; no provider or network access is used.
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import {
   __resetAuthCallbackRunnerForTests,
+  bumpAuthEpoch,
   chooseAuthTokenForInitialization,
   createAuthCallbackRunner,
   googleErrorMessage,
   parseAuthFragment,
+  readAuthEpoch,
   shouldClearAuthHash,
   shouldClearWorkspaceForAuthChange,
   shouldSignOutFor401,
@@ -176,4 +180,195 @@ test('auth changes reset workspace state; stable accounts do not', () => {
   assert.equal(shouldClearWorkspaceForAuthChange('account-a', null), true);
   assert.equal(shouldClearWorkspaceForAuthChange(null, 'account-a'), true);
   assert.equal(shouldClearWorkspaceForAuthChange(null, null), false);
+});
+
+function memoryStorage() {
+  const values = new Map();
+  return {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => { values.set(key, String(value)); },
+    removeItem: (key) => { values.delete(key); },
+    clear: () => { values.clear(); },
+  };
+}
+
+function stubMeFetch({ token = 'fresh-token', user = USER, ok = true, status = 200 } = {}) {
+  let calls = 0;
+  return {
+    get calls() { return calls; },
+    fetchImpl: async (url, init) => {
+      calls += 1;
+      assert.match(url, /\/api\/auth\/me$/);
+      assert.equal(init.headers.Authorization, `Bearer ${token}`);
+      return {
+        ok,
+        status,
+        json: async () => (ok ? { ok: true, user } : { ok: false, error: 'Authentication required.' }),
+      };
+    },
+  };
+}
+
+test('a consumed callback cannot be replayed after a page reload', async () => {
+  const storage = memoryStorage();
+  const first = stubMeFetch();
+  let applied = 0;
+  let settled = 0;
+  const runner = createAuthCallbackRunner({
+    fetchImpl: first.fetchImpl,
+    storage,
+    onAuthenticated: () => { applied += 1; },
+    onSettled: () => { settled += 1; },
+  });
+  assert.equal((await runner.run('#auth_token=fresh-token')).status, 'authenticated');
+  assert.equal(applied, 1);
+  assert.equal(settled, 1);
+
+  // Emulate a reload: module state resets while persisted storage survives.
+  __resetAuthCallbackRunnerForTests();
+  const replay = stubMeFetch();
+  let replayApplied = 0;
+  let replayCleared = 0;
+  let replaySettled = 0;
+  const replayed = createAuthCallbackRunner({
+    fetchImpl: replay.fetchImpl,
+    storage,
+    onAuthenticated: () => { replayApplied += 1; },
+    clearHash: () => { replayCleared += 1; },
+    onSettled: () => { replaySettled += 1; },
+  });
+  const result = await replayed.run('#auth_token=fresh-token');
+  assert.equal(result.status, 'replay');
+  assert.equal(replay.calls, 0);
+  assert.equal(replayApplied, 0);
+  assert.equal(replayCleared, 1);
+  assert.equal(replaySettled, 1);
+});
+
+test('a failed callback cannot restore its account after a newer account is selected', async () => {
+  const storage = memoryStorage();
+  const failed = stubMeFetch({ ok: false, status: 401 });
+  const runner = createAuthCallbackRunner({
+    fetchImpl: failed.fetchImpl,
+    storage,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onAuthenticated: () => assert.fail('failed callback was applied'),
+  });
+  assert.equal((await runner.run('#auth_token=old-token')).status, 'verification_failed');
+  assert.equal(failed.calls, 1);
+  assert.equal(readAuthEpoch(storage), 0);
+
+  bumpAuthEpoch(storage); // newer account selected before the retry/reload
+  __resetAuthCallbackRunnerForTests();
+  const stale = stubMeFetch({ token: 'old-token', user: { id: 'account-a' } });
+  let applied = 0;
+  let cleared = 0;
+  let settled = 0;
+  const replayed = createAuthCallbackRunner({
+    fetchImpl: stale.fetchImpl,
+    storage,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onAuthenticated: () => { applied += 1; },
+    clearHash: () => { cleared += 1; },
+    onSettled: () => { settled += 1; },
+  });
+  const result = await replayed.run('#auth_token=old-token');
+  assert.equal(result.status, 'superseded');
+  assert.equal(stale.calls, 0);
+  assert.equal(applied, 0);
+  assert.equal(cleared, 1);
+  assert.equal(settled, 1);
+});
+
+test('a failed callback retries after its own session cleanup bumps the epoch', async () => {
+  const storage = memoryStorage();
+  let currentAuth = { token: 'stale-stored', user: { id: 'account-a' } };
+  const failed = stubMeFetch({ ok: false, status: 401 });
+  const runner = createAuthCallbackRunner({
+    fetchImpl: failed.fetchImpl,
+    storage,
+    getCurrentAuth: () => currentAuth,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onError: () => {
+      // App.jsx clears a stored session when callback verification fails.
+      currentAuth = null;
+      bumpAuthEpoch(storage);
+    },
+    onAuthenticated: () => assert.fail('failed callback was applied'),
+  });
+  assert.equal((await runner.run('#auth_token=fresh-token')).status, 'verification_failed');
+  assert.equal(failed.calls, 1);
+  assert.equal(readAuthEpoch(storage), 1);
+
+  __resetAuthCallbackRunnerForTests();
+  const retry = stubMeFetch();
+  let appliedToken = null;
+  const retried = createAuthCallbackRunner({
+    fetchImpl: retry.fetchImpl,
+    storage,
+    getCurrentAuth: () => currentAuth,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onAuthenticated: (token) => { appliedToken = token; },
+  });
+  assert.equal((await retried.run('#auth_token=fresh-token')).status, 'authenticated');
+  assert.equal(retry.calls, 1);
+  assert.equal(appliedToken, 'fresh-token');
+});
+
+test('a newer account selected during callback verification suppresses the result', async () => {
+  const storage = memoryStorage();
+  let release;
+  const gate = new Promise((done) => { release = done; });
+  let applied = 0;
+  let cleared = 0;
+  let settled = 0;
+  const runner = createAuthCallbackRunner({
+    fetchImpl: async () => {
+      await gate;
+      return { ok: true, status: 200, json: async () => ({ ok: true, user: USER }) };
+    },
+    storage,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    getCurrentAuth: () => null,
+    onAuthenticated: () => { applied += 1; },
+    clearHash: () => { cleared += 1; },
+    onSettled: () => { settled += 1; },
+  });
+  const pending = runner.run('#auth_token=old-token');
+  bumpAuthEpoch(storage); // another tab selects a newer account while /me is pending
+  release();
+  const result = await pending;
+  assert.equal(result.status, 'superseded');
+  assert.equal(applied, 0);
+  assert.equal(cleared, 1);
+  assert.equal(settled, 1);
+});
+
+test('a fresh callback still replaces an older stored session', async () => {
+  const storage = memoryStorage();
+  const stored = { token: 'stale-stored', user: { id: 'account-a' } };
+  const me = stubMeFetch();
+  let appliedToken = null;
+  const runner = createAuthCallbackRunner({
+    fetchImpl: me.fetchImpl,
+    storage,
+    getCurrentAuth: () => stored,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onAuthenticated: (token) => { appliedToken = token; },
+  });
+  const result = await runner.run('#auth_token=fresh-token');
+  assert.equal(result.status, 'authenticated');
+  assert.equal(appliedToken, 'fresh-token');
+  assert.equal(me.calls, 1);
+});
+
+test('the app bumps the shared epoch and wires callback freshness guards', () => {
+  const appSource = fs.readFileSync(
+    fileURLToPath(new URL('../../apps/web/src/App.jsx', import.meta.url)),
+    'utf8',
+  );
+  assert.match(appSource, /bumpAuthEpoch\(\)/);
+  assert.match(appSource, /getCurrentAuth: \(\) => authRef\.current/);
+  assert.match(appSource, /getAuthEpoch: \(\) => readAuthEpoch\(\)/);
+  assert.match(appSource, /onSettled: \(\) => setAuthChecking\(false\)/);
 });

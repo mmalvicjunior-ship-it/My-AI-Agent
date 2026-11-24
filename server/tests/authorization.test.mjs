@@ -267,10 +267,10 @@ test('imports inside the configured safe root succeed', async () => {
   assert.equal(data.ok, true);
 });
 
-test('import paths that are ancestors of the managed workspace root are rejected', async () => {
+test('an import root containing the managed workspace root is rejected', async () => {
   // The test environment places WORKSPACE_ROOT somewhere under os.tmpdir().
-  // Importing os.tmpdir() would therefore be an ancestor of every managed
-  // workspace and must be rejected, even though it is not inside the workspace.
+  // A broad import root would expose every managed workspace, so the shared
+  // configuration guard rejects it before any path is resolved.
   const broad = createApp({ provider: null, projectImportRoot: os.tmpdir() });
   const broadServer = broad.app.listen(0);
   await once(broadServer, 'listening');
@@ -286,14 +286,15 @@ test('import paths that are ancestors of the managed workspace root are rejected
     });
     const data = await res.json();
     assert.equal(res.status, 403);
-    assert.match(data.error, /ancestor of the managed workspace root/i);
+    assert.equal(data.code, 'IMPORT_UNSAFE');
+    assert.match(data.error, /dedicated folder outside the managed workspace/i);
   } finally {
     broadServer.closeAllConnections?.();
     broadServer.close();
   }
 });
 
-test('import paths that are ancestors of the database directory are rejected', async () => {
+test('an import root containing the database directory is rejected', async () => {
   // A dedicated nested DB path, unrelated to the workspace root, so the
   // database-ancestor check fires before (and independently from) the
   // workspace-ancestor check.
@@ -333,7 +334,8 @@ test('import paths that are ancestors of the database directory are rejected', a
       });
       const data = await res.json();
       assert.equal(res.status, 403);
-      assert.match(data.error, /ancestor of the database directory/i);
+      assert.equal(data.code, 'IMPORT_UNSAFE');
+      assert.match(data.error, /dedicated folder outside the managed workspace/i);
     } finally {
       broadServer.closeAllConnections?.();
       broadServer.close();
@@ -344,7 +346,7 @@ test('import paths that are ancestors of the database directory are rejected', a
   }
 });
 
-test('import paths inside the managed workspace root are rejected', async () => {
+test('an import root inside the managed workspace root is rejected', async () => {
   const broad = createApp({ provider: null, projectImportRoot: os.tmpdir() });
   const broadServer = broad.app.listen(0);
   await once(broadServer, 'listening');
@@ -361,7 +363,8 @@ test('import paths inside the managed workspace root are rejected', async () => 
     });
     const data = await res.json();
     assert.equal(res.status, 403);
-    assert.match(data.error, /workspace root/i);
+    assert.equal(data.code, 'IMPORT_UNSAFE');
+    assert.match(data.error, /dedicated folder outside the managed workspace/i);
   } finally {
     broadServer.closeAllConnections?.();
     broadServer.close();
@@ -389,7 +392,8 @@ test('the managed workspace tree can never be imported, even from a broad import
     });
     const data = await res.json();
     assert.equal(res.status, 403);
-    assert.match(data.error, /workspace root/i);
+    assert.equal(data.code, 'IMPORT_UNSAFE');
+    assert.match(data.error, /dedicated folder outside the managed workspace/i);
   } finally {
     broadServer.closeAllConnections?.();
     broadServer.close();

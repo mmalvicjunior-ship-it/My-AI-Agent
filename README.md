@@ -215,12 +215,18 @@ and assistant turns to the AI API.
 
 ### Workspace coding tools
 
-Create a workspace in the app. Importing an existing server directory through
-`POST /api/projects` is **disabled by default**; it only works when the operator
-sets `PROJECT_IMPORT_ROOT`, and the requested path must resolve inside that
-root. Paths inside the managed `WORKSPACE_ROOT` are always rejected because that
-tree holds every account's project files. The file scanner skips dependency/build
-folders and credential files. Gemini can inspect/search files and request the
+Create a workspace in the app. Importing an existing server directory is
+**disabled by default**; it only works when the operator sets
+`PROJECT_IMPORT_ROOT`. When configured, the project picker calls
+`GET /api/projects/discover` to list likely software projects inside that root
+and submits only an opaque relative `discoveryId` to `POST /api/projects`.
+Absolute paths are never returned to the browser, and the legacy `path` field is
+still accepted for existing integrations. Paths inside the managed
+`WORKSPACE_ROOT` are always rejected because that tree holds every account's
+project files. Selecting a project starts the existing safe file scan, which
+builds the file index and project metadata. The file scanner skips
+dependency/build folders and credential files. Gemini can inspect/search files
+and request the
 predefined `npm test`, `npm run build`, `npm run lint`, `npm run format`,
 `node --check`, `python_check`, and `python_run` tools. `python_check` parses a
 `.py` file without executing it. `python_run` executes an exact, digest-pinned
@@ -421,7 +427,7 @@ prompts). Never commit real values.
 | `GOOGLE_CLIENT_SECRET` | No | Google OAuth 2.0 client secret. Server-side only, never exposed to the browser. |
 | `GOOGLE_OAUTH_REDIRECT_URI` | No | Exact authorized redirect URI. For the current Vercel app use `https://my-ai-agent-apps.vercel.app/api/auth/google/callback`. |
 | `APP_ORIGIN` | No | Base URL the browser returns to after the Google callback. Empty = same-origin relative redirect. Must be an absolute https origin (http only on localhost) with no credentials, path, query or fragment; invalid values fail startup closed. |
-| `PROJECT_IMPORT_ROOT` | No | Leave unset to disable importing existing server directories. When set, imports must resolve inside this directory; paths inside `WORKSPACE_ROOT` are always rejected. |
+| `PROJECT_IMPORT_ROOT` | No | Leave unset to disable project discovery and imports of existing server directories. When set, discovery and imports stay inside this dedicated directory; it must be outside `WORKSPACE_ROOT` and the database directory. |
 | `NODE_VERSION` | Recommended | `22`. |
 | `PORT` | No | Render injects it; do not set it. |
 | `HOST` | No | Leave unset so the server binds all interfaces. |
@@ -538,8 +544,8 @@ the service publicly:
   the single administrator with `POST /api/auth/admin/provision` (see
   `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
 - Keep `PROJECT_IMPORT_ROOT` unset unless you deliberately need directory
-  imports; if set, point it at a dedicated folder, never the filesystem root or
-  the workspace tree.
+  imports; if set, point it at a dedicated folder, never the filesystem root,
+  the workspace tree, or the database directory.
 - Use HTTPS (Render provides it) because bearer tokens travel in the
   `Authorization` header. They are stored in browser `localStorage`, so a
   cross-site scripting bug could read them; keep the frontend dependencies

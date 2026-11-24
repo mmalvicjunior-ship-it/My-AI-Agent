@@ -566,6 +566,7 @@ kbd { padding: 2px 5px; color: var(--subtle); background: var(--surface); border
 .welcome-project small { color: var(--subtle); font-size: 9px; letter-spacing: .4px; text-transform: uppercase; }
 .welcome-project strong { overflow: hidden; color: var(--text-strong); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .welcome-project-scan { overflow: hidden; color: var(--subtle); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.welcome-project-understanding { overflow: hidden; color: var(--accent); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 .welcome-project button { margin-left: auto; padding: 6px 9px; color: var(--accent); background: transparent; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; font-size: 10px; }
 .welcome-project button:hover { background: var(--surface-hover); }
 .welcome-actions { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
@@ -599,6 +600,24 @@ kbd { padding: 2px 5px; color: var(--subtle); background: var(--surface); border
 .dialog-hint-warn { color: var(--amber); background: rgba(232, 180, 100, .08); border-color: rgba(232, 180, 100, .3); }
 .dialog-hint span { display: block; margin-top: 3px; color: var(--subtle); }
 .dialog-error { padding: 9px 10px; color: var(--red); background: rgba(251, 128, 137, .08); border: 1px solid rgba(251, 128, 137, .25); border-radius: 8px; font-size: 11px; }
+.discovery-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--subtle); font-size: 10px; font-weight: 600; }
+.discovery-toolbar .ghost-button { padding: 5px 9px; font-size: 10px; }
+.discovery-list { display: flex; min-height: 150px; max-height: 290px; flex-direction: column; gap: 5px; padding: 6px; overflow-y: auto; background: var(--surface-raised); border: 1px solid var(--line); border-radius: 9px; }
+.discovery-row { display: flex; width: 100%; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 9px 10px; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 7px; cursor: pointer; text-align: left; }
+.discovery-row:hover { background: var(--surface-hover); }
+.discovery-row.selected { background: var(--accent-soft); border-color: var(--accent); }
+.discovery-row:disabled { cursor: default; opacity: .65; }
+.discovery-row-main { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.discovery-name { overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.discovery-description { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.discovery-row-meta { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
+.discovery-technologies { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.discovery-badge { padding: 2px 6px; color: var(--accent); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; font-size: 9px; font-weight: 700; }
+.discovery-opened { padding: 2px 6px; color: var(--green); background: rgba(119, 210, 161, .1); border-radius: 999px; font-size: 9px; font-weight: 700; }
+.discovery-empty { display: flex; min-height: 130px; flex-direction: column; align-items: center; justify-content: center; gap: 5px; color: var(--subtle); font-size: 10px; text-align: center; }
+.discovery-empty strong { color: var(--text); font-size: 12px; }
+.dialog-secondary-option { display: flex; align-items: center; justify-content: center; gap: 7px; padding-top: 2px; color: var(--subtle); font-size: 10px; }
+.dialog-secondary-option button { padding: 0; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .folder-browser { overflow: hidden; background: var(--surface-raised); border: 1px solid var(--line); border-radius: 9px; }
 .folder-browser-bar { display: flex; align-items: center; gap: 7px; padding: 7px; border-bottom: 1px solid var(--line); }

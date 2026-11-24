@@ -23,11 +23,13 @@ import {
 
 const servers = [];
 const tempDirs = [];
+// Dedicated sibling of the test workspace/database directories, so the import
+// root neither contains nor lives inside either protected location.
+const importRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-workspace-imports-'));
+tempDirs.push(importRoot);
 
 async function startServer() {
-  // Imported fixtures live in the OS temp directory; allow that as the safe
-  // import root while keeping the managed workspace root off-limits.
-  const server = createApp({ auth: false, projectImportRoot: os.tmpdir() }).app.listen(0);
+  const server = createApp({ auth: false, projectImportRoot: importRoot }).app.listen(0);
   await once(server, 'listening');
   servers.push(server);
   const base = `http://127.0.0.1:${server.address().port}/api/projects`;
@@ -100,7 +102,7 @@ test('creating a project creates its workspace folder', async () => {
 
 test('imports an existing directory as a project and scans searchable source files', async () => {
   const api = await startServer();
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-existing-project-'));
+  const root = fs.mkdtempSync(path.join(importRoot, 'myai-existing-project-'));
   tempDirs.push(root);
   fs.mkdirSync(path.join(root, 'src'));
   fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });

@@ -19,6 +19,7 @@ import {
 
 let server;
 let base;
+let importRoot;
 const tempDirs = [];
 
 async function request(method, route, { token, body } = {}) {
@@ -42,7 +43,7 @@ async function register(email) {
 }
 
 function makeFixture(name) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `myai-onboarding-${name}-`));
+  const root = fs.mkdtempSync(path.join(importRoot, `myai-onboarding-${name}-`));
   tempDirs.push(root);
   fs.mkdirSync(path.join(root, 'src'));
   fs.mkdirSync(path.join(root, 'node_modules'));
@@ -54,7 +55,11 @@ function makeFixture(name) {
 }
 
 before(async () => {
-  const created = createApp({ provider: mockProvider, projectImportRoot: os.tmpdir() });
+  // Dedicated sibling of the test workspace/database directories: the import
+  // root must not contain (or live inside) either of them.
+  importRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-onboarding-imports-'));
+  tempDirs.push(importRoot);
+  const created = createApp({ provider: mockProvider, projectImportRoot: importRoot });
   server = created.app.listen(0);
   await once(server, 'listening');
   base = `http://127.0.0.1:${created.app.address?.()?.port || server.address().port}`;

@@ -76,11 +76,17 @@ function recordModelCooldown(store, key, error, fallbackMs = 0) {
 /** Records a cooldown and makes the error report the effective retry time. */
 function applyModelCooldown(store, key, error, fallbackMs = 0) {
   const entry = recordModelCooldown(store, key, error, fallbackMs);
-  if (entry && Number.isFinite(entry.remainingMs)) {
-    // A shorter Retry-After must not produce an earlier persisted resume than
-    // the stronger cooldown already in force for this model.
-    error.retryAfterMs = Math.max(0, entry.remainingMs);
-    error.retryAfterSeconds = Math.ceil(entry.remainingMs / 1000);
+  if (entry && error && typeof error === 'object') {
+    // The same HTTP error is rethrown into the outer catch. Mark it so the
+    // catch cannot re-record a slightly newer "stronger" cooldown from the
+    // retryAfterMs value this function just expanded.
+    error.cooldownApplied = true;
+    if (Number.isFinite(entry.remainingMs)) {
+      // A shorter Retry-After must not produce an earlier persisted resume than
+      // the stronger cooldown already in force for this model.
+      error.retryAfterMs = Math.max(0, entry.remainingMs);
+      error.retryAfterSeconds = Math.ceil(entry.remainingMs / 1000);
+    }
   }
   return entry;
 }
@@ -598,12 +604,12 @@ export function createOpenAIProvider({
             if (providerError !== error) {
               logProviderHttpError({ providerName, model, error: providerError, toolSupportFailure: false });
             }
-            if (isQuotaExhaustedError(providerError)) {
+            if (!providerError.cooldownApplied && isQuotaExhaustedError(providerError)) {
               applyModelCooldown(activeCooldowns, cooldownKey, providerError, DEFAULT_QUOTA_COOLDOWN_MS);
               providerError.retryable = false;
               throw withActivity(providerError);
             }
-            if (isTransientOpenAIError(providerError)) {
+            if (!providerError.cooldownApplied && isTransientOpenAIError(providerError)) {
               // Same rule as the HTTP branch: always persist the cooldown, but
               // do not wait in-request when the upstream Retry-After is long.
               applyModelCooldown(activeCooldowns, cooldownKey, providerError, retryDelayMs(delays, providerError, attempt));

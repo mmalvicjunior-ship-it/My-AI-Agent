@@ -12,9 +12,14 @@ export const POSTGRES_SCHEMA_SQL = `
     name       TEXT NOT NULL,
     root_path  TEXT,
     owner_id   BIGINT,
+    import_key TEXT,
     created_at TEXT NOT NULL DEFAULT (${NOW})
   );
   CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects (owner_id, id);
+  -- Additive migration for databases created before concurrent imports were
+  -- made idempotent. Existing rows keep import_key = NULL and are untouched.
+  ALTER TABLE projects ADD COLUMN IF NOT EXISTS import_key TEXT;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_import_key ON projects (import_key);
 
   CREATE TABLE IF NOT EXISTS users (
     id            BIGSERIAL PRIMARY KEY,

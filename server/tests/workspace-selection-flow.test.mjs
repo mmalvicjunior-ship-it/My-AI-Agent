@@ -8,8 +8,10 @@ import { fileURLToPath } from 'node:url';
 import {
   activeProjectIdForPersistence,
   chatRequestContext,
+  discoveredProjectRows,
   isCurrentProjectCreationScope,
   matchingProjectId,
+  projectUnderstandingPaths,
   responseScopeKey,
   selectRestoredProjectId,
   validatedChatProjectId,
@@ -17,6 +19,7 @@ import {
   workspaceLoadingMessage,
   workspaceSelectionState,
   workspaceStatusMessage,
+  workspaceUnderstandingSummary,
 } from '../../apps/web/src/workspaceUiHelpers.js';
 
 const APP_SOURCE = fs.readFileSync(
@@ -103,7 +106,7 @@ test('project restoration ignores stale and cross-account IDs', () => {
     currentProjectId: '7',
     storedProjectId: '7',
     projectsLoaded: true,
-  }), '8');
+  }), '');
   assert.equal(selectRestoredProjectId({
     projects: [],
     currentProjectId: '7',
@@ -247,7 +250,7 @@ test('one authorized project is safe to restore; multiple projects respect selec
   assert.match(ready.message, /Workspace ready: Eight/);
 });
 
-test('stale restored selection is reported without reusing the invalid ID', () => {
+test('stale restored selection requires an explicit choice instead of reusing another project', () => {
   const projects = [{ id: 8, name: 'Current project' }];
   const staleId = '7';
   const next = selectRestoredProjectId({
@@ -256,17 +259,18 @@ test('stale restored selection is reported without reusing the invalid ID', () =
     storedProjectId: staleId,
     projectsLoaded: true,
   });
-  assert.equal(next, '8');
+  assert.equal(next, '');
   const state = workspaceSelectionState({
     projects,
     projectId: next,
-    activeProject: projects[0],
+    activeProject: null,
     staleRestoredProjectId: staleId,
   });
   assert.equal(state.status, 'stale_selection');
-  assert.equal(state.ready, true);
-  assert.equal(state.projectId, 8);
+  assert.equal(state.ready, false);
+  assert.equal(state.projectId, null);
   assert.match(state.message, /no longer available/i);
+  assert.match(state.message, /choose a project/i);
   assert.equal(chatRequestContext({
     projects,
     projectId: staleId,
@@ -302,7 +306,7 @@ test('account switching never reuses a previous account project ID', () => {
     currentProjectId: '7',
     storedProjectId: '7',
     projectsLoaded: true,
-  }), '8');
+  }), '');
 });
 
 test('App.jsx waits for project loading, tracks load failure, and revalidates chat scope', () => {
@@ -475,4 +479,50 @@ test('failed reload hides the prior workspace without erasing the saved selectio
   assert.match(APP_SOURCE, /Workspace unavailable/);
   assert.match(APP_SOURCE, /placeholder=\{visibleProject/);
   assert.match(APP_SOURCE, /onClick=\{loadProjects\}>Retry</);
+});
+
+test('discovered picker rows dedupe invalid entries and list opened projects first', () => {
+  const rows = discoveredProjectRows([
+    { discoveryId: 'v1.beta', name: 'Beta', technologies: ['Node.js'] },
+    { discoveryId: 'v1.opened', name: 'Alpha', alreadyOpenedProjectId: 9 },
+    { discoveryId: 'v1.beta', name: 'Beta duplicate' },
+    { discoveryId: '', name: 'Invalid' },
+  ]);
+  assert.deepEqual(rows.map((row) => row.discoveryId), ['v1.opened', 'v1.beta']);
+  assert.equal(rows[0].alreadyOpenedProjectId, 9);
+  assert.deepEqual(rows[1].technologies, ['Node.js']);
+});
+
+test('post-scan understanding uses only allowlisted files that the scan found', () => {
+  const result = {
+    files: ['README.md', 'AGENTS.md', 'src/index.js', 'package.json', '.env.local'],
+    manifests: ['package.json'],
+    languageHints: ['JavaScript'],
+    frameworkHints: ['Vite'],
+    projectTypes: ['Node.js'],
+    truncated: false,
+  };
+  const paths = projectUnderstandingPaths(result);
+  assert.deepEqual(paths, ['README.md', 'AGENTS.md', 'package.json']);
+  const summary = workspaceUnderstandingSummary({ result, readPaths: paths });
+  assert.match(summary, /Understood project:/);
+  assert.match(summary, /Node\.js/);
+  assert.match(summary, /README\.md, AGENTS\.md, package\.json/);
+});
+
+test('the picker sends opaque discovery IDs and keeps new workspaces name-only', () => {
+  assert.match(APP_SOURCE, /const createProject = async \(\{ name, path: existingPath, discoveryId \} = \{\}\)/);
+  assert.match(APP_SOURCE, /discoveryId: trimmedDiscoveryId/);
+  assert.match(APP_SOURCE, /projectUnderstandingPaths\(result\)/);
+  assert.match(APP_SOURCE, /workspaceUnderstandingSummary\(\{ result, readPaths \}\)/);
+  const dialogSource = fs.readFileSync(
+    fileURLToPath(new URL('../../apps/web/src/ProjectDialog.jsx', import.meta.url)),
+    'utf8',
+  );
+  assert.match(dialogSource, /<h2 id="project-dialog-title">Open a project<\/h2>/);
+  assert.match(dialogSource, /Choose a project and let your agent understand its codebase\./);
+  assert.match(dialogSource, /\/api\/projects\/discover/);
+  assert.match(dialogSource, /discoveryId: selected\.discoveryId/);
+  assert.match(dialogSource, /New workspace/);
+  assert.equal(dialogSource.includes('/api/projects/browse'), false);
 });

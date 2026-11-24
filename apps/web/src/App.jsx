@@ -7,10 +7,12 @@ import AuthScreen from './AuthScreen';
 import ProjectDialog from './ProjectDialog';
 import WorkspaceFiles from './WorkspaceFiles';
 import {
+  bumpAuthEpoch,
   chooseAuthTokenForInitialization,
   createAuthCallbackRunner,
   googleErrorMessage,
   parseAuthFragment,
+  readAuthEpoch,
   renewExistingSession,
   shouldApplyRenewalResult,
   shouldClearWorkspaceForAuthChange,
@@ -23,6 +25,7 @@ import {
   chatRequestContext,
   isCurrentProjectCreationScope,
   matchingProjectId,
+  projectUnderstandingPaths,
   quickActionsFor,
   responseScopeKey,
   selectRestoredProjectId,
@@ -31,6 +34,7 @@ import {
   verifiedWorkspaceProject,
   workspaceLoadingMessage,
   workspaceScanStatus,
+  workspaceUnderstandingSummary,
   workspaceSelectionState,
   workspaceStatusMessage,
 } from './workspaceUiHelpers.js';
@@ -57,6 +61,13 @@ function persistAuth(auth) {
   } catch {
     /* Storage may be unavailable in private browsing; the session still works. */
   }
+}
+
+// A new token or a different account invalidates any callback verification in
+// flight in another tab. Cosmetic updates to the same session do not.
+function authEpochIdentity(auth) {
+  if (!auth) return '';
+  return `${auth.user?.id ?? ''}:${auth.token ?? ''}`;
 }
 
 function formatTimeAgo(ts) {
@@ -468,6 +479,7 @@ function App() {
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceScan, setWorkspaceScan] = useState({ status: 'idle', error: null, result: null });
+  const [projectUnderstanding, setProjectUnderstanding] = useState(null);
   const [scanRequest, setScanRequest] = useState(0);
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileContent, setFileContent] = useState('');
@@ -547,9 +559,11 @@ function App() {
   const wasAtBottomRef = useRef(true);
 
   const applyAuth = useCallback((next) => {
+    const previous = authRef.current;
     authRef.current = next;
     persistAuth(next);
     setAuth(next);
+    if (authEpochIdentity(previous) !== authEpochIdentity(next)) bumpAuthEpoch();
   }, []);
 
   // One cleanup path for sign-out, confirmed session expiry, and account
@@ -567,6 +581,7 @@ function App() {
     setWorkspaceFiles([]);
     setWorkspaceLoading(false);
     setWorkspaceScan({ status: 'idle', error: null, result: null });
+    setProjectUnderstanding(null);
     setSelectedFile(null);
     setFileContent('');
     setFileSearch('');
@@ -653,6 +668,9 @@ function App() {
       apiBase: API_BASE,
       fetchImpl: (...args) => globalThis.fetch(...args),
       getTransitionGeneration: () => authTransitionGenerationRef.current,
+      getCurrentAuth: () => authRef.current,
+      getAuthEpoch: () => readAuthEpoch(),
+      onSettled: () => setAuthChecking(false),
       clearHash: () => {
         if (window.history?.replaceState) {
           window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
@@ -809,7 +827,7 @@ function App() {
   }, [sessions]);
 
   // Restore only from the current account's loaded project list. A stale ID
-  // from another account or a deleted project is replaced by a valid one.
+  // from another account or a deleted project requires an explicit choice.
   useEffect(() => {
     if (!auth || !projectsLoadedRef.current) return;
     if (projectsScopeRef.current !== responseScopeKey(authUserId, null)) return;
@@ -1179,12 +1197,13 @@ function App() {
     setProjectDialogOpen(true);
   };
 
-  const createProject = async ({ name, path: existingPath } = {}) => {
+  const createProject = async ({ name, path: existingPath, discoveryId } = {}) => {
     const trimmedName = typeof name === 'string' ? name.trim() : '';
     if (!trimmedName) {
       setProjectError('Project name is required.');
       return;
     }
+    const trimmedDiscoveryId = typeof discoveryId === 'string' ? discoveryId.trim() : '';
     setProjectBusy(true);
     setProjectError(null);
     const requestUserId = authRef.current?.user?.id ?? null;
@@ -1208,7 +1227,8 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: trimmedName,
-          ...(existingPath ? { path: existingPath } : {}),
+          ...(trimmedDiscoveryId ? { discoveryId: trimmedDiscoveryId } : {}),
+          ...(!trimmedDiscoveryId && existingPath ? { path: existingPath } : {}),
         }),
       });
       // A response belonging to an account or load generation that is no
@@ -1362,10 +1382,12 @@ function App() {
       setFileContent('');
       setWorkspaceLoading(false);
       setWorkspaceScan({ status: 'idle', error: null, result: null });
+      setProjectUnderstanding(null);
       return;
     }
     setWorkspaceLoading(true);
     setWorkspaceScan({ status: 'scanning', error: null, result: null });
+    setProjectUnderstanding(null);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/tree`);
       const result = await response.json();
@@ -1373,6 +1395,24 @@ function App() {
       if (!isCurrent()) return;
       setWorkspaceFiles(Array.isArray(result.files) ? result.files : []);
       setWorkspaceScan({ status: 'complete', error: null, result });
+
+      // The scan already built the file index and metadata. Read only a small
+      // allowlist of root instruction/manifest files through the existing
+      // owner-scoped, redacting file route; failures never fail the scan.
+      const readPaths = [];
+      for (const filePath of projectUnderstandingPaths(result)) {
+        try {
+          const fileResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(filePath)}`);
+          const fileResult = await fileResponse.json().catch(() => null);
+          if (!isCurrent()) return;
+          if (fileResponse.ok && fileResult?.ok && typeof fileResult.content === 'string') {
+            readPaths.push(filePath);
+          }
+        } catch {
+          // Ignore an unreadable optional document; the scan remains complete.
+        }
+      }
+      if (isCurrent()) setProjectUnderstanding(workspaceUnderstandingSummary({ result, readPaths }));
     } catch (error) {
       if (!isCurrent()) return;
       setWorkspaceScan({ status: 'failed', error: error.message, result: null });
@@ -1995,6 +2035,9 @@ function App() {
                       <small>Agent is working in</small>
                       <strong>{visibleProject.name}</strong>
                       <span className="welcome-project-scan">{workspaceScanView.message}</span>
+                      {projectUnderstanding && (
+                        <span className="welcome-project-understanding">{projectUnderstanding}</span>
+                      )}
                     </div>
                     <button type="button" onClick={() => { setWorkspaceTab('files'); setWorkspaceOpen(true); }}>View files</button>
                   </div>

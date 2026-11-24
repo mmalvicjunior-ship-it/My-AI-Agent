@@ -15,6 +15,14 @@ import { createWorkspaceTools } from './ai/tools.js';
 import { createTaskRunner } from './tasks/runner.js';
 import { createTaskExecutor } from './tasks/executor.js';
 import { ensureDir, projectDir, isPathInside } from './workspace/files.js';
+import {
+  buildDiscoveryResults,
+  collectProjectCandidates,
+  decodeDiscoveryId,
+  discoveryDedupeKey,
+  inspectProjectMarkers,
+  revalidateProjectCandidates,
+} from './workspace/project-discovery.js';
 import { getWorkspaceDriver } from './workspace/storage-driver.js';
 import { requireAuth, bypassAuth, isBypassUser, deleteExpiredSessions } from './auth/index.js';
 
@@ -23,6 +31,52 @@ function realOrResolved(value) {
     return fs.realpathSync(value);
   } catch {
     return path.resolve(value);
+  }
+}
+
+// Immutable key for an imported directory. NULL owner (local bypass mode) uses
+// 0 as a sentinel; real user IDs start at 1. Managed workspaces have no
+// rootPath and therefore no key, so duplicate names remain allowed.
+function importKeyFor(ownerId, rootPath) {
+  return JSON.stringify([ownerId ?? 0, rootPath]);
+}
+
+function isImportKeyConflict(error) {
+  const message = String(error?.message || '');
+  return error?.code === '23505'
+    || /idx_projects_import_key|projects\.import_key|UNIQUE constraint failed/i.test(message);
+}
+
+/**
+ * Finds or creates one owned project for a canonical import root. The unique
+ * import_key closes the SELECT/INSERT race between separate app processes;
+ * a loser re-reads the winner instead of creating a duplicate row.
+ */
+export function findOrCreateImportedProject(db, { name, rootPath, ownerId }) {
+  if (typeof rootPath !== 'string' || !rootPath) return null;
+  const importKey = importKeyFor(ownerId, rootPath);
+  const findExisting = () => (ownerId === null
+    ? db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id IS NULL AND root_path = ? ORDER BY id LIMIT 1').get(rootPath)
+    : db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id = ? AND root_path = ? ORDER BY id LIMIT 1').get(ownerId, rootPath));
+
+  const existing = findExisting();
+  if (existing) {
+    return { existing: true, project: { id: Number(existing.id), name: existing.name } };
+  }
+
+  try {
+    const result = db
+      .prepare('INSERT INTO projects (name, root_path, owner_id, import_key) VALUES (?, ?, ?, ?)')
+      .run(name, rootPath, ownerId, importKey);
+    return {
+      existing: false,
+      project: { id: Number(result.lastInsertRowid), name },
+    };
+  } catch (error) {
+    if (!isImportKeyConflict(error)) throw error;
+    const winner = findExisting();
+    if (!winner) throw error;
+    return { existing: true, project: { id: Number(winner.id), name: winner.name } };
   }
 }
 
@@ -200,24 +254,73 @@ export function createApp(options = {}) {
     }
     let rootPath = null;
     const workspaceDriver = getWorkspaceDriver();
-    if (req.body?.path !== undefined && workspaceDriver.mode !== 'local') {
+    const hasLegacyPath = req.body?.path !== undefined;
+    const hasDiscoveryId = req.body?.discoveryId !== undefined;
+    if (hasLegacyPath && hasDiscoveryId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Provide either a discovered project or a path, not both.',
+      });
+    }
+    if ((hasLegacyPath || hasDiscoveryId) && workspaceDriver.mode !== 'local') {
       return res.status(400).json({
         ok: false,
         error: 'Importing existing directories is not supported while object storage is enabled.',
       });
     }
-    if (req.body?.path !== undefined) {
+
+    const configuredRoot = typeof rawImportRoot === 'string' ? rawImportRoot.trim() : '';
+    if ((hasLegacyPath || hasDiscoveryId) && !configuredRoot) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Importing existing server directories is disabled. Set PROJECT_IMPORT_ROOT on the server to allow it.',
+      });
+    }
+
+    // Apply the same configuration guard as discovery/browse before resolving
+    // any import. An import root that contains, or lives inside, the managed
+    // workspace or database directory is never acceptable, even when the
+    // requested directory is only a harmless-looking sibling.
+    // Name-only workspaces do not touch the import root, so an unsafe import
+    // configuration must not block ordinary project creation.
+    const importRootReal = (hasLegacyPath || hasDiscoveryId) && configuredRoot
+      ? realOrResolved(configuredRoot)
+      : null;
+    const workspaceRootReal = realOrResolved(config.workspaceRoot);
+    const databaseDirReal = path.dirname(realOrResolved(config.databasePath));
+    if (importRootReal && (
+      isPathInside(importRootReal, workspaceRootReal)
+      || isPathInside(workspaceRootReal, importRootReal)
+      || isPathInside(importRootReal, databaseDirReal)
+      || isPathInside(databaseDirReal, importRootReal)
+    )) {
+      return res.status(403).json({
+        ok: false,
+        code: 'IMPORT_UNSAFE',
+        error: 'PROJECT_IMPORT_ROOT must be a dedicated folder outside the managed workspace and database directories.',
+      });
+    }
+
+    let requestedPath = null;
+    if (hasLegacyPath) {
       if (typeof req.body.path !== 'string' || !path.isAbsolute(req.body.path)) {
         return res.status(400).json({ ok: false, error: 'Existing project path must be an absolute directory path on the server.' });
       }
-      if (typeof rawImportRoot !== 'string' || rawImportRoot.trim() === '') {
-        return res.status(403).json({
-          ok: false,
-          error: 'Importing existing server directories is disabled. Set PROJECT_IMPORT_ROOT on the server to allow it.',
-        });
+      requestedPath = req.body.path;
+    } else if (hasDiscoveryId) {
+      if (typeof req.body.discoveryId !== 'string') {
+        return res.status(400).json({ ok: false, error: 'Invalid discovered project.' });
       }
+      const relativePath = decodeDiscoveryId(req.body.discoveryId);
+      if (!relativePath) {
+        return res.status(400).json({ ok: false, error: 'Invalid discovered project.' });
+      }
+      requestedPath = path.resolve(importRootReal, ...relativePath.split('/'));
+    }
+
+    if (requestedPath !== null) {
       try {
-        rootPath = fs.realpathSync(req.body.path);
+        rootPath = fs.realpathSync(requestedPath);
         if (!fs.statSync(rootPath).isDirectory()) {
           return res.status(400).json({ ok: false, error: 'Existing project path must be a directory.' });
         }
@@ -228,8 +331,7 @@ export function createApp(options = {}) {
         return res.status(400).json({ ok: false, error: 'Existing project directory could not be opened.' });
       }
 
-      const importRoot = realOrResolved(rawImportRoot);
-      if (!isPathInside(importRoot, rootPath)) {
+      if (!isPathInside(importRootReal, rootPath)) {
         return res.status(403).json({
           ok: false,
           error: 'Existing project path is outside the configured import root.',
@@ -237,7 +339,7 @@ export function createApp(options = {}) {
       }
       // The managed workspace tree holds every user's project files, so it can
       // never be registered as an importable project.
-      if (isPathInside(realOrResolved(config.workspaceRoot), rootPath)) {
+      if (isPathInside(workspaceRootReal, rootPath)) {
         return res.status(403).json({
           ok: false,
           error: 'Existing project path cannot be inside the managed workspace root.',
@@ -246,8 +348,6 @@ export function createApp(options = {}) {
       // Ancestor check: if the import root is an ancestor of the managed
       // workspace or the database directory, the import would expose all
       // user projects or server secrets. Reject it.
-      const workspaceRootReal = realOrResolved(config.workspaceRoot);
-      const databaseDirReal = path.dirname(realOrResolved(config.databasePath));
       if (isPathInside(rootPath, workspaceRootReal)) {
         return res.status(403).json({
           ok: false,
@@ -262,20 +362,15 @@ export function createApp(options = {}) {
       }
     }
     const ownerId = isBypassUser(req.user) ? null : req.user.id;
-    // Idempotent import: retrying "Open existing project" reopens the existing
-    // owned record for that real path instead of silently accumulating
-    // duplicate projects. Managed new workspaces keep their existing behavior
-    // (same name may be created more than once). Matching is scoped to this
-    // owner only, so one account can never discover or reuse another account's
-    // project.
-    const existing = rootPath === null ? null : (ownerId === null
-      ? db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id IS NULL AND root_path = ? ORDER BY id LIMIT 1').get(rootPath)
-      : db.prepare('SELECT id, name, root_path FROM projects WHERE owner_id = ? AND root_path = ? ORDER BY id LIMIT 1').get(ownerId, rootPath));
-    if (existing) {
-      return res.json({
+    // Imports use a database-level unique key so two simultaneous requests for
+    // the same canonical root and owner cannot both insert. Managed new
+    // workspaces keep their existing duplicate-name behavior.
+    if (rootPath !== null) {
+      const imported = findOrCreateImportedProject(db, { name, rootPath, ownerId });
+      return res.status(imported.existing ? 200 : 201).json({
         ok: true,
-        existing: true,
-        project: { id: existing.id, name: existing.name },
+        ...(imported.existing ? { existing: true } : {}),
+        project: imported.project,
       });
     }
 
@@ -296,6 +391,69 @@ export function createApp(options = {}) {
       throw error;
     }
     res.status(201).json({ ok: true, project: { id, name } });
+  });
+
+  // --- Project discovery (read-only picker for project opening) ------------
+  // Finds likely software projects only inside PROJECT_IMPORT_ROOT. Results
+  // contain opaque relative IDs and display metadata, never server paths.
+  app.get('/api/projects/discover', (req, res) => {
+    const configuredRoot = typeof rawImportRoot === 'string' ? rawImportRoot.trim() : '';
+    if (!configuredRoot) {
+      return res.status(403).json({
+        ok: false,
+        code: 'DISCOVERY_NOT_CONFIGURED',
+        error: 'Project discovery is disabled. Set PROJECT_IMPORT_ROOT on the server to an allowed parent folder, then restart the server.',
+      });
+    }
+
+    const importRoot = realOrResolved(configuredRoot);
+    const workspaceRootReal = realOrResolved(config.workspaceRoot);
+    const databaseDirReal = path.dirname(realOrResolved(config.databasePath));
+    if (isPathInside(importRoot, workspaceRootReal)
+      || isPathInside(workspaceRootReal, importRoot)
+      || isPathInside(importRoot, databaseDirReal)
+      || isPathInside(databaseDirReal, importRoot)) {
+      return res.status(403).json({
+        ok: false,
+        code: 'IMPORT_UNSAFE',
+        error: 'PROJECT_IMPORT_ROOT must be a dedicated folder outside the managed workspace and database directories.',
+      });
+    }
+
+    try {
+      const collected = collectProjectCandidates({ root: importRoot });
+      const candidates = revalidateProjectCandidates({
+        candidates: collected.candidates,
+        root: importRoot,
+      });
+      const truncated = collected.truncated || candidates.length !== collected.candidates.length;
+      // Only the requesting user's owned roots may be marked as already open.
+      const ownedRows = isBypassUser(req.user)
+        ? db.prepare('SELECT id, root_path FROM projects WHERE root_path IS NOT NULL').all()
+        : db.prepare('SELECT id, root_path FROM projects WHERE owner_id = ? AND root_path IS NOT NULL').all(req.user.id);
+      const ownedByRealPath = new Map();
+      for (const row of ownedRows) {
+        try {
+          if (typeof row.root_path !== 'string' || !row.root_path) continue;
+          const real = fs.realpathSync(row.root_path);
+          if (!isPathInside(importRoot, real)) continue;
+          const key = discoveryDedupeKey(real);
+          if (!ownedByRealPath.has(key)) ownedByRealPath.set(key, row.id);
+        } catch {
+          // A stale or inaccessible owned root is simply not marked as opened.
+        }
+      }
+      const projects = buildDiscoveryResults({
+        candidates,
+        ownedByRealPath,
+        // Read markers from the canonical path that was just revalidated, not
+        // from the original directory entry, which may have been swapped.
+        inspect: (candidate) => inspectProjectMarkers({ absolutePath: candidate.realPath }),
+      });
+      return res.json({ ok: true, projects, truncated, count: projects.length });
+    } catch {
+      return res.status(400).json({ ok: false, error: 'Project discovery could not be read.' });
+    }
   });
 
   // --- Allowed import folders (read-only picker for project creation) ------

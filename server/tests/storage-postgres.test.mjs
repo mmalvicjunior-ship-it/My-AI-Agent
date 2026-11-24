@@ -61,6 +61,32 @@ test('PGlite schema and idempotent migrations expose every required table/column
   assert.ok(proposals.has('result_json'));
 });
 
+test('projects.import_key is unique for imports and nullable for managed workspaces', () => {
+  const projectColumns = new Set(db.prepare('PRAGMA table_info(projects)').all().map((row) => row.name));
+  assert.ok(projectColumns.has('import_key'), 'missing projects.import_key');
+  const indexes = db.prepare('SELECT indexname FROM pg_indexes WHERE tablename = ?').all('projects');
+  assert.ok(indexes.some((row) => row.indexname === 'idx_projects_import_key'), 'missing unique import_key index');
+
+  const rootPath = '/pglite/imports/shared-app';
+  const key = JSON.stringify([0, rootPath]);
+  const insert = db.prepare(
+    'INSERT INTO projects (name, root_path, owner_id, import_key) VALUES (?, ?, ?, ?)',
+  );
+  assert.equal(insert.run('Import A', rootPath, null, key).changes, 1);
+  assert.throws(() => insert.run('Import B', rootPath, null, key), /duplicate key|unique/i);
+  assert.equal(Number(db.prepare('SELECT COUNT(*) AS count FROM projects WHERE import_key = ?').get(key).count), 1);
+
+  // Different owners can import the same root; managed workspaces keep NULL
+  // import_key and remain unrestricted.
+  assert.equal(insert.run('Import C', rootPath, 42, JSON.stringify([42, rootPath])).changes, 1);
+  assert.equal(db.prepare(
+    'INSERT INTO projects (name, root_path, owner_id, import_key) VALUES (?, ?, ?, NULL)',
+  ).run('Managed A', null, 42).changes, 1);
+  assert.equal(db.prepare(
+    'INSERT INTO projects (name, root_path, owner_id, import_key) VALUES (?, ?, ?, NULL)',
+  ).run('Managed A', null, 42).changes, 1);
+});
+
 test('SQL adapter translates placeholders, RETURNING, changes, and timestamps', () => {
   const created = db.prepare('INSERT INTO projects (name, owner_id) VALUES (?, ?)').run('postgres-adapter', null);
   assert.equal(created.changes, 1);

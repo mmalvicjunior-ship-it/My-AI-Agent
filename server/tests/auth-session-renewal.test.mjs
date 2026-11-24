@@ -11,8 +11,10 @@ import { mockProvider } from '../src/ai/mock.js';
 import { createSession, deleteExpiredSessions, findSessionUser, hashToken } from '../src/auth/index.js';
 import {
   __resetAuthCallbackRunnerForTests,
+  bumpAuthEpoch,
   chooseAuthTokenForInitialization,
   createAuthCallbackRunner,
+  readAuthEpoch,
   renewExistingSession,
   shouldApplyRenewalResult,
 } from '../../apps/web/src/authFlow.js';
@@ -268,4 +270,33 @@ test('sign-out or account switching during callback verification drops the stale
   assert.equal(authenticated, 0);
   assert.equal(errors, 0);
   assert.equal(cleared, 0);
+});
+
+test('a cross-tab account selection during verification supersedes the callback', async () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => { values.set(key, String(value)); },
+    removeItem: (key) => { values.delete(key); },
+  };
+  const gate = deferred();
+  let authenticated = 0;
+  let cleared = 0;
+  const runner = createAuthCallbackRunner({
+    fetchImpl: async () => {
+      await gate.promise;
+      return meResponse({ id: 'account-a' });
+    },
+    storage,
+    getAuthEpoch: () => readAuthEpoch(storage),
+    onAuthenticated: () => { authenticated += 1; },
+    clearHash: () => { cleared += 1; },
+  });
+  const pending = runner.run('#auth_token=fresh-token');
+  bumpAuthEpoch(storage); // newer account selected in a different tab
+  gate.resolve();
+  const result = await pending;
+  assert.equal(result.status, 'superseded');
+  assert.equal(authenticated, 0);
+  assert.equal(cleared, 1);
 });

@@ -93,7 +93,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
         </div>
         <div className="auth-aside-copy">
           <span className="auth-aside-eyebrow">AI coding workspace</span>
-          <h2>Describe it.<br />Plan it.<br /><span>Ship it.</span></h2>
+          <h2>Describe it.{' '}<br />Plan it.{' '}<br /><span>Ship it.</span></h2>
           <p>Work on a real project with an agent that inspects files, proposes changes and asks before it writes or runs anything.</p>
         </div>
         <ul className="auth-points">
@@ -116,11 +116,10 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
               : 'Sign in to continue to your workspaces.'}
           </p>
 
-          <div className="auth-tabs" role="tablist" aria-label="Authentication mode">
+          <div className="auth-tabs" role="group" aria-label="Authentication mode">
             <button
               type="button"
-              role="tab"
-              aria-selected={!isRegister}
+              aria-pressed={!isRegister}
               className={!isRegister ? 'active' : ''}
               onClick={() => switchMode('login')}
             >
@@ -128,8 +127,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
             </button>
             <button
               type="button"
-              role="tab"
-              aria-selected={isRegister}
+              aria-pressed={isRegister}
               className={isRegister ? 'active' : ''}
               onClick={() => switchMode('register')}
             >
@@ -181,7 +179,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
                   type="button"
                   onClick={() => setShowPassword((value) => !value)}
                   aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  tabIndex={-1}
+                  aria-pressed={showPassword}
                 >
                   {showPassword ? 'Hide' : 'Show'}
                 </button>
@@ -198,7 +196,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
           <p className="auth-note">
             {isRegister
               ? 'New accounts can use Google or email and password. Your projects stay private to your account.'
-              : 'Sessions stay signed in across refreshes and can be ended with Sign out.'}
+              : 'Sessions persist across refreshes. Sign out ends access.'}
           </p>
         </div>
       </section>

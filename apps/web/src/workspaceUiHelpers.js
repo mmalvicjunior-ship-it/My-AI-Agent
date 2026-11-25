@@ -331,6 +331,60 @@ export function isCurrentProjectCreationScope({
 }
 
 /**
+ * Snapshot of everything that makes an async workspace response safe to apply.
+ * A new account, token, session generation, or project selection produces a
+ * different snapshot, so delayed responses can be discarded consistently.
+ */
+export function captureWorkspaceResponseScope({
+  authenticated = false,
+  userId = null,
+  token = null,
+  projectId = '',
+  generation = 0,
+} = {}) {
+  return Object.freeze({
+    authenticated: Boolean(authenticated),
+    userId: userId === undefined ? null : userId,
+    token: token === undefined ? null : token,
+    projectId: projectId === null || projectId === undefined ? '' : String(projectId),
+    generation: Number.isFinite(generation) ? generation : 0,
+  });
+}
+
+/** Compares a captured response scope with the current workspace/session. */
+export function isCurrentWorkspaceResponseScope({ current = null, request = null } = {}) {
+  if (!current || !request) return false;
+  return Boolean(current.authenticated)
+    && Boolean(request.authenticated)
+    && current.userId === request.userId
+    && current.token === request.token
+    && current.generation === request.generation
+    && current.projectId === request.projectId;
+}
+
+/**
+ * Session-only counterpart for operations that explicitly target a project
+ * other than the one currently selected. The target project and its ownership
+ * are validated by the request URL and the server, not by the selected tab.
+ */
+export function isCurrentWorkspaceSessionScope({ current = null, request = null } = {}) {
+  if (!current || !request) return false;
+  return Boolean(current.authenticated)
+    && Boolean(request.authenticated)
+    && current.userId === request.userId
+    && current.token === request.token
+    && current.generation === request.generation;
+}
+
+/**
+ * Request-lifecycle ownership. A completion may clear its own loading flag
+ * even when its response is stale, but it must never clear a newer request.
+ */
+export function isCurrentRequestLifecycle(activeRequestId, requestId) {
+  return activeRequestId === requestId;
+}
+
+/**
  * Turns the existing path-safe /tree response into a small, user-visible
  * summary of what the agent can see. Missing metadata stays absent; no extra
  * scan is started by the UI.

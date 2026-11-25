@@ -24,6 +24,7 @@ export default function ProjectDialog({
   const [loading, setLoading] = useState(false);
   const [attempted, setAttempted] = useState(false);
   const [localError, setLocalError] = useState(null);
+  const dialogRef = useRef(null);
   const nameRef = useRef(null);
 
   const loadProjects = useCallback(async () => {
@@ -82,10 +83,55 @@ export default function ProjectDialog({
   }, [open, busy, onClose]);
 
   useEffect(() => {
-    if (!open || mode !== 'new') return undefined;
-    const timer = window.setTimeout(() => nameRef.current?.focus(), 30);
-    return () => window.clearTimeout(timer);
+    if (!open) return undefined;
+    const previouslyFocused = document.activeElement;
+    return () => {
+      if (previouslyFocused?.isConnected && typeof previouslyFocused.focus === 'function') {
+        previouslyFocused.focus();
+      }
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    if (mode === 'new') {
+      const timer = window.setTimeout(() => nameRef.current?.focus(), 30);
+      return () => window.clearTimeout(timer);
+    }
+    dialogRef.current?.focus();
+    return undefined;
   }, [open, mode]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== 'Tab') return;
+      const container = dialogRef.current;
+      if (!container) return;
+      const focusables = [...container.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      )].filter((element) => element.offsetParent !== null || element === document.activeElement);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        container.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!container.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      } else if (event.shiftKey && (document.activeElement === first || document.activeElement === container)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [open, mode, busy]);
 
   if (!open) return null;
 
@@ -115,7 +161,14 @@ export default function ProjectDialog({
     <div className="dialog-overlay" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget && !busy) onClose();
     }}>
-      <div className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title">
+      <div
+        className="project-dialog"
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-dialog-title"
+      >
         <header className="dialog-head">
           <div>
             <span className="dialog-eyebrow">Workspace</span>

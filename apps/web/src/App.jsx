@@ -22,8 +22,12 @@ import {
   TASK_LIST_LIMIT,
   activeProjectIdForPersistence,
   buildPromptWithAttachment,
+  captureWorkspaceResponseScope,
   chatRequestContext,
   isCurrentProjectCreationScope,
+  isCurrentRequestLifecycle,
+  isCurrentWorkspaceResponseScope,
+  isCurrentWorkspaceSessionScope,
   matchingProjectId,
   projectUnderstandingPaths,
   quickActionsFor,
@@ -514,6 +518,10 @@ function App() {
   // Incremented on every sign-out/account switch and on a newly accepted auth
   // result. Async callbacks compare it before touching workspace state.
   const authTransitionGenerationRef = useRef(0);
+  // Dedicated workspace generation: every account/session change invalidates
+  // all outstanding workspace requests, even those started by a direct login
+  // that did not go through clearSession().
+  const workspaceGenerationRef = useRef(0);
   const renewalStateRef = useRef({ inFlightToken: null });
   const authUserId = auth?.user?.id ?? null;
   const activeProject = projects.find((project) => String(project.id) === String(projectId)) || null;
@@ -549,6 +557,7 @@ function App() {
   const workspaceFileRequestRef = useRef(0);
   const searchRequestRef = useRef(0);
   const taskDetailRequestRef = useRef(0);
+  const taskSubmitRequestRef = useRef(0);
   const selectedFileRef = useRef(selectedFile);
   selectedFileRef.current = selectedFile;
   const messageListRef = useRef(null);
@@ -560,16 +569,74 @@ function App() {
 
   const applyAuth = useCallback((next) => {
     const previous = authRef.current;
+    const changed = authEpochIdentity(previous) !== authEpochIdentity(next);
     authRef.current = next;
     persistAuth(next);
     setAuth(next);
-    if (authEpochIdentity(previous) !== authEpochIdentity(next)) bumpAuthEpoch();
+    if (changed) {
+      bumpAuthEpoch();
+      // Directly accepting a new login (without an explicit clearSession)
+      // must also invalidate every request started by the previous session.
+      workspaceGenerationRef.current += 1;
+      // Abort a pending chat so a same-user token change cannot leave the
+      // composer busy. The matching request's own finally still clears the
+      // controller and generating flag.
+      controllerRef.current?.abort();
+      setGenerating(false);
+    }
   }, []);
+
+  // Captures the current account/token/generation/project before a request.
+  // Every guarded handler compares this snapshot again before applying a
+  // result or an error.
+  const readWorkspaceScope = useCallback((scopeProjectId = projectIdRef.current) => captureWorkspaceResponseScope({
+    authenticated: Boolean(authRef.current),
+    userId: authRef.current?.user?.id ?? null,
+    token: authRef.current?.token ?? null,
+    projectId: scopeProjectId,
+    generation: workspaceGenerationRef.current,
+  }), []);
+
+  const isCurrentWorkspaceScope = useCallback((request, scopeProjectId = projectIdRef.current) => (
+    isCurrentWorkspaceResponseScope({
+      current: readWorkspaceScope(scopeProjectId),
+      request,
+    })
+  ), [readWorkspaceScope]);
+
+  // For an explicitly targeted project, only the account/session must remain
+  // valid. The target project itself is validated by the URL and server.
+  const isCurrentWorkspaceSession = useCallback((request) => (
+    isCurrentWorkspaceSessionScope({
+      current: readWorkspaceScope(request?.projectId),
+      request,
+    })
+  ), [readWorkspaceScope]);
 
   // One cleanup path for sign-out, confirmed session expiry, and account
   // changes. Everything derived from the old account or project is discarded.
   const clearWorkspaceState = useCallback((userId = null) => {
+    // Invalidate outstanding work first; their later success/error callbacks
+    // will fail the shared scope check instead of painting the new account.
+    workspaceGenerationRef.current += 1;
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    workspaceRequestRef.current += 1;
+    workspaceFileRequestRef.current += 1;
+    searchRequestRef.current += 1;
+    taskDetailRequestRef.current += 1;
+    taskSubmitRequestRef.current += 1;
+
     persistActiveProjectId(userId, '');
+    // Drop loaded conversations without writing the empty state into the old
+    // account's storage namespace. The authUserId effect reloads the new one.
+    sessionsLoadedRef.current = false;
+    sessionsNamespaceRef.current = null;
+    setSessions([]);
+    setActiveId(null);
+    setInput('');
+    setTaskInput('');
+    setGenerating(false);
     projectsLoadedRef.current = false;
     projectsScopeRef.current = null;
     projectsLoadGenerationRef.current += 1;
@@ -592,6 +659,9 @@ function App() {
     setTasks([]);
     setProjectProposals([]);
     setTaskStatusFilter(null);
+    setTasksError(null);
+    setTaskLoading(false);
+    setTaskSubmitting(false);
     setTaskDetail(null);
     setTaskDetailError(null);
     setFocusTaskId(null);
@@ -891,9 +961,10 @@ function App() {
 
   const loadProjects = useCallback(async () => {
     const scope = responseScopeKey(authRef.current?.user?.id ?? null, null);
+    const requestWorkspaceScope = readWorkspaceScope(null);
     const generation = ++projectsLoadGenerationRef.current;
     const isCurrent = () => generation === projectsLoadGenerationRef.current
-      && responseScopeKey(authRef.current?.user?.id ?? null, null) === scope;
+      && isCurrentWorkspaceScope(requestWorkspaceScope, null);
 
     if (!authRef.current) {
       if (!isCurrent()) return;
@@ -928,14 +999,13 @@ function App() {
       setProjectsLoadError('Could not load your authorized projects.');
       setProjectsLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, isCurrentWorkspaceScope, readWorkspaceScope]);
 
   useEffect(() => {
     let cancelled = false;
-    const accountScope = () => responseScopeKey(authRef.current?.user?.id ?? null, null);
     const checkHealth = async () => {
-      const scope = accountScope();
-      const isCurrent = () => !cancelled && accountScope() === scope;
+      const requestScope = readWorkspaceScope(null);
+      const isCurrent = () => !cancelled && isCurrentWorkspaceScope(requestScope, null);
       try {
         const response = await apiFetch(`${API_BASE}/api/health`);
         if (!response.ok) throw new Error(`Health check returned ${response.status}`);
@@ -971,7 +1041,7 @@ function App() {
       projectsLoadGenerationRef.current += 1;
       window.clearInterval(timer);
     };
-  }, [apiFetch, auth?.token, loadProjects]);
+  }, [apiFetch, auth?.token, isCurrentWorkspaceScope, loadProjects, readWorkspaceScope]);
 
   // A verified selection (including a restored one after browser refresh)
   // starts the existing safe /tree scan automatically. `scanRequest` also lets
@@ -1043,6 +1113,11 @@ function App() {
       projectsLoaded: !projectsLoading && !projectsLoadError,
       retryRequest,
     });
+    const requestScope = readWorkspaceScope(requestContext.projectId);
+    // Compare against the project selected now, not the request's own target:
+    // passing the target ID back to the guard would make every project switch
+    // look current and let a delayed reply land in the wrong workspace.
+    const isCurrent = () => isCurrentWorkspaceScope(requestScope);
     try {
       const response = await apiFetch(`${API_BASE}/api/chat`, {
         method: 'POST',
@@ -1055,6 +1130,9 @@ function App() {
         }),
       });
       const result = await response.json();
+      // A reply from an account/session that has since changed is discarded
+      // before it can append a message or raise a toast for the new account.
+      if (!isCurrent()) return;
       if (!response.ok || !result.ok) {
         const error = new Error(result.error || `Request failed (${response.status})`);
         error.status = response.status;
@@ -1082,7 +1160,7 @@ function App() {
       }));
       setRetryRequest(null);
     } catch (error) {
-      if (error.name === 'AbortError') return;
+      if (!isCurrent() || error.name === 'AbortError') return;
       setRetryRequest({ sessionId, prompt, history, attachment: requestAttachment });
       const toastMessage = providerErrorToast(error);
       setToast({ message: toastMessage });
@@ -1092,13 +1170,16 @@ function App() {
         setHealth((current) => ({ ...current, warning: toastMessage }));
       }
     } finally {
-      if (controllerRef.current === controller) {
+      // Lifecycle cleanup is independent from response application: a stale
+      // response still finishes this request, but it cannot clear a newer one.
+      if (isCurrentRequestLifecycle(controllerRef.current, controller)) {
         controllerRef.current = null;
         setGenerating(false);
       }
     }
-  }, [activeProject, generating, health.online, health.provider, projects, projectId,
-    projectsLoading, projectsLoadError, retryRequest, selectedProvider, updateSession]);
+  }, [activeProject, generating, health.online, health.provider, isCurrentWorkspaceScope,
+    projects, projectId, projectsLoading, projectsLoadError, readWorkspaceScope, retryRequest,
+    selectedProvider, updateSession]);
 
   const sendMessage = useCallback(async (value = input) => {
     const rawPrompt = typeof value === 'string' ? value : '';
@@ -1221,6 +1302,8 @@ function App() {
       currentScope: projectsScopeRef.current,
       requestScope,
     });
+    const requestWorkspaceScope = readWorkspaceScope(null);
+    const isCurrentSession = () => isCurrentWorkspaceScope(requestWorkspaceScope, null);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects`, {
         method: 'POST',
@@ -1234,8 +1317,10 @@ function App() {
       // A response belonging to an account or load generation that is no
       // longer current must be discarded without touching newer UI state.
       if (!isCurrentRequest()) return;
+      if (!isCurrentSession()) return;
       const result = await response.json();
       if (!isCurrentRequest()) return;
+      if (!isCurrentSession()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not add the project.');
       setProjects((current) => upsertProject(current, result.project));
       setProjectId(String(result.project.id));
@@ -1258,15 +1343,16 @@ function App() {
       // Bump the request in case the idempotent POST reopened the same project.
       setScanRequest((value) => value + 1);
       if (!isCurrentRequest()) return;
+      if (!isCurrentSession()) return;
       setToast({
         message: result.existing
           ? `Project “${result.project.name}” is already in your workspace.`
           : `Project “${result.project.name}” is ready.`,
       });
     } catch (error) {
-      if (isCurrentRequest()) setProjectError(error.message);
+      if (isCurrentRequest() && isCurrentSession()) setProjectError(error.message);
     } finally {
-      if (isCurrentRequest()) setProjectBusy(false);
+      if (isCurrentRequest() && isCurrentSession()) setProjectBusy(false);
     }
   };
 
@@ -1288,6 +1374,7 @@ function App() {
   const loadTasks = useCallback(async (statusFilter = taskStatusFilterRef.current, scopeProjectId = projectIdRef.current) => {
     const currentScope = () => responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
     const scope = responseScopeKey(authRef.current?.user?.id ?? null, scopeProjectId);
+    const requestWorkspaceScope = readWorkspaceScope(scopeProjectId);
     if (taskLoadScopeRef.current !== scope) {
       // A different account or workspace must never keep the previous list on
       // screen while the new request is in flight.
@@ -1297,7 +1384,9 @@ function App() {
       setTaskDetail(null);
     }
     const generation = ++taskLoadGenerationRef.current;
-    const isCurrent = () => generation === taskLoadGenerationRef.current && taskLoadScopeRef.current === currentScope();
+    const isCurrent = () => generation === taskLoadGenerationRef.current
+      && taskLoadScopeRef.current === currentScope()
+      && isCurrentWorkspaceScope(requestWorkspaceScope, scopeProjectId);
 
     setTaskLoading(true);
     try {
@@ -1336,7 +1425,7 @@ function App() {
     } finally {
       if (isCurrent()) setTaskLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, isCurrentWorkspaceScope, readWorkspaceScope]);
 
   // Load the authenticated workspace's tasks immediately after session
   // verification, on page reload, and whenever the selected workspace changes.
@@ -1348,11 +1437,20 @@ function App() {
     loadTasks();
   }, [authChecking, auth?.token, projectId, loadTasks]);
 
-  const loadTaskDetail = useCallback(async (taskId) => {
+  // `explicitProjectId` is used by proposal decisions that target a project
+  // other than the one currently selected. Those requests still require the
+  // same authenticated session, but must not be discarded just because the
+  // selected workspace changed.
+  const loadTaskDetail = useCallback(async (taskId, { explicitProjectId = null } = {}) => {
     const requestId = ++taskDetailRequestRef.current;
-    const scope = responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
+    const targetProjectId = String(explicitProjectId ?? projectIdRef.current ?? '');
+    const scope = responseScopeKey(authRef.current?.user?.id ?? null, targetProjectId);
+    const requestWorkspaceScope = readWorkspaceScope(targetProjectId);
     const isCurrent = () => requestId === taskDetailRequestRef.current
-      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
+      && (explicitProjectId
+        ? isCurrentWorkspaceSession(requestWorkspaceScope)
+        : responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope
+          && isCurrentWorkspaceScope(requestWorkspaceScope, targetProjectId));
     try {
       const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}`);
       const result = await response.json();
@@ -1369,13 +1467,15 @@ function App() {
     } catch (error) {
       if (isCurrent()) setTaskDetailError(error.message);
     }
-  }, [apiFetch]);
+  }, [apiFetch, isCurrentWorkspaceScope, isCurrentWorkspaceSession, readWorkspaceScope]);
 
   const loadWorkspaceFiles = async (id = projectId) => {
     const requestId = ++workspaceRequestRef.current;
     const scope = responseScopeKey(authRef.current?.user?.id ?? null, id);
+    const requestWorkspaceScope = readWorkspaceScope(id);
     const isCurrent = () => requestId === workspaceRequestRef.current
-      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope
+      && isCurrentWorkspaceScope(requestWorkspaceScope, id);
     if (!id) {
       setWorkspaceFiles([]);
       setSelectedFile(null);
@@ -1427,8 +1527,10 @@ function App() {
     const requestId = ++workspaceFileRequestRef.current;
     const openedProject = projectId;
     const scope = responseScopeKey(authRef.current?.user?.id ?? null, openedProject);
+    const requestWorkspaceScope = readWorkspaceScope(openedProject);
     const isCurrent = () => requestId === workspaceFileRequestRef.current
-      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope
+      && isCurrentWorkspaceScope(requestWorkspaceScope, openedProject);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(openedProject)}/file?path=${encodeURIComponent(filePath)}`);
       const result = await response.json();
@@ -1447,8 +1549,10 @@ function App() {
     const requestId = ++searchRequestRef.current;
     const searchedProject = projectId;
     const scope = responseScopeKey(authRef.current?.user?.id ?? null, searchedProject);
+    const requestWorkspaceScope = readWorkspaceScope(searchedProject);
     const isCurrent = () => requestId === searchRequestRef.current
-      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope;
+      && responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current) === scope
+      && isCurrentWorkspaceScope(requestWorkspaceScope, searchedProject);
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(searchedProject)}/search?q=${encodeURIComponent(fileSearch.trim())}`);
       const result = await response.json();
@@ -1527,47 +1631,62 @@ function App() {
   };
 
   const applyFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
-    const requestScope = responseScopeKey(authRef.current?.user?.id ?? null, projectIdRef.current);
+    const requestProjectId = String(id ?? projectIdRef.current);
+    if (!requestProjectId) return;
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
+    // The editor belongs to the selected workspace. The action can still be
+    // finalized for its target project while the user views another project.
+    const isCurrentView = () => isCurrentWorkspaceScope(requestScope);
     const originalFile = selectedFileRef.current;
-    const isCurrentScope = () => responseScopeKey(
-      authRef.current?.user?.id ?? null,
-      projectIdRef.current,
-    ) === requestScope;
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(requestProjectId)}/proposals/${encodeURIComponent(proposalId)}/apply`, {
         method: 'POST',
       });
       const result = await response.json();
+      if (!isCurrentSession()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not apply the proposed file.');
       markProposal(sessionId, messageIndex, activityIndex, 'applied');
+      if (!isCurrentSession()) return;
       setToast({ message: `Applied changes to ${result.file.path}.` });
-      await loadWorkspaceFiles(String(id));
-      if (!isCurrentScope()) return;
-      const fileResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(result.file.path)}`);
+      // The loader keeps its own project guard, so a different selected
+      // workspace never inherits this proposal's files.
+      await loadWorkspaceFiles(requestProjectId);
+      if (!isCurrentSession()) return;
+      const fileResponse = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(requestProjectId)}/file?path=${encodeURIComponent(result.file.path)}`);
       const fileResult = await fileResponse.json();
+      if (!isCurrentSession()) return;
       if (!fileResponse.ok || !fileResult.ok) throw new Error(fileResult.error || 'Created file but could not open it.');
-      if (!isCurrentScope()) return;
-      // Do not yank the editor away if the user selected another file while
-      // the proposal was being applied. Refresh only the file still in view.
-      if (selectedFileRef.current === originalFile) {
+      if (!isCurrentSession()) return;
+      // Only swap the editor when the target project is still the active view
+      // and the user has not selected another file while this ran.
+      if (isCurrentView() && selectedFileRef.current === originalFile) {
         setSelectedFile(fileResult.path);
         setFileContent(fileResult.content);
       }
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
     }
   };
 
   const discardFileProposal = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    const requestProjectId = String(id ?? projectIdRef.current);
+    if (!requestProjectId) return;
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(requestProjectId)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
         method: 'POST',
       });
       const result = await response.json();
+      if (!isCurrentSession()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not discard the proposed file.');
       markProposal(sessionId, messageIndex, activityIndex, 'discarded');
+      if (!isCurrentSession()) return;
       setToast({ message: 'Proposal discarded. Nothing was written.' });
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
     }
   };
@@ -1591,25 +1710,37 @@ function App() {
   };
 
   const rejectWorkspaceCommand = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    const requestProjectId = String(id ?? projectIdRef.current);
+    if (!requestProjectId) return;
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(requestProjectId)}/proposals/${encodeURIComponent(proposalId)}/reject`, {
         method: 'POST',
       });
       const result = await response.json();
+      if (!isCurrentSession()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not reject the command.');
       markCommandState(sessionId, messageIndex, activityIndex, 'rejected');
+      if (!isCurrentSession()) return;
       setToast({ message: 'Command rejected. Nothing was run.' });
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
     }
   };
 
   const runApprovedWorkspaceCommand = async (sessionId, messageIndex, activityIndex, id, proposalId) => {
+    const requestProjectId = String(id ?? projectIdRef.current);
+    if (!requestProjectId) return;
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(id)}/commands/${encodeURIComponent(proposalId)}/run`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(requestProjectId)}/commands/${encodeURIComponent(proposalId)}/run`, {
         method: 'POST',
       });
       const result = await response.json();
+      if (!isCurrentSession()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not run the approved command.');
       updateSession(sessionId, (session) => ({
         ...session,
@@ -1626,7 +1757,9 @@ function App() {
             : message
         )),
       }));
+      if (!isCurrentSession()) return;
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
     }
   };
@@ -1715,48 +1848,76 @@ function App() {
       setToast({ message: 'Tasks must be 20,000 characters or fewer.' });
       return;
     }
+    const requestProjectId = String(visibleProject.id);
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const requestId = ++taskSubmitRequestRef.current;
+    // The selected project, not the request's own target, decides whether the
+    // response still belongs on screen. This keeps a stale task from clearing
+    // the draft the user typed after switching projects.
+    const isCurrent = () => isCurrentWorkspaceScope(requestScope);
+    const isCurrentRequest = () => isCurrentRequestLifecycle(taskSubmitRequestRef.current, requestId);
+    const requestProjectName = visibleProject.name;
     setTaskSubmitting(true);
     try {
       const response = await apiFetch(`${API_BASE}/api/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId: Number(visibleProject.id), instruction: prompt }),
+        body: JSON.stringify({ projectId: Number(requestProjectId), instruction: prompt }),
       });
       const result = await response.json();
+      // A delayed response from a previous account or project must not clear a
+      // newer draft, add a task, focus it, or show a toast in the new view.
+      if (!isCurrent()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not create task.');
       setTaskInput('');
-      setTaskSubmitting(false);
       setTasks((current) => [result.task, ...current]);
+      // Preserve the original immediate cleanup: the submit button unlocks
+      // before the task detail request starts.
+      setTaskSubmitting(false);
       // loadTaskDetail already sets the detail; do not overwrite it with an
       // empty shell after the real response arrives.
       await loadTaskDetail(result.task.id);
+      if (!isCurrent()) return;
       setFocusTaskId(result.task.id);
       setWorkspaceTab('tasks');
       setWorkspaceOpen(true);
-      setToast({ message: `Task created in ${visibleProject.name}.` });
+      setToast({ message: `Task created in ${requestProjectName}.` });
     } catch (error) {
-      setTaskSubmitting(false);
+      if (!isCurrent()) return;
       setToast({ message: error.message });
+    } finally {
+      // Lifecycle cleanup is independent from response application. A stale
+      // project switch still unlocks this submit, but cannot clear a newer one.
+      if (isCurrentRequest()) setTaskSubmitting(false);
     }
-  }, [projectsLoading, workspaceSelection.ready, workspaceSelection.message, visibleProject,
-    taskInput, loadTasks, loadTaskDetail]);
+  }, [isCurrentRequestLifecycle, isCurrentWorkspaceScope, projectsLoading,
+    readWorkspaceScope, workspaceSelection.ready, workspaceSelection.message,
+    visibleProject, taskInput, loadTaskDetail]);
 
   const cancelTask = useCallback(async (taskId) => {
+    const requestProjectId = projectIdRef.current;
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrent = () => isCurrentWorkspaceScope(requestScope, requestProjectId);
     try {
       const response = await apiFetch(`${API_BASE}/api/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: 'POST' });
       const result = await response.json();
+      if (!isCurrent()) return;
       if (!response.ok || !result.ok) throw new Error(result.error || 'Could not cancel task.');
       await loadTasks();
+      if (!isCurrent()) return;
       setTaskDetail(null);
       setToast({ message: 'Task cancelled.' });
     } catch (error) {
+      if (!isCurrent()) return;
       setToast({ message: error.message });
     }
-  }, [loadTasks]);
+  }, [isCurrentWorkspaceScope, loadTasks, readWorkspaceScope]);
 
   const postTaskProposalDecision = useCallback(async (task, proposal, decision) => {
     const ownedProjectId = String(task?.project_id ?? projectId ?? '');
     if (!ownedProjectId || !proposal?.proposalId) throw new Error('Proposal information is unavailable.');
+    const requestScope = readWorkspaceScope(ownedProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
 
     const encodedProject = encodeURIComponent(ownedProjectId);
     const encodedProposal = encodeURIComponent(proposal.proposalId);
@@ -1771,55 +1932,85 @@ function App() {
 
     const response = await apiFetch(`${API_BASE}${endpoint}`, { method: 'POST' });
     const result = await response.json();
+    if (!isCurrentSession()) return null;
     if (!response.ok || !result.ok) {
       const error = new Error(result.error || `Could not ${decision} the proposal.`);
       error.status = response.status;
       throw error;
     }
     return result;
-  }, [apiFetch, projectId]);
+  }, [apiFetch, isCurrentWorkspaceSession, projectId, readWorkspaceScope]);
 
   const refreshAfterProposalDecision = useCallback(async (task) => {
-    await Promise.all([loadTaskDetail(task.id), loadTasks()]);
-    const workspaceId = String(task.project_id ?? projectId ?? '');
+    const workspaceId = String(task?.project_id ?? projectIdRef.current ?? '');
+    const requestScope = readWorkspaceScope(workspaceId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
+    const isCurrentView = () => isCurrentWorkspaceScope(requestScope);
+    // Task detail is tied to the task that was acted on, not to the selected
+    // tab. The loader guards it by the authenticated session.
+    await loadTaskDetail(task.id, { explicitProjectId: workspaceId });
+    if (!isCurrentSession() || !isCurrentView()) return;
+    await loadTasks();
     if (workspaceId) await loadWorkspaceFiles(workspaceId);
-  }, [loadTaskDetail, loadTasks, projectId]);
+  }, [isCurrentWorkspaceScope, isCurrentWorkspaceSession, loadTaskDetail,
+    loadTasks, readWorkspaceScope]);
 
   const applyTaskProposal = useCallback(async (task, proposal) => {
+    const requestProjectId = String(task?.project_id ?? projectIdRef.current ?? '');
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
       const result = await postTaskProposalDecision(task, proposal, 'apply');
+      if (!result || !isCurrentSession()) return;
       setToast({ message: `Applied changes to ${result.file?.path || proposal.path || 'the proposed file'}.` });
+      if (!isCurrentSession()) return;
       await refreshAfterProposalDecision(task);
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
       throw error;
     }
-  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+  }, [isCurrentWorkspaceSession, postTaskProposalDecision, readWorkspaceScope,
+    refreshAfterProposalDecision]);
 
   const rejectTaskProposal = useCallback(async (task, proposal) => {
+    const requestProjectId = String(task?.project_id ?? projectIdRef.current ?? '');
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
-      await postTaskProposalDecision(task, proposal, 'reject');
+      const result = await postTaskProposalDecision(task, proposal, 'reject');
+      if (!result || !isCurrentSession()) return;
       setToast({ message: 'Proposal rejected. Nothing was applied or run.' });
+      if (!isCurrentSession()) return;
       await refreshAfterProposalDecision(task);
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
       throw error;
     }
-  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+  }, [isCurrentWorkspaceSession, postTaskProposalDecision, readWorkspaceScope,
+    refreshAfterProposalDecision]);
 
   const runTaskProposal = useCallback(async (task, proposal) => {
+    const requestProjectId = String(task?.project_id ?? projectIdRef.current ?? '');
+    const requestScope = readWorkspaceScope(requestProjectId);
+    const isCurrentSession = () => isCurrentWorkspaceSession(requestScope);
     try {
       const result = await postTaskProposalDecision(task, proposal, 'run');
+      if (!result || !isCurrentSession()) return;
       const exitCode = result.result?.exitCode;
       setToast({
         message: `Command completed${Number.isFinite(exitCode) ? ` with exit code ${exitCode}` : ''}.`,
       });
+      if (!isCurrentSession()) return;
       await refreshAfterProposalDecision(task);
     } catch (error) {
+      if (!isCurrentSession()) return;
       setToast({ message: error.message });
       throw error;
     }
-  }, [postTaskProposalDecision, refreshAfterProposalDecision]);
+  }, [isCurrentWorkspaceSession, postTaskProposalDecision, readWorkspaceScope,
+    refreshAfterProposalDecision]);
 
   const quickActions = useMemo(() => quickActionsFor({
     hasProject: workspaceSelection.ready,

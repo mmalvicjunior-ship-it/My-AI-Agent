@@ -64,6 +64,101 @@ function pythonEnvironment() {
   return env;
 }
 
+function isWindowsAppsAlias(filePath) {
+  return /[\\/]Microsoft\.WindowsApps[\\/]/i.test(filePath);
+}
+
+function isNonEmptyFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+// spawnSync starts the resolved path directly (no shell), so only a real
+// executable can be launched. Script launchers such as .cmd/.bat are unusable
+// here even when PATH lists them before python.exe.
+function isExecutableFile(filePath) {
+  return /\.exe$/i.test(filePath) && isNonEmptyFile(filePath);
+}
+
+function hasInstallManagerTarget(candidate) {
+  try {
+    return fs.statSync(`${candidate}.__target__`).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function resolveInstallManagerTarget(candidate) {
+  const targetFile = `${candidate}.__target__`;
+  try {
+    const target = fs.readFileSync(targetFile, 'utf8').trim();
+    return target && path.isAbsolute(target) && isExecutableFile(target) ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWindowsCandidate(candidate) {
+  const resolved = path.resolve(candidate);
+  // Python's Windows install-manager launchers carry a sibling __target__ file.
+  // Resolve that real interpreter instead of spawning the launcher, which can
+  // otherwise start an install flow when USERPROFILE/HOME are not inherited.
+  // A launcher with an unusable target is rejected, not treated as a real
+  // interpreter.
+  if (hasInstallManagerTarget(resolved)) return resolveInstallManagerTarget(resolved);
+  if (isWindowsAppsAlias(resolved)) return null;
+  return isExecutableFile(resolved) ? resolved : null;
+}
+
+function defaultWhereRunner(executable) {
+  return spawnSync('where.exe', [executable], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    windowsHide: true,
+    env: pythonEnvironment(),
+  });
+}
+
+/**
+ * Resolves a configured Python command to a real executable before spawning.
+ * On Windows this skips app execution aliases and install-manager launchers so
+ * the sanitized child environment cannot trigger an installation prompt.
+ * The optional whereRunner is injectable for deterministic tests.
+ */
+export function resolvePythonExecutable(pythonBin = config.pythonBin, { whereRunner = defaultWhereRunner } = {}) {
+  const executable = typeof pythonBin === 'string' ? pythonBin.trim() : '';
+  if (!executable) return executable;
+  if (process.platform !== 'win32') return executable;
+
+  const explicitPath = path.isAbsolute(executable) || executable.includes('/') || executable.includes('\\');
+  if (explicitPath) {
+    const resolved = resolveWindowsCandidate(executable);
+    if (resolved) return resolved;
+    throw new WorkspaceError(502,
+      'PYTHON_BIN does not resolve to a usable Python 3.12+ executable. On Windows, set it to a real python.exe rather than an app alias or install-manager launcher.');
+  }
+
+  const lookup = whereRunner(executable);
+  if (lookup.error || lookup.status !== 0) {
+    throw new WorkspaceError(502,
+      `PYTHON_BIN could not be resolved to a Python 3.12+ executable: ${executable}. Set PYTHON_BIN to the absolute path of python.exe.`);
+  }
+  const candidates = String(lookup.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    const resolved = resolveWindowsCandidate(candidate);
+    if (resolved) return resolved;
+  }
+  throw new WorkspaceError(502,
+    'PYTHON_BIN resolved only to Windows launchers that cannot run with the sanitized subprocess environment. Set PYTHON_BIN to a real Python 3.12+ executable.');
+}
+
 function postExecutionError(status, message) {
   const error = new WorkspaceError(status, message);
   // The proposal runner uses this to distinguish "nothing started, safe to
@@ -98,10 +193,11 @@ function killProcessTree(pid) {
  * with an actionable message instead of an opaque spawn error.
  */
 export function assertPythonInterpreter(pythonBin = config.pythonBin) {
-  const executable = typeof pythonBin === 'string' ? pythonBin.trim() : '';
-  if (!executable) {
+  const configured = typeof pythonBin === 'string' ? pythonBin.trim() : '';
+  if (!configured) {
     throw new WorkspaceError(502, 'PYTHON_BIN is empty. Configure a Python 3.12+ executable before running Python commands.');
   }
+  const executable = resolvePythonExecutable(configured);
   const result = spawnSync(executable, ['--version'], {
     encoding: 'utf8',
     timeout: 5_000,
@@ -255,10 +351,11 @@ export function runPythonCheck(
   { pythonBin = config.pythonBin, ...options } = {},
 ) {
   const file = inspectPythonFile(rootDir, relativePath);
-  assertPythonInterpreter(pythonBin);
+  const executable = resolvePythonExecutable(pythonBin);
+  assertPythonInterpreter(executable);
   const limits = runOptions(options);
   return runPythonProcess({
-    executable: pythonBin,
+    executable,
     // -I keeps project directories off sys.path; -c executes only the constant
     // AST script above, never the contents of the target file.
     args: ['-I', '-c', PYTHON_AST_CHECK, file.absolute],
@@ -287,10 +384,11 @@ export function runPythonFile(
     expectedPath: relativePath,
     expectedDigest,
   });
-  assertPythonInterpreter(pythonBin);
+  const executable = resolvePythonExecutable(pythonBin);
+  assertPythonInterpreter(executable);
   const limits = runOptions(options);
   return runPythonProcess({
-    executable: pythonBin,
+    executable,
     // -I ignores PYTHON* environment variables and excludes the script folder
     // from sys.path. This reduces startup surprises; it is not a sandbox.
     args: ['-I', file.absolute],

@@ -14,6 +14,8 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
+import { hashToken } from '../src/auth/index.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const CLIENT_ID = 'test-client-id';
 const CLIENT_SECRET = 'test-client-secret';
@@ -118,8 +120,13 @@ async function request(method, base, pathname, { token, body } = {}) {
   return { status: res.status, data };
 }
 
-function startGoogle(base, body = {}) {
-  return request('POST', base, '/api/auth/google/start', { body });
+async function startGoogle(base, body = {}) {
+  // Mirrors the browser: a fresh deployment first exchanges the owner secret
+  // for a one-time authorization, then carries that value into OAuth start.
+  // Returning users start the ordinary flow with no setup value at all.
+  const setupToken = await authorizeFirstAccount(base);
+  const requestBody = setupToken ? { ...body, setupToken } : body;
+  return request('POST', base, '/api/auth/google/start', { body: requestBody });
 }
 
 async function callback(base, { code = 'test-code', state, error } = {}) {
@@ -173,7 +180,7 @@ test('google/start returns 503 when Google is not configured', async () => {
   });
 }, { timeout: 30_000 });
 
-test('google/start redirects directly to Google on a fresh database without any token', async () => {
+test('google/start redirects to Google only after valid first-account setup', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     try {
@@ -194,7 +201,7 @@ test('google/start redirects directly to Google on a fresh database without any 
   });
 }, { timeout: 30_000 });
 
-test('the first Google sign-in creates an ordinary account without any token', async () => {
+test('the first Google sign-in with setup authorization creates an ordinary account', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     const restoreFetch = globalThis.fetch;
@@ -229,40 +236,41 @@ test('the first Google sign-in creates an ordinary account without any token', a
   });
 }, { timeout: 30_000 });
 
-test('two simultaneous first Google sign-ins create two ordinary accounts', async () => {
+test('a second setup exchange replaces the first OAuth state instead of creating another first account', async () => {
   await withTempDb(async () => {
     const restore = setGoogleConfig();
     const originalFetch = globalThis.fetch;
-    mockGoogle({ tokeninfoBody: claimsFor('google-sub-first-user', 'first-user@example.com') });
+    mockGoogle({ tokeninfoBody: claimsFor('google-sub-second-user', 'second-user@example.com') });
     try {
       await withApp(async ({ base, db }) => {
-        // Both flows start while the database is empty and send no token.
-        const start1 = await startGoogle(base, {});
-        const start2 = await startGoogle(base, {});
+        // A second owner exchange invalidates the first state; only one setup-
+        // authorized OAuth state may be active at a time.
+        const setupToken1 = await authorizeFirstAccount(base);
+        const start1 = await request('POST', base, '/api/auth/google/start', {
+          body: { setupToken: setupToken1 },
+        });
+        const setupToken2 = await authorizeFirstAccount(base);
+        const start2 = await request('POST', base, '/api/auth/google/start', {
+          body: { setupToken: setupToken2 },
+        });
         assert.equal(start1.status, 200);
         assert.equal(start2.status, 200);
         const state1 = stateFrom(start1);
         const state2 = stateFrom(start2);
+        assert.notEqual(state1, state2);
+        const active = db.prepare('SELECT state_hash FROM oauth_states WHERE setup_authorized = 1').all();
+        assert.equal(active.length, 1);
+        assert.equal(active[0].state_hash, hashToken(state2));
 
-        const cb1 = await callback(base, { code: 'code-one', state: state1 });
-        assert.ok(authFragment(cb1).get('auth_token'));
-
-        const previousFetch = globalThis.fetch;
-        globalThis.fetch = async (url, options) => {
-          if (String(url).startsWith('https://oauth2.googleapis.com/tokeninfo?')) {
-            return new Response(JSON.stringify(claimsFor('google-sub-second-user', 'second-user@example.com')), {
-              status: 200, headers: { 'content-type': 'application/json' },
-            });
-          }
-          return previousFetch(url, options);
-        };
+        const stale = await callback(base, { code: 'code-one', state: state1 });
+        assert.equal(errorLocation(stale).get('auth_error'), 'google_state');
+        assert.equal(Number(db.prepare('SELECT COUNT(*) AS c FROM users').get().c), 0);
 
         const cb2 = await callback(base, { code: 'code-two', state: state2 });
         assert.ok(authFragment(cb2).get('auth_token'));
 
         const rows = db.prepare('SELECT email, is_admin FROM users ORDER BY id').all();
         assert.deepEqual(rows.map((row) => ({ email: row.email, is_admin: row.is_admin })), [
-          { email: 'first-user@example.com', is_admin: 0 },
           { email: 'second-user@example.com', is_admin: 0 },
         ]);
         assert.equal(Number(db.prepare('SELECT COUNT(*) AS c FROM users WHERE is_admin = 1').get().c), 0);

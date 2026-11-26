@@ -11,10 +11,12 @@ import {
   bumpAuthEpoch,
   chooseAuthTokenForInitialization,
   createAuthCallbackRunner,
+  fragmentHashWithoutSetup,
   googleErrorMessage,
   parseAuthFragment,
   readAuthEpoch,
   shouldClearAuthHash,
+  shouldClearSetupHash,
   shouldClearWorkspaceForAuthChange,
   shouldSignOutFor401,
 } from '../../apps/web/src/authFlow.js';
@@ -109,8 +111,47 @@ test('a callback token wins over a stale stored session; refresh keeps the store
   }), 'stored-token');
   assert.equal(chooseAuthTokenForInitialization({}), null);
   assert.deepEqual(parseAuthFragment(''), {
-    present: false, token: null, error: null, expiresAt: null,
+    present: false, token: null, error: null, expiresAt: null, setup: null,
   });
+});
+
+test('a setup fragment is read once and stripped without touching auth callbacks', () => {
+  const fragment = parseAuthFragment('#setup=owner-credential');
+  assert.deepEqual(fragment, {
+    present: false,
+    token: null,
+    error: null,
+    expiresAt: null,
+    setup: 'owner-credential',
+  });
+  assert.equal(shouldClearSetupHash({ setup: fragment.setup, callbackPresent: fragment.present }), true);
+  assert.equal(shouldClearSetupHash({ setup: null, callbackPresent: false }), false);
+  assert.equal(shouldClearSetupHash({
+    setup: 'owner-credential',
+    callbackPresent: true,
+  }), true, 'the setup credential is stripped even when a callback is present');
+
+  assert.equal(fragmentHashWithoutSetup('#setup=owner-credential'), '');
+  assert.equal(
+    fragmentHashWithoutSetup('#setup=owner-credential&auth_token=fresh-token&auth_expires=2030-01-01'),
+    '#auth_token=fresh-token&auth_expires=2030-01-01',
+  );
+  assert.equal(fragmentHashWithoutSetup('#auth_token=fresh-token'), null);
+});
+
+test('setup, cancellation, account, and server failures have friendly messages', () => {
+  for (const code of ['google_setup_required', 'google_setup_invalid']) {
+    const message = googleErrorMessage(code);
+    assert.match(message, /setup link/i);
+    assert.doesNotMatch(message, /undefined|null|token=/i);
+  }
+  assert.match(googleErrorMessage('google_cancelled'), /cancelled/i);
+  assert.match(googleErrorMessage('google_account_exists'), /already exists/i);
+  assert.match(googleErrorMessage('google_unverified_email'), /verified email/i);
+  for (const code of ['google_not_configured', 'google_unavailable', 'google_identity_invalid', 'unexpected']) {
+    assert.match(googleErrorMessage(code), /try again/i);
+    assert.doesNotMatch(googleErrorMessage(code), /undefined|null|GOOGLE_/i);
+  }
 });
 
 test('an OAuth error fragment is shown and consumed without verifying a token', async () => {

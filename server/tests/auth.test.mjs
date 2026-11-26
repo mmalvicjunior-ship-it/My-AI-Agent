@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { createApp } from '../src/index.js';
 import { mockProvider } from '../src/ai/mock.js';
 import { hashPassword, verifyPassword } from '../src/auth/index.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 let server;
 let db;
@@ -32,8 +33,9 @@ async function request(method, path, { token, body } = {}) {
   return { status: res.status, data };
 }
 
-function register(email, password = 'correct-horse-battery') {
-  return request('POST', '/api/auth/register', { body: { email, password } });
+async function register(email, password = 'correct-horse-battery') {
+  const setupToken = await authorizeFirstAccount(base);
+  return request('POST', '/api/auth/register', { body: { email, password, setupToken } });
 }
 
 function login(email, password = 'correct-horse-battery') {

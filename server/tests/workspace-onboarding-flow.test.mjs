@@ -10,6 +10,7 @@ import path from 'node:path';
 
 import { createApp } from '../src/index.js';
 import { mockProvider } from '../src/ai/mock.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 import {
   shouldStartWorkspaceScan,
   upsertProject,
@@ -35,8 +36,9 @@ async function request(method, route, { token, body } = {}) {
 }
 
 async function register(email) {
+  const setupToken = await authorizeFirstAccount(base);
   const result = await request('POST', '/api/auth/register', {
-    body: { email, password: 'long-enough-password' },
+    body: { email, password: 'long-enough-password', setupToken },
   });
   assert.equal(result.status, 201);
   return result.data;

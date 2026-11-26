@@ -18,6 +18,7 @@ import {
   renewExistingSession,
   shouldApplyRenewalResult,
 } from '../../apps/web/src/authFlow.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 let server;
 let db;
@@ -29,6 +30,11 @@ async function request(method, path, { token, body } = {}) {
   if (token) headers.authorization = `Bearer ${token}`;
   const response = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   return { status: response.status, data: await response.json().catch(() => null) };
+}
+
+async function register(email, password = 'long-enough-password') {
+  const setupToken = await authorizeFirstAccount(base);
+  return request('POST', '/api/auth/register', { body: { email, password, setupToken } });
 }
 
 function deferred() {
@@ -64,7 +70,7 @@ beforeEach(() => {
 
 test('an active session renews its sliding expiry but never exceeds its absolute cap', async () => {
   const email = `renewal-${Date.now()}@example.com`;
-  const registered = await request('POST', '/api/auth/register', { body: { email, password: 'long-enough-password' } });
+  const registered = await register(email);
   assert.equal(registered.status, 201);
   const token = registered.data.token;
   const original = db.prepare('SELECT token_hash, expires_at, absolute_expires_at FROM sessions WHERE token_hash = ?').get(hashToken(token));
@@ -91,7 +97,7 @@ test('an active session renews its sliding expiry but never exceeds its absolute
 
 test('the absolute expiry still ends a continuously used session', async () => {
   const email = `absolute-${Date.now()}@example.com`;
-  const registered = await request('POST', '/api/auth/register', { body: { email, password: 'long-enough-password' } });
+  const registered = await register(email);
   const token = registered.data.token;
   const row = db.prepare('SELECT token_hash FROM sessions WHERE token_hash = ?').get(hashToken(token));
   const absolute = new Date(Date.now() + 1000).toISOString();
@@ -111,7 +117,7 @@ test('the absolute expiry still ends a continuously used session', async () => {
 
 test('expired or malformed bearer credentials are rejected and deleted', async () => {
   const email = `expired-${Date.now()}@example.com`;
-  const registered = await request('POST', '/api/auth/register', { body: { email, password: 'long-enough-password' } });
+  const registered = await register(email);
   const token = registered.data.token;
   const row = db.prepare('SELECT token_hash FROM sessions WHERE token_hash = ?').get(hashToken(token));
   db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?')

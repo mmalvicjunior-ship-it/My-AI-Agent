@@ -7,8 +7,8 @@
 //   2. A client cannot self-promote with isAdmin/is_admin/admin fields.
 //   3. Provisioning promotes an existing account and existing sessions see it.
 //   4. The database still permits only one administrator.
-//   5. On a fresh database, ordinary registration needs no token while
-//      administrator provisioning remains token-gated.
+//   5. On a fresh database, ordinary registration requires a one-time setup
+//      authorization while administrator provisioning remains owner-token-gated.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -19,6 +19,7 @@ import { once } from 'node:events';
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
 import { createUserWithRole } from '../src/routes/auth.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const servers = [];
 let base;
@@ -41,6 +42,11 @@ async function request(method, pathname, { token, body } = {}) {
   return { status: res.status, data };
 }
 
+async function register(body) {
+  const setupToken = await authorizeFirstAccount(base);
+  return request('POST', '/api/auth/register', { body: { ...body, setupToken } });
+}
+
 before(async () => {
   const created = createApp({ provider: null });
   db = created.db;
@@ -57,9 +63,9 @@ after(() => {
   }
 });
 
-test('the first public account registers without a token and is not an admin', async () => {
-  const res = await request('POST', '/api/auth/register', {
-    body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+test('the first public account registers with setup authorization and is not an admin', async () => {
+  const res = await register({
+    email: 'admin@example.com', password: 'correct-horse-battery',
   });
   assert.equal(res.status, 201);
   assert.equal(res.data.ok, true);
@@ -69,8 +75,8 @@ test('the first public account registers without a token and is not an admin', a
 });
 
 test('later public accounts are never administrators', async () => {
-  const res = await request('POST', '/api/auth/register', {
-    body: { email: 'user@example.com', password: 'correct-horse-battery' },
+  const res = await register({
+    email: 'user@example.com', password: 'correct-horse-battery',
   });
   assert.equal(res.status, 201);
   assert.equal(res.data.ok, true);
@@ -78,8 +84,8 @@ test('later public accounts are never administrators', async () => {
 });
 
 test('client-supplied role fields are ignored on registration', async () => {
-  const res = await request('POST', '/api/auth/register', {
-    body: { email: 'evil@example.com', password: 'correct-horse-battery', isAdmin: true, is_admin: true, admin: true },
+  const res = await register({
+    email: 'evil@example.com', password: 'correct-horse-battery', isAdmin: true, is_admin: true, admin: true,
   });
   assert.equal(res.status, 201);
   assert.equal(res.data.ok, true);
@@ -149,7 +155,7 @@ test('only one administrator can exist and a lost provisioning race is downgrade
   assert.equal(db.prepare('SELECT COUNT(*) AS c FROM users WHERE is_admin = 1').get().c, 1);
 });
 
-test('a fresh database allows ordinary registration but keeps provisioning token-gated', async () => {
+test('a fresh database requires setup authorization for ordinary registration', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-authrole-'));
   const tempDbPath = path.join(tempDir, 'fresh.db');
   const originalDbPath = config.databasePath;
@@ -163,13 +169,23 @@ test('a fresh database allows ordinary registration but keeps provisioning token
     await once(freshServer, 'listening');
     const freshBase = `http://127.0.0.1:${freshServer.address().port}`;
 
-    const first = await fetch(`${freshBase}/api/auth/register`, {
+    const denied = await fetch(`${freshBase}/api/auth/register`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: 'first@example.com', password: 'correct-horse-battery' }),
     });
+    assert.equal(denied.status, 403, 'the first account needs a setup authorization');
+
+    const setupToken = await authorizeFirstAccount(freshBase);
+    const first = await fetch(`${freshBase}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        email: 'first@example.com', password: 'correct-horse-battery', setupToken,
+      }),
+    });
     const firstData = await first.json();
-    assert.equal(first.status, 201, 'ordinary registration needs no bootstrap token');
+    assert.equal(first.status, 201, 'valid setup authorization permits the first account');
     assert.equal(firstData.user.isAdmin, false);
 
     for (const bootstrapToken of [undefined, 'not-the-token']) {

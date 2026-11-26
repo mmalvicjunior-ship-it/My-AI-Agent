@@ -161,14 +161,14 @@ export const config = {
   pythonRunTimeoutMs: positiveIntFromEnv('PYTHON_RUN_TIMEOUT_MS', 30_000, { min: 100, max: 600_000 }),
   pythonRunMaxOutputBytes: positiveIntFromEnv('PYTHON_RUN_MAX_OUTPUT_BYTES', 16_000, { min: 1, max: 1_048_576 }),
 
-  // Authentication defaults. Registration stays enabled so ordinary users can
-  // sign up normally, including on a fresh deployment. BOOTSTRAP_TOKEN is used
-  // only by the owner-only /api/auth/admin/provision endpoint, never by public
-  // registration or Google sign-in. Set ALLOW_REGISTRATION=false once the
-  // administrator account exists to close public registration.
+  // Authentication defaults. ALLOW_REGISTRATION controls ordinary signup after
+  // the first account exists. The first account requires a separate, one-time
+  // setup credential; BOOTSTRAP_TOKEN is reserved exclusively for owner-only
+  // administrator provisioning. Neither secret is sent to Google or logged.
   authSessionDays: sessionDaysFromEnv(),
   allowRegistration: process.env.ALLOW_REGISTRATION !== 'false',
   bootstrapToken: (process.env.BOOTSTRAP_TOKEN || '').trim(),
+  firstAccountSetupToken: (process.env.FIRST_ACCOUNT_SETUP_TOKEN || '').trim(),
   // Optional Google sign-in (authorization-code flow, server-side only).
   // Leave all three Google values empty to disable the "Continue with Google"
   // button. The client secret never leaves this server.
@@ -221,6 +221,7 @@ export function safeSummary() {
     allowRegistration: config.allowRegistration,
     authSessionDays: config.authSessionDays,
     bootstrapToken: mask(config.bootstrapToken),
+    firstAccountSetupToken: mask(config.firstAccountSetupToken),
     googleClientId: mask(config.googleClientId),
     googleClientSecret: mask(config.googleClientSecret),
     googleRedirectUri: config.googleRedirectUri || '(not set)',
@@ -239,6 +240,8 @@ export function redactSecrets(text) {
     config.aiApiKey,
     config.geminiApiKey,
     config.googleClientSecret,
+    config.bootstrapToken,
+    config.firstAccountSetupToken,
     config.databaseUrl,
     config.workspaceS3SecretKey,
   ]) {

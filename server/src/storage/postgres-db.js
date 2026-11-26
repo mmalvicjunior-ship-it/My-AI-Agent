@@ -39,11 +39,48 @@ export const POSTGRES_SCHEMA_SQL = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_users_single_admin ON users (is_admin) WHERE is_admin = 1;
 
   CREATE TABLE IF NOT EXISTS oauth_states (
-    state_hash   TEXT PRIMARY KEY,
-    allow_create INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
-    created_at   TEXT NOT NULL DEFAULT (${NOW}),
-    expires_at   TEXT NOT NULL
+    state_hash       TEXT PRIMARY KEY,
+    allow_create     INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
+    setup_authorized INTEGER NOT NULL DEFAULT 0 CHECK (setup_authorized IN (0, 1)),
+    setup_grant_hash TEXT,
+    created_at       TEXT NOT NULL DEFAULT (${NOW}),
+    expires_at       TEXT NOT NULL
   );
+  ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS setup_authorized
+    INTEGER NOT NULL DEFAULT 0 CHECK (setup_authorized IN (0, 1));
+  ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS setup_grant_hash TEXT;
+  DELETE FROM oauth_states WHERE setup_authorized = 1;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_states_single_setup
+    ON oauth_states (setup_authorized) WHERE setup_authorized = 1;
+
+  -- The owner setup credential is independent of the administrator token. Only
+  -- its SHA-256 hash is stored; expiry starts on first exchange and consumption
+  -- happens only after a successful first account is created.
+  CREATE TABLE IF NOT EXISTS setup_credentials (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    credential_hash TEXT NOT NULL UNIQUE,
+    grant_hash      TEXT,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    consumed_at     TEXT
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_credentials_grant
+    ON setup_credentials (grant_hash) WHERE grant_hash IS NOT NULL;
+
+  -- First-account grants: one short-lived, single-use opaque authorization.
+  -- The raw value never reaches this table; only its SHA-256 hash is stored.
+  -- bound_state_hash permits one active flow while allowing a failed callback
+  -- to retry with the same grant.
+  CREATE TABLE IF NOT EXISTS setup_authorizations (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    token_hash       TEXT NOT NULL UNIQUE,
+    bound_state_hash TEXT,
+    created_at       TEXT NOT NULL DEFAULT (${NOW}),
+    expires_at       TEXT NOT NULL
+  );
+  ALTER TABLE setup_authorizations ADD COLUMN IF NOT EXISTS bound_state_hash TEXT;
+  CREATE INDEX IF NOT EXISTS idx_setup_authorizations_expires
+    ON setup_authorizations (expires_at);
 
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash           TEXT PRIMARY KEY,

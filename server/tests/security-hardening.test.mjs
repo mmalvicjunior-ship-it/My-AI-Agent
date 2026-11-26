@@ -13,6 +13,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config, validateAppOrigin } from '../src/config.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const CLIENT_ID = 'test-client-id';
 const CLIENT_SECRET = 'test-client-secret';
@@ -127,8 +128,9 @@ async function callback(base, { code = 'test-code', state } = {}) {
 const fragmentFrom = (res) => new URLSearchParams(String(res.headers.get('location') || '').split('#')[1] || '');
 
 async function registerAdmin(base) {
+  const setupToken = await authorizeFirstAccount(base);
   const res = await request('POST', base, '/api/auth/register', {
-    body: { email: 'admin@example.com', password: 'correct-horse-battery' },
+    body: { email: 'admin@example.com', password: 'correct-horse-battery', setupToken },
   });
   assert.equal(res.status, 201);
   return res;

@@ -13,10 +13,13 @@ import {
   googleErrorMessage,
   parseAuthFragment,
   readAuthEpoch,
+  readInitialAuthFragment,
   renewExistingSession,
   shouldApplyRenewalResult,
+  shouldClearSetupHash,
   shouldClearWorkspaceForAuthChange,
   shouldSignOutFor401,
+  stripSetupHash,
 } from './authFlow.js';
 import {
   TASK_LIST_LIMIT,
@@ -45,6 +48,9 @@ import {
 
 const API_BASE = (import.meta.env && import.meta.env.VITE_API_BASE_URL) ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '') : '';
 const AUTH_KEY = 'myai.auth.v1';
+// Strip a first-account setup credential before React renders. It is held only
+// in this module/in-memory prop and exchanged once with the backend.
+const INITIAL_AUTH_FRAGMENT = readInitialAuthFragment();
 
 function readStoredAuth() {
   try {
@@ -506,10 +512,13 @@ function App() {
   const [taskDetailError, setTaskDetailError] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [diffPreview, setDiffPreview] = useState(false);
-  const initialAuthFragment = parseAuthFragment(window.location.hash);
-  const [auth, setAuth] = useState(() => readStoredAuth());
+  const initialAuthFragment = INITIAL_AUTH_FRAGMENT;
+  // The setup credential is read from the URL fragment once before render and
+  // held only in this component tree. It is never copied into browser storage.
+  const [setupCredentialFromUrl] = useState(() => initialAuthFragment.setup);
+  const [auth, setAuth] = useState(() => (setupCredentialFromUrl ? null : readStoredAuth()));
   const [authChecking, setAuthChecking] = useState(
-    () => Boolean(readStoredAuth()) || initialAuthFragment.present,
+    () => Boolean(!setupCredentialFromUrl && readStoredAuth()) || initialAuthFragment.present,
   );
   const [authError, setAuthError] = useState(
     () => (initialAuthFragment.error ? googleErrorMessage(initialAuthFragment.error) : null),
@@ -759,6 +768,16 @@ function App() {
       },
     });
   }
+
+  // Defensive repeat in case history was restored after module evaluation.
+  // The credential remains only in React state until it is exchanged once.
+  useEffect(() => {
+    if (!shouldClearSetupHash({
+      setup: setupCredentialFromUrl,
+      callbackPresent: initialAuthFragment.present,
+    })) return;
+    stripSetupHash();
+  }, [setupCredentialFromUrl, initialAuthFragment.present]);
 
   // Google callback verification happens here, before the Login/workspace
   // decision. A callback token always beats a stale token in localStorage.
@@ -2036,6 +2055,7 @@ function App() {
       <AuthScreen
         apiBase={API_BASE}
         initialError={authError}
+        setupCredential={setupCredentialFromUrl}
         onAuthenticated={(token, user, expiresAt) => applyAuth({ token, user, expiresAt })}
       />
     );

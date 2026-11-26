@@ -5,15 +5,22 @@ authentication. When the three `GOOGLE_*` variables are set, a
 "Continue with Google" button appears on the sign-in/registration screen;
 when they are not set, nothing changes and the button is never shown.
 
-Google sign-in is a normal user flow. It needs no bootstrap token, setup URL,
-URL fragment, or developer configuration from the person signing in.
+Google sign-in is a normal user flow for returning users. On a fresh deployment
+the owner must first open the one-time setup link described in
+`docs/FIRST-ACCOUNT-BOOTSTRAP.md`; after that, people signing in need no token,
+setup URL, fragment, or developer configuration.
 
 ## How it works (server-side authorization-code flow)
 
-1. The browser calls `POST /api/auth/google/start` with an empty JSON body. The
-   server creates a random one-time `state`, stores only its SHA-256 hash with a
-   10-minute expiry, and returns Google's consent-screen URL. The frontend
-   navigates there immediately.
+1. The browser calls `POST /api/auth/google/start`. For a returning user the
+   body is empty JSON. On a fresh deployment the body includes the short-lived,
+   server-issued setup grant obtained from the owner setup link; neither the
+   setup credential nor `BOOTSTRAP_TOKEN` is ever sent to Google. The server
+   creates a random one-time `state`, stores only its SHA-256 hash with the
+   grant's remaining expiry, a server-side `setup_authorized` flag, and a hash
+   of the grant it is bound to. Only one setup-authorized state may be active;
+   starting another flow replaces the previous state. The frontend navigates to
+   the returned consent-screen URL immediately.
 2. Google redirects the browser back to the server callback
    `GET /api/auth/google/callback?code=...&state=...`.
 3. The server exchanges the code for tokens (server-to-server, client secret
@@ -41,9 +48,11 @@ URL fragment, or developer configuration from the person signing in.
 - A different Google `sub` claiming an email that is already linked to another
   Google identity is rejected (`google_identity_conflict`).
 - Google-created accounts are **never** administrators, including the first
-  account on a fresh deployment.
-- Google registration respects `ALLOW_REGISTRATION=false`
-  (`google_registration_disabled`); login for existing accounts is unaffected.
+  account created from the owner setup link.
+- A first Google account on a fresh deployment requires a valid, unexpired setup
+  grant bound to the current state (`google_setup_required`); later new
+  accounts respect `ALLOW_REGISTRATION=false`
+  (`google_registration_disabled`). Returning accounts can always sign in.
 - Google-only accounts get an unusable password hash, so password sign-in is
   impossible for them.
 

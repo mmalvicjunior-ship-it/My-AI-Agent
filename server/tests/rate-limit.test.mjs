@@ -13,6 +13,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const servers = [];
 let base;
@@ -32,10 +33,13 @@ async function request(method, pathname, { body, xff } = {}) {
   return { status: res.status, data, retryAfter: res.headers.get('retry-after') };
 }
 
-const reg = (email, xff) => request('POST', '/api/auth/register', {
-  xff,
-  body: { email, password: 'correct-horse-battery' },
-});
+const reg = async (email, xff) => {
+  const setupToken = await authorizeFirstAccount(base);
+  return request('POST', '/api/auth/register', {
+    xff,
+    body: { email, password: 'correct-horse-battery', setupToken },
+  });
+};
 const badLogin = (email, xff) => request('POST', '/api/auth/login', {
   xff,
   body: { email, password: 'definitely-wrong-password' },

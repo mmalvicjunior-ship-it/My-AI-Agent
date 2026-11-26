@@ -122,16 +122,68 @@ export function openDb() {
   // SHA-256 hash of each state is stored, and rows are consumed (deleted)
   // on use. `allow_create` captures the server-side registration setting from
   // when the flow started, so the callback never re-trusts the browser.
-  // The legacy bootstrap_ok column is intentionally omitted: existing rows
-  // with that column keep its harmless default of 0.
+  // `setup_authorized` records that a valid, short-lived first-account grant
+  // was transferred into this state before the browser went to Google.
+  // `setup_grant_hash` ties the state to that grant so the callback can consume
+  // it atomically. The legacy bootstrap_ok column is intentionally omitted:
+  // existing rows with that column keep its harmless default of 0.
   db.exec(`
     CREATE TABLE IF NOT EXISTS oauth_states (
-      state_hash   TEXT PRIMARY KEY,
-      allow_create INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
-      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-      expires_at   TEXT NOT NULL
+      state_hash       TEXT PRIMARY KEY,
+      allow_create     INTEGER NOT NULL DEFAULT 0 CHECK (allow_create IN (0, 1)),
+      setup_authorized INTEGER NOT NULL DEFAULT 0 CHECK (setup_authorized IN (0, 1)),
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at       TEXT NOT NULL
     );
   `);
+  const oauthStateColumns = db.prepare('PRAGMA table_info(oauth_states)').all();
+  if (!oauthStateColumns.some((column) => column.name === 'setup_authorized')) {
+    db.exec('ALTER TABLE oauth_states ADD COLUMN setup_authorized INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!oauthStateColumns.some((column) => column.name === 'setup_grant_hash')) {
+    db.exec('ALTER TABLE oauth_states ADD COLUMN setup_grant_hash TEXT');
+  }
+  // Legacy states cannot outlive a deployment change and would conflict with
+  // the one-active-setup-state guard below. Drop only setup-authorized states;
+  // ordinary sign-in states are left untouched.
+  db.exec('DELETE FROM oauth_states WHERE setup_authorized = 1');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_states_single_setup
+           ON oauth_states (setup_authorized) WHERE setup_authorized = 1`);
+
+  // The owner setup credential is independent of the administrator token. Only
+  // its SHA-256 hash is stored. `expires_at` starts on first exchange and
+  // `consumed_at` is set only after a successful first account is created.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS setup_credentials (
+      id              INTEGER PRIMARY KEY CHECK (id = 1),
+      credential_hash TEXT NOT NULL UNIQUE,
+      grant_hash      TEXT,
+      created_at      TEXT NOT NULL,
+      expires_at      TEXT NOT NULL,
+      consumed_at     TEXT
+    );
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_credentials_grant
+           ON setup_credentials (grant_hash) WHERE grant_hash IS NOT NULL`);
+
+  // First-account setup grants. The raw opaque value is returned to the browser
+  // exactly once; only its SHA-256 hash is stored here. `bound_state_hash`
+  // permits one active flow at a time while still allowing a failed OAuth
+  // callback to retry with the same grant.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS setup_authorizations (
+      id               INTEGER PRIMARY KEY CHECK (id = 1),
+      token_hash       TEXT NOT NULL UNIQUE,
+      bound_state_hash TEXT,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at       TEXT NOT NULL
+    );
+  `);
+  const setupGrantColumns = db.prepare('PRAGMA table_info(setup_authorizations)').all();
+  if (!setupGrantColumns.some((column) => column.name === 'bound_state_hash')) {
+    db.exec('ALTER TABLE setup_authorizations ADD COLUMN bound_state_hash TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_setup_authorizations_expires ON setup_authorizations (expires_at)');
 
   // Bearer sessions. Only the SHA-256 hash of each token is stored, so a leaked
   // database file cannot be replayed as a live session.

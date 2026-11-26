@@ -11,6 +11,7 @@ import { once } from 'node:events';
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
 import { createTask, savePlan } from '../src/tasks/store.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const tempDirs = [];
 let server;
@@ -45,8 +46,9 @@ async function request(method, pathname, { token, body } = {}) {
 }
 
 async function register(email) {
+  const setupToken = await authorizeFirstAccount(base);
   const { status, data } = await request('POST', '/api/auth/register', {
-    body: { email, password: 'correct-horse-battery' },
+    body: { email, password: 'correct-horse-battery', setupToken },
   });
   assert.equal(status, 201, `could not register ${email}: ${JSON.stringify(data)}`);
   return data;
@@ -315,10 +317,15 @@ test('an import root containing the database directory is rejected', async () =>
     const dbDir = path.dirname(config.databasePath);
     try {
       // Register a fresh user on this app so the request is authenticated.
+      const setupToken = await authorizeFirstAccount(broadBase);
       const reg = await fetch(`${broadBase}/api/auth/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email: 'db-ancestor@example.com', password: 'correct-horse-battery' }),
+        body: JSON.stringify({
+          email: 'db-ancestor@example.com',
+          password: 'correct-horse-battery',
+          setupToken,
+        }),
       });
       const regData = await reg.json();
       assert.equal(reg.status, 201);

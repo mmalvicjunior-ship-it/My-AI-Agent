@@ -14,23 +14,73 @@ export const GOOGLE_ERRORS = {
   google_unverified_email: 'Please use a Google account with a verified email address.',
   google_unavailable: 'Google sign-in is unavailable right now. Please try again later.',
   google_identity_invalid: 'Google sign-in could not be completed. Please try again.',
+  google_setup_required: 'This deployment is waiting for its first account. Open the owner-provided setup link and try again.',
+  google_setup_invalid: 'The setup authorization is invalid or has expired. Open the owner-provided setup link again.',
 };
 
 export function googleErrorMessage(code) {
   return GOOGLE_ERRORS[code] || 'Google sign-in could not be completed. Please try again.';
 }
 
-/** Reads the Google callback fragment without consuming it. */
+/**
+ * Reads the fragment without consuming it. `setup` is the owner-supplied
+ * first-account credential: it is returned to the caller in memory only, is
+ * never used as an auth callback, and is stripped from the URL as soon as it
+ * is read. It is not the administrator provisioning token.
+ */
 export function parseAuthFragment(hash) {
   const raw = typeof hash === 'string' ? hash : '';
   if (!raw || raw.length < 2) {
-    return { present: false, token: null, error: null, expiresAt: null };
+    return { present: false, token: null, error: null, expiresAt: null, setup: null };
   }
   const params = new URLSearchParams(raw.startsWith('#') ? raw.slice(1) : raw);
   const token = params.get('auth_token') || null;
   const error = params.get('auth_error') || null;
   const expiresAt = params.get('auth_expires') || null;
-  return { present: Boolean(token || error), token, error, expiresAt };
+  const setup = params.get('setup') || null;
+  return { present: Boolean(token || error), token, error, expiresAt, setup };
+}
+
+/** A setup credential is removed immediately, even alongside a callback. */
+export function shouldClearSetupHash({ setup } = {}) {
+  return Boolean(setup);
+}
+
+/**
+ * Returns the replacement hash with only `setup` removed. `null` means the
+ * current hash has no setup credential and must be left completely untouched.
+ */
+export function fragmentHashWithoutSetup(hash) {
+  const raw = typeof hash === 'string' ? hash : '';
+  if (!raw) return null;
+  const params = new URLSearchParams(raw.startsWith('#') ? raw.slice(1) : raw);
+  if (!params.has('setup')) return null;
+  params.delete('setup');
+  const remaining = params.toString();
+  return remaining ? `#${remaining}` : '';
+}
+
+/** Removes only a setup fragment, leaving callback fragments for the runner. */
+export function stripSetupHash() {
+  if (typeof window === 'undefined' || !window.history?.replaceState) return;
+  const replacement = fragmentHashWithoutSetup(window.location.hash);
+  if (replacement === null) return;
+  window.history.replaceState(
+    {},
+    '',
+    `${window.location.pathname}${window.location.search}${replacement}`,
+  );
+}
+
+/**
+ * Reads and strips the setup fragment at module load, before React renders.
+ * This minimizes the time the owner credential is visible in the address bar.
+ */
+export function readInitialAuthFragment() {
+  const hash = typeof window === 'undefined' ? '' : window.location.hash;
+  const fragment = parseAuthFragment(hash);
+  if (shouldClearSetupHash(fragment)) stripSetupHash();
+  return fragment;
 }
 
 /**

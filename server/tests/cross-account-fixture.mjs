@@ -9,6 +9,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 
 import { createTask, savePlan } from '../src/tasks/store.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const PASSWORD = 'synthetic-cross-account-password';
 
@@ -52,8 +53,9 @@ export function runCrossAccountBackendChecks({ label, createApp, cleanup = () =>
   }
 
   async function register(email) {
+    const setupToken = await authorizeFirstAccount(base);
     const result = await request('POST', '/api/auth/register', {
-      body: { email, password: PASSWORD },
+      body: { email, password: PASSWORD, setupToken },
     });
     assert.equal(result.status, 201, `${label}: registration failed with HTTP ${result.status}`);
     return { ...result.data, email: result.data.user.email };

@@ -18,6 +18,7 @@ import { createTaskExecutor } from '../src/tasks/executor.js';
 import { createTask, listSteps } from '../src/tasks/store.js';
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 const servers = [];
 const tempDirs = [];
@@ -47,8 +48,9 @@ async function request(method, pathname, { token, body } = {}) {
 }
 
 async function register(email) {
+  const setupToken = await authorizeFirstAccount(base);
   const { status, data } = await request('POST', '/api/auth/register', {
-    body: { email, password: 'correct-horse-battery' },
+    body: { email, password: 'correct-horse-battery', setupToken },
   });
   assert.equal(status, 201, `could not register ${email}: ${JSON.stringify(data)}`);
   return data;

@@ -1,9 +1,9 @@
 // Administrator provisioning regression tests.
 //
-// Ordinary registration and Google sign-in never need a setup token and never
-// create an administrator. The existing BOOTSTRAP_TOKEN is reused only by the
-// owner-only POST /api/auth/admin/provision endpoint, which works while there
-// is no administrator and stops working once one exists.
+// The first account is authorized by the owner setup link and is always an
+// ordinary user. The existing BOOTSTRAP_TOKEN is also used by the owner-only
+// POST /api/auth/admin/provision endpoint, which works while there is no
+// administrator and stops working once one exists.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,6 +13,7 @@ import { once } from 'node:events';
 
 import { createApp } from '../src/index.js';
 import { config } from '../src/config.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 async function withFreshApp(fn) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-admin-'));
@@ -56,13 +57,14 @@ function adminCount(db) {
   return Number(db.prepare('SELECT COUNT(*) AS count FROM users WHERE is_admin = 1').get().count);
 }
 
-test('ordinary registration works on a fresh deployment and stays non-admin', async () => {
+test('ordinary registration with valid setup authorization stays non-admin', async () => {
   await withFreshApp(async ({ base, db }) => {
+    const setupToken = await authorizeFirstAccount(base);
     const res = await request(base, 'POST', '/api/auth/register', {
       body: {
         email: 'first@example.com',
         password: 'correct-horse-battery',
-        bootstrapToken: 'not-needed',
+        setupToken,
         isAdmin: true,
       },
     });
@@ -149,8 +151,9 @@ test('admin provisioning stops after one administrator exists', async () => {
 
 test('admin provisioning promotes an existing account without invalidating its session', async () => {
   await withFreshApp(async ({ base, db }) => {
+    const setupToken = await authorizeFirstAccount(base);
     const registered = await request(base, 'POST', '/api/auth/register', {
-      body: { email: 'owner@example.com', password: 'correct-horse-battery' },
+      body: { email: 'owner@example.com', password: 'correct-horse-battery', setupToken },
     });
     assert.equal(registered.status, 201);
     const sessionToken = registered.data.token;

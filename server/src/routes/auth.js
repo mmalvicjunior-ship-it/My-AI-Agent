@@ -1,5 +1,5 @@
-// Account endpoints: registration, login, logout, session verification, and
-// the owner-only first-administrator provisioning endpoint.
+// Account endpoints: first-account setup, registration, login, logout, session
+// verification, Google OAuth, and owner-only administrator provisioning.
 // Mounted at /api/auth before the global authentication middleware so that
 // these routes are the only public write endpoints besides /api/health.
 import crypto from 'node:crypto';
@@ -25,6 +25,18 @@ import {
   createOAuthState,
   STATE_TTL_MS,
 } from '../auth/google.js';
+import {
+  bindSetupGrant,
+  checkSetupGrant,
+  checkSetupGrantHash,
+  clearSetupAuthorizations,
+  consumeSetupGrant,
+  consumeSetupGrantHash,
+  countUsers,
+  issueSetupAuthorization,
+  setupCredentialHash,
+  withWriteTransaction,
+} from '../auth/setup.js';
 
 function publicUser(row) {
   // row may be either a raw database row (is_admin) or the session projection
@@ -55,12 +67,45 @@ function tokensEqual(provided, expected) {
   return crypto.timingSafeEqual(providedHash, expectedHash);
 }
 
+/** The two owner credentials must be distinct for either protected flow. */
+function credentialsConflict() {
+  return Boolean(config.firstAccountSetupToken)
+    && tokensEqual(config.firstAccountSetupToken, config.bootstrapToken);
+}
+
 /** PostgreSQL reports unique violations as SQLSTATE 23505, not "UNIQUE". */
 export function isDuplicateEmailError(error) {
   return error?.code === '23505' || /unique constraint/i.test(String(error?.message || ''));
 }
 
 const SINGLE_ADMIN_INDEX = 'idx_users_single_admin';
+
+// Public setup errors deliberately describe the owner-provided setup link
+// without ever echoing, naming, or logging a token value.
+const SETUP_REQUIRED_ERROR = 'Creating the first account requires the owner-provided setup link. Open that link again and try once.';
+const SETUP_INVALID_ERROR = 'The setup authorization is invalid or has expired. Open the owner-provided setup link again.';
+const SETUP_COMPLETE_ERROR = 'First-account setup is already complete.';
+const SETUP_CONFIG_ERROR = 'First-account setup is not configured. Ask the owner to set a unique FIRST_ACCOUNT_SETUP_TOKEN on the server and restart it.';
+const CREDENTIAL_CONFLICT_ERROR = 'First-account setup and administrator provisioning are not configured with unique credentials. Ask the owner to set FIRST_ACCOUNT_SETUP_TOKEN to a value different from the administrator provisioning token and restart the server.';
+
+class DuplicateUserError extends Error {}
+class CallbackOutcomeError extends Error {
+  constructor(code) {
+    super(code);
+    this.code = code;
+  }
+}
+
+/** All auth responses carry credentials or credential-derived state. */
+function noStore(req, res, next) {
+  res.set('Cache-Control', 'no-store');
+  next();
+}
+
+function earlierIso(...values) {
+  const times = values.map((value) => Date.parse(value)).filter(Number.isFinite);
+  return new Date(Math.min(...times)).toISOString();
+}
 
 /** True only for the single-admin index, never for email/google_sub collisions. */
 export function isSingleAdminViolation(error) {
@@ -107,6 +152,7 @@ function rejectRateLimited(res, limit, message) {
 
 export function createAuthRouter({ db }) {
   const router = express.Router();
+  router.use(noStore);
   const registerLimiter = createAttemptLimiter({ max: 10 });
   // Login brute-force is counted per (IP, email) pair so one client hammering
   // an account does not lock out every other account on a shared proxy or
@@ -117,6 +163,9 @@ export function createAuthRouter({ db }) {
   // Google sign-in has its own bucket so a broken third party can never lock
   // out email/password authentication.
   const googleLimiter = createAttemptLimiter({ max: 20 });
+  // First-account authorization is validated separately from ordinary
+  // registration; a bad setup link must not consume the public signup bucket.
+  const setupLimiter = createAttemptLimiter({ max: 10 });
   // First-administrator provisioning is owner-only and must not share a bucket
   // with ordinary registration traffic.
   const adminProvisionLimiter = createAttemptLimiter({ max: 10 });
@@ -127,17 +176,61 @@ export function createAuthRouter({ db }) {
   }
 
 
+  /** Public, secret-free hint used by the form to explain first-account setup. */
+  router.get('/setup/status', (req, res) => {
+    return res.json({ ok: true, required: countUsers(db) === 0 });
+  });
+
+  /**
+   * Exchanges the server-only FIRST_ACCOUNT_SETUP_TOKEN for a short-lived,
+   * single-use opaque authorization. BOOTSTRAP_TOKEN is never accepted here.
+   * The owner secret is compared in constant time; only a random server-issued
+   * value is returned to the browser, and only hashes are persisted. Neither
+   * value is ever sent to Google, logged, or echoed in an error message.
+   */
+  router.post('/setup/authorize', (req, res) => {
+    const limit = setupLimiter(clientKey(req));
+    if (!limit.allowed) {
+      return rejectRateLimited(res, limit, 'Too many setup attempts. Try again later.');
+    }
+
+    if (!config.firstAccountSetupToken) {
+      return res.status(503).json({ ok: false, error: SETUP_CONFIG_ERROR });
+    }
+    if (credentialsConflict()) {
+      return res.status(503).json({ ok: false, error: CREDENTIAL_CONFLICT_ERROR });
+    }
+
+    const provided = typeof req.body?.setupCredential === 'string' ? req.body.setupCredential.trim() : '';
+    if (!tokensEqual(provided, config.firstAccountSetupToken)) {
+      return res.status(403).json({ ok: false, error: 'Setup authorization was not accepted.' });
+    }
+
+    const outcome = withWriteTransaction(db, () => {
+      if (countUsers(db) > 0) {
+        clearSetupAuthorizations(db);
+        return { status: 'complete' };
+      }
+      return issueSetupAuthorization(db, setupCredentialHash(provided));
+    });
+    if (outcome.status === 'complete') {
+      return res.status(409).json({ ok: false, error: SETUP_COMPLETE_ERROR });
+    }
+    if (outcome.status !== 'ok') {
+      return res.status(403).json({ ok: false, error: SETUP_INVALID_ERROR });
+    }
+
+    return res.json({
+      ok: true,
+      setupToken: outcome.token,
+      expiresAt: outcome.expiresAt,
+    });
+  });
+
   router.post('/register', (req, res) => {
     const limit = registerLimiter(clientKey(req));
     if (!limit.allowed) {
       return rejectRateLimited(res, limit, 'Too many registration attempts. Try again later.');
-    }
-
-    if (!config.allowRegistration) {
-      return res.status(403).json({
-        ok: false,
-        error: 'New registrations are currently closed. Please contact your administrator.',
-      });
     }
 
     const email = normalizeEmail(req.body?.email);
@@ -149,38 +242,76 @@ export function createAuthRouter({ db }) {
       return res.status(400).json({ ok: false, error: passwordError });
     }
 
-    const existing = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
-    if (existing) {
-      return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
-    }
+    // Scrypt is deliberately completed before the write transaction opens so
+    // one public registration cannot block every other database writer.
+    const passwordHash = hashPassword(req.body.password);
+    const providedSetup = typeof req.body?.setupToken === 'string' && Boolean(req.body.setupToken.trim());
 
-    let created;
+    // Revalidation, grant consumption, and the insert share one transaction.
+    // A duplicate-email race throws so the rollback restores the grant.
+    let outcome;
     try {
-      // Public registration can never create an administrator, including when
-      // this is the first account or the client sends a role field.
-      created = createUserWithRole(db, {
-        email,
-        passwordHash: hashPassword(req.body.password),
-        googleSub: null,
-        requestAdmin: false,
+      outcome = withWriteTransaction(db, () => {
+        const firstAccount = countUsers(db) === 0;
+        if (firstAccount && !checkSetupGrant(db, req.body?.setupToken, { requireUnbound: true })) {
+          return { status: providedSetup ? 'setup_invalid' : 'setup_required' };
+        }
+        if (!firstAccount && !config.allowRegistration) {
+          return { status: 'closed' };
+        }
+
+        const existing = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(email);
+        if (existing) return { status: 'duplicate' };
+
+        if (firstAccount && !consumeSetupGrant(db, req.body?.setupToken)) {
+          return { status: 'setup_invalid' };
+        }
+
+        try {
+          // Setup authorizes account creation only. It never grants admin and
+          // client-supplied role fields are ignored on every public path.
+          const created = createUserWithRole(db, {
+            email,
+            passwordHash,
+            googleSub: null,
+            requestAdmin: false,
+          });
+          return { status: 'created', created };
+        } catch (error) {
+          if (isDuplicateEmailError(error)) throw new DuplicateUserError();
+          throw error;
+        }
       });
     } catch (error) {
-      // Unique constraint race with another registration for the same email.
-      if (isDuplicateEmailError(error)) {
-        return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
-      }
-      throw error;
+      if (error instanceof DuplicateUserError) outcome = { status: 'duplicate' };
+      else throw error;
+    }
+
+    if (outcome.status === 'setup_invalid') {
+      return res.status(403).json({ ok: false, error: SETUP_INVALID_ERROR });
+    }
+    if (outcome.status === 'setup_required') {
+      return res.status(403).json({ ok: false, error: SETUP_REQUIRED_ERROR });
+    }
+    if (outcome.status === 'closed') {
+      return res.status(403).json({
+        ok: false,
+        error: 'New registrations are currently closed. Please contact your administrator.',
+      });
+    }
+    if (outcome.status === 'duplicate') {
+      return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
     }
 
     // Pre-authentication projects are claimed only by the provisioned
     // administrator, never by an arbitrary public registration.
 
-    const session = createSession(db, created.id, config.authSessionDays);
+    const session = createSession(db, outcome.created.id, config.authSessionDays);
     return res.status(201).json({
       ok: true,
       token: session.token,
       expiresAt: session.expiresAt,
-      user: { id: created.id, email, isAdmin: false },
+      user: { id: outcome.created.id, email, isAdmin: false },
     });
   });
 
@@ -195,15 +326,50 @@ export function createAuthRouter({ db }) {
         error: 'Google sign-in is temporarily unavailable. Please try again later.',
       });
     }
-    // Ordinary Google sign-in never needs a setup token. New accounts are
-    // governed only by the server's registration setting.
     const allowCreate = config.allowRegistration ? 1 : 0;
-
     const state = createOAuthState();
-    // One-time state, stored only as a SHA-256 hash, valid for 10 minutes.
-    db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(new Date().toISOString());
-    db.prepare('INSERT INTO oauth_states (state_hash, allow_create, expires_at) VALUES (?, ?, ?)')
-      .run(hashToken(state), allowCreate, new Date(Date.now() + STATE_TTL_MS).toISOString());
+    const stateHash = hashToken(state);
+    const providedSetup = typeof req.body?.setupToken === 'string' && Boolean(req.body.setupToken.trim());
+
+    // On a fresh deployment the first account must be authorized. The opaque
+    // grant is validated, bound to this one state, and carried into the state
+    // as a hash. Only a random `state` goes to Google; neither secret is ever
+    // included in the authorize URL. A failed callback can start a fresh state
+    // with the same still-valid grant.
+    const outcome = withWriteTransaction(db, () => {
+      db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(new Date().toISOString());
+
+      let setupAuthorized = 0;
+      let setupGrantHash = null;
+      let expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString();
+      if (countUsers(db) === 0) {
+        const grant = checkSetupGrant(db, req.body?.setupToken);
+        if (!grant) {
+          return { status: providedSetup ? 'setup_invalid' : 'setup_required' };
+        }
+        // One active setup flow at a time. Rebinding invalidates any earlier
+        // state from this same grant without consuming the grant itself.
+        db.prepare('DELETE FROM oauth_states WHERE setup_authorized = 1').run();
+        bindSetupGrant(db, grant.tokenHash, stateHash);
+        setupAuthorized = 1;
+        setupGrantHash = grant.tokenHash;
+        expiresAt = earlierIso(expiresAt, grant.expiresAt);
+      }
+
+      db.prepare(`
+        INSERT INTO oauth_states (state_hash, allow_create, setup_authorized, setup_grant_hash, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(stateHash, allowCreate, setupAuthorized, setupGrantHash, expiresAt);
+      return { status: 'ok' };
+    });
+
+    if (outcome.status === 'setup_invalid') {
+      return res.status(403).json({ ok: false, error: SETUP_INVALID_ERROR });
+    }
+    if (outcome.status === 'setup_required') {
+      return res.status(403).json({ ok: false, error: SETUP_REQUIRED_ERROR });
+    }
+
     return res.json({
       ok: true,
       url: googleAuthorizeUrl({ clientId: config.googleClientId, redirectUri: config.googleRedirectUri, state }),
@@ -225,11 +391,14 @@ export function createAuthRouter({ db }) {
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     if (!code || !state) return redirectWithError('google_state');
 
-    // Consume the state atomically: the row is deleted and returned in one
-    // statement, so a replayed or concurrent second callback finds nothing.
+    // Consume the state atomically before any await: a replayed or concurrent
+    // second callback finds nothing. A failed identity exchange keeps the
+    // grant available for a fresh state, so the owner need not resend a secret.
     const stateHash = hashToken(state);
     const stateRow = db.prepare(
-      'DELETE FROM oauth_states WHERE state_hash = ? RETURNING allow_create, expires_at',
+      `DELETE FROM oauth_states
+        WHERE state_hash = ?
+        RETURNING allow_create, setup_authorized, setup_grant_hash, expires_at`,
     ).get(stateHash);
     if (!stateRow) return redirectWithError('google_state');
     if (new Date(stateRow.expires_at).getTime() <= Date.now()) return redirectWithError('google_state');
@@ -250,49 +419,88 @@ export function createAuthRouter({ db }) {
       const normalized = normalizeEmail(identity.email);
       if (!normalized) return redirectWithError('google_identity_invalid');
 
-      const finish = (userId) => {
-        const session = createSession(db, userId, config.authSessionDays);
-        return res.redirect(302, `${origin}/#auth_token=${session.token}&auth_expires=${encodeURIComponent(session.expiresAt)}`);
-      };
+      // Scrypt runs before the write transaction. Returning users and explicit
+      // email conflicts skip the work entirely.
+      const precheck = db.prepare(
+        'SELECT id, google_sub FROM users WHERE google_sub = ? OR lower(email) = ? LIMIT 1',
+      ).get(identity.sub, normalized);
+      const shadowHash = precheck ? null : hashPassword(crypto.randomBytes(32).toString('hex'));
 
-      const bySub = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
-      if (bySub) return finish(bySub.id);
-
-      const existing = db.prepare('SELECT id, google_sub FROM users WHERE lower(email) = ?').get(normalized);
-      if (existing) {
-        // Never silently link a password account to a Google identity.
-        return redirectWithError(existing.google_sub ? 'google_identity_conflict' : 'google_account_exists');
-      }
-
-      if (stateRow.allow_create !== 1) {
-        return redirectWithError('google_registration_disabled');
-      }
-      // Google-only accounts get an unusable random password hash: password
-      // sign-in is impossible for them; only Google sign-in works. They are
-      // always ordinary users; administrators are provisioned separately.
-      const shadowHash = hashPassword(crypto.randomBytes(32).toString('hex'));
-      let created;
+      // Revalidate first-account status, grant binding, and identity inside
+      // one transaction; consume the grant only when the insert succeeds.
+      let outcome;
       try {
-        created = createUserWithRole(db, {
-          email: normalized,
-          passwordHash: shadowHash,
-          googleSub: identity.sub,
-          requestAdmin: false,
+        outcome = withWriteTransaction(db, () => {
+          const bySub = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
+          if (bySub) return { status: 'session', userId: bySub.id };
+
+          const existing = db.prepare('SELECT id, google_sub FROM users WHERE lower(email) = ?').get(normalized);
+          if (existing) {
+            // Never silently link a password account to a Google identity.
+            throw new CallbackOutcomeError(
+              existing.google_sub ? 'google_identity_conflict' : 'google_account_exists',
+            );
+          }
+
+          const firstAccount = countUsers(db) === 0;
+          if (firstAccount) {
+            if (Number(stateRow.setup_authorized) !== 1 || !stateRow.setup_grant_hash) {
+              throw new CallbackOutcomeError('google_setup_required');
+            }
+            if (!checkSetupGrantHash(db, stateRow.setup_grant_hash, { expectedStateHash: stateHash })) {
+              throw new CallbackOutcomeError('google_setup_required');
+            }
+          } else if (Number(stateRow.setup_authorized) === 1) {
+            // A setup-authorized state may only create the first account. It is
+            // not a general registration ticket if another account won the race.
+            throw new CallbackOutcomeError('google_setup_required');
+          } else if (Number(stateRow.allow_create) !== 1) {
+            throw new CallbackOutcomeError('google_registration_disabled');
+          }
+
+          if (firstAccount
+            && !consumeSetupGrantHash(db, stateRow.setup_grant_hash, stateHash)) {
+            throw new CallbackOutcomeError('google_setup_required');
+          }
+
+          try {
+            // Google-only accounts get an unusable random password hash:
+            // password sign-in is impossible for them; only Google sign-in
+            // works. They are always ordinary users; admins are provisioned
+            // separately by the owner-only endpoint.
+            const created = createUserWithRole(db, {
+              email: normalized,
+              passwordHash: shadowHash,
+              googleSub: identity.sub,
+              requestAdmin: false,
+            });
+            return { status: 'session', userId: created.id };
+          } catch (error) {
+            // A concurrent flow may have created the same identity or email
+            // between the lookups and the insert. Re-check instead of trusting
+            // stale reads, just as the email/password path does.
+            if (isDuplicateEmailError(error)) {
+              const bySubAfter = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
+              if (bySubAfter) return { status: 'session', userId: bySubAfter.id };
+              const byEmailAfter = db.prepare('SELECT google_sub FROM users WHERE lower(email) = ?').get(normalized);
+              if (byEmailAfter) {
+                throw new CallbackOutcomeError(
+                  byEmailAfter.google_sub ? 'google_identity_conflict' : 'google_account_exists',
+                );
+              }
+            }
+            throw error;
+          }
         });
       } catch (error) {
-        // A concurrent flow may have created the same identity or email between
-        // the lookups and the insert. Re-check instead of trusting stale reads.
-        if (isDuplicateEmailError(error)) {
-          const bySubAfter = db.prepare('SELECT id FROM users WHERE google_sub = ?').get(identity.sub);
-          if (bySubAfter) return finish(bySubAfter.id);
-          const byEmailAfter = db.prepare('SELECT google_sub FROM users WHERE lower(email) = ?').get(normalized);
-          if (byEmailAfter) {
-            return redirectWithError(byEmailAfter.google_sub ? 'google_identity_conflict' : 'google_account_exists');
-          }
-        }
-        throw error;
+        if (error instanceof CallbackOutcomeError) outcome = { status: 'error', code: error.code };
+        else throw error;
       }
-      return finish(created.id);
+
+      if (outcome.status === 'error') return redirectWithError(outcome.code);
+
+      const session = createSession(db, outcome.userId, config.authSessionDays);
+      return res.redirect(302, `${origin}/#auth_token=${session.token}&auth_expires=${encodeURIComponent(session.expiresAt)}`);
     } catch (error) {
       console.error('[auth] Google callback failed:', redactSecrets(String(error?.message || error)));
       return redirectWithError('google_identity_invalid');
@@ -303,8 +511,9 @@ export function createAuthRouter({ db }) {
    * Owner-only first-administrator provisioning.
    *
    * This is the secure replacement for the old "first account becomes admin"
-   * behavior. Ordinary sign-up and Google sign-in never call it and never need
-   * a token. The operator supplies the existing server-side BOOTSTRAP_TOKEN
+   * behavior. Ordinary sign-up and Google sign-in never call it; a setup
+   * authorization grants account creation only, never administration. The
+   * operator supplies the existing server-side BOOTSTRAP_TOKEN
    * directly to this endpoint, either to create a password administrator or to
    * promote an already verified account. It stops working as soon as one
    * administrator exists.
@@ -313,6 +522,13 @@ export function createAuthRouter({ db }) {
     const limit = adminProvisionLimiter(clientKey(req));
     if (!limit.allowed) {
       return rejectRateLimited(res, limit, 'Too many setup attempts. Try again later.');
+    }
+
+    // A misconfigured shared value must not let the setup credential become an
+    // administrator credential. Both owner flows fail closed until the secrets
+    // are different again.
+    if (credentialsConflict()) {
+      return res.status(503).json({ ok: false, error: CREDENTIAL_CONFLICT_ERROR });
     }
 
     const provided = typeof req.body?.bootstrapToken === 'string' ? req.body.bootstrapToken.trim() : '';

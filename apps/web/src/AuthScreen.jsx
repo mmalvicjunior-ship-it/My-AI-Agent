@@ -1,35 +1,96 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 /**
  * Sign-in / registration screen shown before the workspace loads.
  * The backend issues a bearer token; App.jsx stores it and attaches it to
  * every /api request. No token or password is ever written to logs.
  *
- * Google sign-in needs no setup token: clicking the button starts the normal
- * OAuth flow and sends the user straight to Google. Administrator provisioning
- * is a separate owner-only server operation and is never surfaced here.
+ * On a fresh deployment the owner can open a setup link carrying a dedicated
+ * first-account credential in the URL fragment (not the administrator token).
+ * App.jsx reads and strips it before render; this screen exchanges it once for
+ * a short-lived, single-use opaque grant held only in React state. That grant
+ * is sent to the backend for first-account registration or bound into the
+ * Google OAuth state. The owner credential itself is never sent to Google or
+ * persisted by the browser.
  *
  * The Google callback fragment is verified by App.jsx before it decides whether
  * this screen is needed, so a stale stored session cannot swallow a new token.
  * Friendly callback errors are passed in via `initialError`.
  */
-export default function AuthScreen({ apiBase = '', onAuthenticated, initialError = null }) {
-  const [mode, setMode] = useState('login');
+export default function AuthScreen({
+  apiBase = '',
+  onAuthenticated,
+  initialError = null,
+  setupCredential = null,
+}) {
+  const [mode, setMode] = useState(() => (setupCredential ? 'register' : 'login'));
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState(initialError);
   const [busy, setBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [setupAuthorization, setSetupAuthorization] = useState(null);
+  const [setupExchanging, setSetupExchanging] = useState(Boolean(setupCredential));
+  const exchangedSecretRef = useRef(null);
 
   const isRegister = mode === 'register';
+  const setupPending = Boolean(setupCredential) && !setupAuthorization;
 
   useEffect(() => {
     if (initialError) setError(initialError);
   }, [initialError]);
 
+  // Public status hint: it contains no secret and only tells the form whether
+  // this deployment is still waiting for its first account.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`${apiBase}/api/auth/setup/status`);
+        const result = await response.json().catch(() => ({}));
+        if (!cancelled && response.ok && result.ok) {
+          setSetupRequired(Boolean(result.required));
+        }
+      } catch {
+        /* The server's registration response still explains setup errors. */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiBase]);
+
+  // Exchange the fragment secret exactly once per value. The response is an
+  // opaque server-issued authorization; the secret is never forwarded to
+  // Google, logged, or copied into browser storage.
+  useEffect(() => {
+    if (!setupCredential || exchangedSecretRef.current === setupCredential) return;
+    exchangedSecretRef.current = setupCredential;
+    setMode('register');
+    setError(null);
+    setSetupExchanging(true);
+    (async () => {
+      try {
+        const response = await fetch(`${apiBase}/api/auth/setup/authorize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ setupCredential }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.ok || !result.setupToken) {
+          throw new Error(result.error || 'The setup authorization could not be verified. Open the setup link again.');
+        }
+        setSetupAuthorization(result.setupToken);
+      } catch (err) {
+        setError(err.message || 'The setup authorization could not be verified. Open the setup link again.');
+      } finally {
+        setSetupExchanging(false);
+      }
+    })();
+  }, [apiBase, setupCredential]);
+
   const switchMode = (next) => {
-    if (busy) return;
+    if (busy || setupPending) return;
     setMode(next);
     setError(null);
     setPassword('');
@@ -40,16 +101,15 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
     setError(null);
     setGoogleBusy(true);
     try {
-      // Ordinary Google sign-in needs no setup token. The backend returns
-      // Google's authorize URL and the browser goes there immediately.
+      const body = isRegister && setupAuthorization ? { setupToken: setupAuthorization } : {};
       const response = await fetch(`${apiBase}/api/auth/google/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify(body),
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok || !result.ok || !result.url) {
-        throw new Error('Google sign-in is unavailable right now. Please try again.');
+        throw new Error(result.error || 'Google sign-in is unavailable right now. Please try again.');
       }
       window.location.assign(result.url);
     } catch (err) {
@@ -67,10 +127,12 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
     }
     setBusy(true);
     try {
+      const body = { email: email.trim(), password };
+      if (isRegister && setupAuthorization) body.setupToken = setupAuthorization;
       const response = await fetch(`${apiBase}/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password }),
+        body: JSON.stringify(body),
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok || !result.ok || !result.token) {
@@ -116,6 +178,17 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
               : 'Sign in to continue to your workspaces.'}
           </p>
 
+          {isRegister && setupRequired && (
+            <div className="auth-notice" role="status">
+              {setupExchanging
+                ? 'Verifying the owner-provided setup link…'
+                : setupAuthorization
+                  ? 'Setup link verified. It authorizes one first account and expires shortly.'
+                  : 'The first account needs the owner-provided setup link. Open that link to authorize either Google or email and password.'}
+              {' '}The secret stays in this page and is never sent to Google.
+            </div>
+          )}
+
           <div className="auth-tabs" role="group" aria-label="Authentication mode">
             <button
               type="button"
@@ -135,7 +208,12 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
             </button>
           </div>
 
-          <button type="button" className="auth-google" onClick={startGoogle} disabled={googleBusy || busy}>
+          <button
+            type="button"
+            className="auth-google"
+            onClick={startGoogle}
+            disabled={googleBusy || busy || setupPending}
+          >
             {googleBusy ? (
               <span className="auth-google-spinner" aria-hidden="true" />
             ) : (
@@ -188,7 +266,7 @@ export default function AuthScreen({ apiBase = '', onAuthenticated, initialError
 
             {error && <div className="auth-error" role="alert">{error}</div>}
 
-            <button type="submit" className="auth-submit" disabled={busy}>
+            <button type="submit" className="auth-submit" disabled={busy || setupPending}>
               {busy ? 'Please wait…' : isRegister ? 'Create account' : 'Sign in'}
             </button>
           </form>

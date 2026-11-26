@@ -60,25 +60,32 @@ sidebar to end the session. Accounts are stored locally in SQLite.
   no cookie, so no CSRF token is needed. Clearing site data signs you out.
 - Sessions expire after `AUTH_SESSION_DAYS` (default 30). Expired or revoked
   tokens receive `401` and return the UI to the sign-in screen.
-- `/api/health` is the only public endpoint besides register/login/logout and
-  the owner-only admin provisioning route. Every project, file, task,
+- `/api/health`, the setup status/exchange endpoints, and register/login/logout
+  are public; admin provisioning remains owner-only. Every project, file, task,
   proposal, and command endpoint requires a session and is scoped to the owning
   account. Requesting another account's project returns `404`, not its contents.
-- Ordinary registration and Google sign-in never require a token and always
-  create ordinary users. The first administrator is provisioned separately by
-  the owner through `POST /api/auth/admin/provision`, which reuses the
-  server-side `BOOTSTRAP_TOKEN` and stops working once one admin exists. No
-  startup migration promotes an arbitrary first visitor. The provisioned admin
-  adopts projects that predate accounts (`owner_id IS NULL`) so existing local
-  data stays reachable. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
+- The first account (password or Google) requires a dedicated owner setup
+  credential in the link `#setup=<FIRST_ACCOUNT_SETUP_TOKEN>`. It is distinct
+  from the administrator token. The app strips the fragment before render,
+  exchanges it server-side for a short-lived opaque grant, and never sends it
+  to Google or browser storage. The credential expires after first use and is
+  consumed only after the first account is created. Later accounts follow
+  `ALLOW_REGISTRATION`. The first account is always an ordinary user; the
+  administrator is provisioned separately through
+  `POST /api/auth/admin/provision` with `BOOTSTRAP_TOKEN`, which is never exposed
+  to the browser and stops working once one admin exists. No startup migration
+  promotes an arbitrary first visitor. The provisioned admin adopts projects
+  that predate accounts (`owner_id IS NULL`) so existing local data stays
+  reachable. See `docs/FIRST-ACCOUNT-BOOTSTRAP.md`.
 - Optional Google sign-in (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_OAUTH_REDIRECT_URI`)
   uses Google's authorization-code flow entirely server-side: the browser is
-  redirected straight to Google, Google calls back
+  redirected to Google with only a random one-time `state`, Google calls back
   `/api/auth/google/callback`, and the server exchanges the code and validates
   the identity against Google's tokeninfo endpoint (verified email required)
-  before issuing a normal session token. Google users are never administrators,
-  existing email/password accounts are never auto-linked, and no client secret
-  reaches the browser. Setup: `docs/GOOGLE-OAUTH.md`.
+  before issuing a normal session token. On a fresh deployment the setup
+  authorization is folded into that server-side state. Google users are never
+  administrators, existing email/password accounts are never auto-linked, and
+  no client secret reaches the browser. Setup: `docs/GOOGLE-OAUTH.md`.
 - Register/login are throttled in memory (10 attempts per 15 minutes per IP,
   with a per-IP registration limit and a login spray backstop; `TRUST_PROXY`
   controls how many proxy hops are trusted for client IPs). The counters reset
@@ -87,8 +94,18 @@ sidebar to end the session. Accounts are stored locally in SQLite.
 These routes are public:
 
 ```text
-POST /api/auth/register   { email, password } -> { token, expiresAt, user }
-                          (always creates an ordinary user)
+GET  /api/auth/setup/status
+                          { ok, required } (no secret; first account only)
+POST /api/auth/setup/authorize
+                          { setupCredential } -> { setupToken, expiresAt }
+                          (dedicated owner credential exchange; opaque one-time grant)
+POST /api/auth/register   { email, password, [setupToken] }
+                          -> { token, expiresAt, user }
+                          (first account requires setupToken; always ordinary)
+POST /api/auth/google/start
+                          [setupToken] -> { url } (Google gets only state)
+GET  /api/auth/google/callback
+                          code/state -> redirect with auth token/error fragment
 POST /api/auth/login      { email, password } -> { token, expiresAt, user }
 POST /api/auth/logout     invalidates the presented session (idempotent)
 GET  /api/auth/me         verifies a token and returns the current user
@@ -421,7 +438,8 @@ prompts). Never commit real values.
 | `DATABASE_PATH` | Yes | `/var/data/app.db` on the mounted disk. |
 | `WORKSPACE_ROOT` | Yes | `/var/data/workspaces` on the mounted disk. |
 | `AUTH_SESSION_DAYS` | No | Session lifetime in days (1-365). Defaults to `30`. |
-| `BOOTSTRAP_TOKEN` | Yes before admin provisioning | Shared secret for the owner-only `/api/auth/admin/provision` endpoint. Set in the Render dashboard; never commit it. Not used by ordinary registration or Google sign-in. |
+| `BOOTSTRAP_TOKEN` | Yes before admin provisioning | Owner-only secret for `/api/auth/admin/provision`. Never sent to the browser, setup link, or Google. Set in the Render dashboard; never commit it. |
+| `FIRST_ACCOUNT_SETUP_TOKEN` | Yes before first account | Dedicated one-time setup credential for `/api/auth/setup/authorize`. Must differ from `BOOTSTRAP_TOKEN`; expires after first use and is consumed only after the first account is created. Set in the Render dashboard; never commit it. |
 | `ALLOW_REGISTRATION` | No | Defaults to enabled. Set `false` after provisioning the administrator to close public registration. Existing accounts can always log in. |
 | `GOOGLE_CLIENT_ID` | No | Google OAuth 2.0 client ID (Web application). Enables the "Continue with Google" button. Render only; never the frontend. |
 | `GOOGLE_CLIENT_SECRET` | No | Google OAuth 2.0 client secret. Server-side only, never exposed to the browser. |
@@ -539,10 +557,12 @@ approve, or run another account's projects. Imports of existing server
 directories are off unless `PROJECT_IMPORT_ROOT` is configured. Before exposing
 the service publicly:
 
-- Generate a strong `BOOTSTRAP_TOKEN` and set it in the Render dashboard
-  BEFORE the first deploy. Ordinary users sign in normally; the owner creates
-  the single administrator with `POST /api/auth/admin/provision` (see
-  `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
+- Generate two different strong secrets: `BOOTSTRAP_TOKEN` for
+  `POST /api/auth/admin/provision` and `FIRST_ACCOUNT_SETUP_TOKEN` for the
+  one-time setup link. Set both in the Render dashboard BEFORE the first deploy.
+  The owner uses `#setup=<FIRST_ACCOUNT_SETUP_TOKEN>` for the first account,
+  then creates the single administrator with `POST /api/auth/admin/provision`
+  (see `docs/FIRST-ACCOUNT-BOOTSTRAP.md`). Then set `ALLOW_REGISTRATION=false`.
 - Keep `PROJECT_IMPORT_ROOT` unset unless you deliberately need directory
   imports; if set, point it at a dedicated folder, never the filesystem root,
   the workspace tree, or the database directory.

@@ -415,6 +415,7 @@ kbd { padding: 2px 5px; color: var(--subtle); background: var(--surface); border
 .auth-form input:focus { border-color: var(--accent); }
 .auth-form input:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
 .auth-error { padding: 9px 10px; color: var(--red); background: rgba(251, 128, 137, .08); border: 1px solid rgba(251, 128, 137, .25); border-radius: 7px; font-size: 12px; }
+.auth-notice { margin: 0 0 16px; padding: 9px 10px; color: var(--muted); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 7px; font-size: 12px; line-height: 1.5; }
 .auth-submit { margin-top: 3px; padding: 11px; color: #201a30; background: #c5b5ff; border: 0; border-radius: 8px; cursor: pointer; font: 700 13px 'DM Sans', sans-serif; }
 .auth-submit:hover { background: var(--accent); }
 .auth-submit:disabled { cursor: progress; opacity: .65; }

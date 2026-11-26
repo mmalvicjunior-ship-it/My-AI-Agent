@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { authorizeFirstAccount } from './setup-authorization.mjs';
+
 const importRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'myai-import-'));
 process.env.PROJECT_IMPORT_ROOT = importRoot;
 process.env.DATABASE_BACKEND = 'pglite';
@@ -87,11 +89,13 @@ test('OpenRouter-compatible configuration is reported without using the network'
 });
 
 test('first account registration, login, session verification and logout use Postgres', async () => {
+  const setupToken = await authorizeFirstAccount(base);
   const registered = await request('POST', '/api/auth/register', {
     auth: false,
     body: {
       email: 'storage-user@example.test',
       password: 'correct-horse-battery',
+      setupToken,
     },
   });
   assert.equal(registered.status, 201);

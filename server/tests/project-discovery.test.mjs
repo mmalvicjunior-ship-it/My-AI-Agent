@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from '../src/config.js';
 import { createApp } from '../src/index.js';
 import { mockProvider } from '../src/ai/mock.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 import {
   collectProjectCandidates,
   decodeDiscoveryId,
@@ -45,10 +46,12 @@ async function request(method, route, { token, body } = {}) {
 
 async function register(label = 'user') {
   emailCounter += 1;
+  const setupToken = await authorizeFirstAccount(base);
   const result = await request('POST', '/api/auth/register', {
     body: {
       email: `${label}-${Date.now()}-${emailCounter}@example.com`,
       password: 'long-enough-password',
+      setupToken,
     },
   });
   assert.equal(result.status, 201, JSON.stringify(result.data));

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { createApp } from '../src/index.js';
 import { createOpenAIProvider } from '../src/ai/openai.js';
 import { AUTH_REQUIRED_CODE, isSessionExpiredResponse } from '../../apps/web/src/authResponse.js';
+import { authorizeFirstAccount } from './setup-authorization.mjs';
 
 let server;
 let base;
@@ -54,8 +55,9 @@ test('session 401s are tagged AUTH_REQUIRED', async () => {
 
 test('a provider 401 on /api/chat is not a session failure', async () => {
   const email = `redirect-${Date.now()}@example.com`;
+  const setupToken = await authorizeFirstAccount(base);
   const registered = await request('POST', '/api/auth/register', {
-    body: { email, password: 'correct-horse-battery' },
+    body: { email, password: 'correct-horse-battery', setupToken },
   });
   assert.equal(registered.status, 201, registered.data?.error);
   const { token } = registered.data;

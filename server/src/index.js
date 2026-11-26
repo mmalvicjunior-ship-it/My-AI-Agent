@@ -114,7 +114,8 @@ export function createApp(options = {}) {
   // keeps every client on its own IP bucket instead of sharing the proxy's
   // address, and a spoofed X-Forwarded-For from the client is ignored
   // because only the last `trustProxy` hops are trusted. A test may override
-  // this with createApp({ trustProxy }).
+  // this with createApp({ trustProxy }). Express also uses this setting for
+  // req.secure, which determines the retry cookie's Secure attribute.
   const trustProxy = 'trustProxy' in options ? options.trustProxy : config.trustProxy;
   app.set('trust proxy', trustProxy);
 

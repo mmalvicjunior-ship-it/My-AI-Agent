@@ -17,6 +17,7 @@ import {
   readAuthEpoch,
   shouldClearAuthHash,
   shouldClearSetupHash,
+  shouldIncludeSetupAuthorization,
   shouldClearWorkspaceForAuthChange,
   shouldSignOutFor401,
 } from '../../apps/web/src/authFlow.js';
@@ -137,6 +138,13 @@ test('a setup fragment is read once and stripped without touching auth callbacks
     '#auth_token=fresh-token&auth_expires=2030-01-01',
   );
   assert.equal(fragmentHashWithoutSetup('#auth_token=fresh-token'), null);
+});
+
+test('an active setup authorization survives Register/Sign in tab switches', () => {
+  assert.equal(shouldIncludeSetupAuthorization({ setupAuthorization: 'grant', mode: 'register' }), true);
+  assert.equal(shouldIncludeSetupAuthorization({ setupAuthorization: 'grant', mode: 'login' }), true);
+  assert.equal(shouldIncludeSetupAuthorization({ setupAuthorization: null, mode: 'register' }), false);
+  assert.equal(shouldIncludeSetupAuthorization({}), false);
 });
 
 test('setup, cancellation, account, and server failures have friendly messages', () => {

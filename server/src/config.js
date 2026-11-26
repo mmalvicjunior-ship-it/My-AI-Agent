@@ -48,6 +48,9 @@ function fallbackProviderFromEnv() {
  * "false"/"0" = the server is reached directly (use the socket IP). A plain
  * integer trusts that many hops. A comma-separated list trusts those CIDRs.
  * We never default to unconditionally trusting arbitrary X-Forwarded-For.
+ * Express also uses this setting for `req.secure`, which is the sole source
+ * for the first-account retry cookie's Secure attribute. A service reached
+ * directly, without a trusted proxy, should set TRUST_PROXY=false.
  */
 function trustProxyFromEnv() {
   const raw = process.env.TRUST_PROXY;

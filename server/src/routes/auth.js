@@ -29,6 +29,7 @@ import {
   bindSetupGrant,
   checkSetupGrant,
   checkSetupGrantHash,
+  checkSetupRetryAuthorization,
   clearSetupAuthorizations,
   consumeSetupGrant,
   consumeSetupGrantHash,
@@ -37,6 +38,12 @@ import {
   setupCredentialHash,
   withWriteTransaction,
 } from '../auth/setup.js';
+import {
+  clearSetupRetryCookie,
+  readSetupRetryCookie,
+  secureCookieForRequest,
+  setSetupRetryCookie,
+} from '../auth/setup-cookie.js';
 
 function publicUser(row) {
   // row may be either a raw database row (is_admin) or the session projection
@@ -214,12 +221,20 @@ export function createAuthRouter({ db }) {
       return issueSetupAuthorization(db, setupCredentialHash(provided));
     });
     if (outcome.status === 'complete') {
+      clearSetupRetryCookie(res, { secure: secureCookieForRequest(req) });
       return res.status(409).json({ ok: false, error: SETUP_COMPLETE_ERROR });
     }
     if (outcome.status !== 'ok') {
       return res.status(403).json({ ok: false, error: SETUP_INVALID_ERROR });
     }
 
+    // The retry handle travels only in an HttpOnly cookie. It survives the
+    // full-page Google redirect so a failed or cancelled attempt can retry
+    // without reopening the owner link, while inheriting this grant's expiry.
+    setSetupRetryCookie(res, outcome.retryHandle, {
+      expiresAt: outcome.expiresAt,
+      secure: secureCookieForRequest(req),
+    });
     return res.json({
       ok: true,
       setupToken: outcome.token,
@@ -307,6 +322,7 @@ export function createAuthRouter({ db }) {
     // administrator, never by an arbitrary public registration.
 
     const session = createSession(db, outcome.created.id, config.authSessionDays);
+    clearSetupRetryCookie(res, { secure: secureCookieForRequest(req) });
     return res.status(201).json({
       ok: true,
       token: session.token,
@@ -330,12 +346,18 @@ export function createAuthRouter({ db }) {
     const state = createOAuthState();
     const stateHash = hashToken(state);
     const providedSetup = typeof req.body?.setupToken === 'string' && Boolean(req.body.setupToken.trim());
+    // The browser cannot keep the in-memory grant across the Google redirect,
+    // so a successful setup exchange also set this HttpOnly retry cookie. It is
+    // consulted only when no body grant was supplied and no user exists yet.
+    const retryCookie = readSetupRetryCookie(req);
 
     // On a fresh deployment the first account must be authorized. The opaque
-    // grant is validated, bound to this one state, and carried into the state
-    // as a hash. Only a random `state` goes to Google; neither secret is ever
-    // included in the authorize URL. A failed callback can start a fresh state
-    // with the same still-valid grant.
+    // grant or the cookie-backed retry handle is validated, bound to this one
+    // state, and carried into the state as a hash. Only a random `state` goes to
+    // Google; neither secret is ever included in the authorize URL. A failed
+    // callback can start a fresh state with the same still-valid grant.
+    let cookieCredentialUsed = false;
+    let setupComplete = false;
     const outcome = withWriteTransaction(db, () => {
       db.prepare('DELETE FROM oauth_states WHERE expires_at <= ?').run(new Date().toISOString());
 
@@ -343,9 +365,14 @@ export function createAuthRouter({ db }) {
       let setupGrantHash = null;
       let expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString();
       if (countUsers(db) === 0) {
-        const grant = checkSetupGrant(db, req.body?.setupToken);
+        let grant = checkSetupGrant(db, req.body?.setupToken);
+        if (!grant && !providedSetup && retryCookie) {
+          cookieCredentialUsed = true;
+          const retry = checkSetupRetryAuthorization(db, retryCookie);
+          if (retry) grant = checkSetupGrantHash(db, retry.grantHash);
+        }
         if (!grant) {
-          return { status: providedSetup ? 'setup_invalid' : 'setup_required' };
+          return { status: providedSetup || retryCookie ? 'setup_invalid' : 'setup_required' };
         }
         // One active setup flow at a time. Rebinding invalidates any earlier
         // state from this same grant without consuming the grant itself.
@@ -354,6 +381,8 @@ export function createAuthRouter({ db }) {
         setupAuthorized = 1;
         setupGrantHash = grant.tokenHash;
         expiresAt = earlierIso(expiresAt, grant.expiresAt);
+      } else {
+        setupComplete = true;
       }
 
       db.prepare(`
@@ -363,6 +392,12 @@ export function createAuthRouter({ db }) {
       return { status: 'ok' };
     });
 
+    // Clear only when the cookie itself was rejected, or when setup is already
+    // complete. A stale body token from another tab must not delete a newer
+    // tab's still-valid cookie.
+    if (retryCookie && (cookieCredentialUsed || setupComplete)) {
+      clearSetupRetryCookie(res, { secure: secureCookieForRequest(req) });
+    }
     if (outcome.status === 'setup_invalid') {
       return res.status(403).json({ ok: false, error: SETUP_INVALID_ERROR });
     }
@@ -500,6 +535,7 @@ export function createAuthRouter({ db }) {
       if (outcome.status === 'error') return redirectWithError(outcome.code);
 
       const session = createSession(db, outcome.userId, config.authSessionDays);
+      clearSetupRetryCookie(res, { secure: secureCookieForRequest(req) });
       return res.redirect(302, `${origin}/#auth_token=${session.token}&auth_expires=${encodeURIComponent(session.expiresAt)}`);
     } catch (error) {
       console.error('[auth] Google callback failed:', redactSecrets(String(error?.message || error)));

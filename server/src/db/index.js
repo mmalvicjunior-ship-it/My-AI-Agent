@@ -183,7 +183,14 @@ export function openDb() {
   if (!setupGrantColumns.some((column) => column.name === 'bound_state_hash')) {
     db.exec('ALTER TABLE setup_authorizations ADD COLUMN bound_state_hash TEXT');
   }
+  // Short-lived HttpOnly retry cookie. Only the handle's SHA-256 hash is kept;
+  // it is bound to this same grant and inherits this expiry.
+  if (!setupGrantColumns.some((column) => column.name === 'retry_handle_hash')) {
+    db.exec('ALTER TABLE setup_authorizations ADD COLUMN retry_handle_hash TEXT');
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_setup_authorizations_expires ON setup_authorizations (expires_at)');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_authorizations_retry
+           ON setup_authorizations (retry_handle_hash) WHERE retry_handle_hash IS NOT NULL`);
 
   // Bearer sessions. Only the SHA-256 hash of each token is stored, so a leaked
   // database file cannot be replayed as a live session.

@@ -113,6 +113,7 @@ test('backend auth router registers the documented email/password and Google rou
 test('frontend exposes email/password and Google authentication', () => {
   const authScreen = read('apps/web/src/AuthScreen.jsx');
   const app = read('apps/web/src/App.jsx');
+  const authFlow = read('apps/web/src/authFlow.js');
 
   assert.match(authScreen, /\/api\/auth\/\$\{mode\}/);
   assert.match(authScreen, /useState\(\(\) => \(setupCredential \? 'register' : 'login'\)\)/);
@@ -141,6 +142,10 @@ test('first-account setup keeps setup and admin credentials separate', () => {
   assert.match(authScreen, /\/api\/auth\/setup\/authorize/);
   assert.match(authScreen, /JSON\.stringify\(\{ setupCredential \}\)/);
   assert.match(authScreen, /setupToken: setupAuthorization/);
+  assert.match(authFlow, /shouldIncludeSetupAuthorization/);
+  const googleStart = authScreen.match(/const startGoogle = async \(\) => \{[\s\S]*?\n  \};/)?.[0] || '';
+  assert.match(googleStart, /shouldIncludeSetupAuthorization\(\{ setupAuthorization \}\)/);
+  assert.doesNotMatch(googleStart, /isRegister/, 'Google start must not depend on the current tab');
   assert.match(authScreen, /\/api\/auth\/google\/start/);
   assert.match(authScreen, /window\.location\.assign\(result\.url\)/);
   assert.doesNotMatch(authScreen, /BOOTSTRAP_TOKEN|environment|configured on this server/i);

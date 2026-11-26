@@ -72,15 +72,19 @@ export const POSTGRES_SCHEMA_SQL = `
   -- bound_state_hash permits one active flow while allowing a failed callback
   -- to retry with the same grant.
   CREATE TABLE IF NOT EXISTS setup_authorizations (
-    id               INTEGER PRIMARY KEY CHECK (id = 1),
-    token_hash       TEXT NOT NULL UNIQUE,
-    bound_state_hash TEXT,
-    created_at       TEXT NOT NULL DEFAULT (${NOW}),
-    expires_at       TEXT NOT NULL
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    token_hash        TEXT NOT NULL UNIQUE,
+    retry_handle_hash TEXT,
+    bound_state_hash  TEXT,
+    created_at        TEXT NOT NULL DEFAULT (${NOW}),
+    expires_at        TEXT NOT NULL
   );
   ALTER TABLE setup_authorizations ADD COLUMN IF NOT EXISTS bound_state_hash TEXT;
+  ALTER TABLE setup_authorizations ADD COLUMN IF NOT EXISTS retry_handle_hash TEXT;
   CREATE INDEX IF NOT EXISTS idx_setup_authorizations_expires
     ON setup_authorizations (expires_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_authorizations_retry
+    ON setup_authorizations (retry_handle_hash) WHERE retry_handle_hash IS NOT NULL;
 
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash           TEXT PRIMARY KEY,

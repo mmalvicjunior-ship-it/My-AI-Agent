@@ -13,6 +13,19 @@ const SETUP_TTL_MS = 10 * 60 * 1000;
 
 export { SETUP_TTL_MS };
 
+// HttpOnly retry cookie used only by /api/auth/google/start while the first
+// account is still missing. It carries a fresh random handle, never the owner
+// credential or the opaque setup grant. Only its hash is stored server-side.
+export const SETUP_RETRY_COOKIE = 'myai_setup_retry';
+
+export function createSetupRetryHandle() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+export function setupRetryHash(value) {
+  return hashToken(typeof value === 'string' ? value.trim() : '');
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -68,19 +81,23 @@ export function issueSetupAuthorization(db, credentialHash) {
   db.prepare('DELETE FROM oauth_states WHERE setup_authorized = 1').run();
 
   const token = createSetupToken();
+  const retryHandle = createSetupRetryHandle();
   const tokenHash = hashToken(token);
+  const retryHash = setupRetryHash(retryHandle);
   db.prepare(`
-    INSERT INTO setup_authorizations (id, token_hash, bound_state_hash, created_at, expires_at)
-    VALUES (1, ?, NULL, ?, ?)
+    INSERT INTO setup_authorizations
+      (id, token_hash, retry_handle_hash, bound_state_hash, created_at, expires_at)
+    VALUES (1, ?, ?, NULL, ?, ?)
     ON CONFLICT (id) DO UPDATE SET
       token_hash = excluded.token_hash,
+      retry_handle_hash = excluded.retry_handle_hash,
       bound_state_hash = NULL,
       created_at = excluded.created_at,
       expires_at = excluded.expires_at
-  `).run(tokenHash, createdAt, expiresAt);
+  `).run(tokenHash, retryHash, createdAt, expiresAt);
   db.prepare('UPDATE setup_credentials SET grant_hash = ?, consumed_at = NULL WHERE id = 1').run(tokenHash);
 
-  return { status: 'ok', token, expiresAt };
+  return { status: 'ok', token, retryHandle, expiresAt };
 }
 
 /**
@@ -110,6 +127,35 @@ export function checkSetupGrantHash(db, tokenHash, { expectedStateHash = undefin
     WHERE a.id = 1 AND a.token_hash = ? AND c.consumed_at IS NULL
   `).get(tokenHash);
   return checkGrantRow(row, { expectedStateHash });
+}
+
+/**
+ * Validates the HttpOnly retry cookie handle. It is useful only while the
+ * same still-unconsumed setup grant is valid; it inherits that grant's expiry
+ * and can never outlive or replace it. A matched but expired handle is cleared
+ * server-side as well as expiring in the browser.
+ */
+export function checkSetupRetryAuthorization(db, handle) {
+  if (typeof handle !== 'string' || !handle.trim()) return null;
+  const hash = setupRetryHash(handle);
+  const row = db.prepare(`
+    SELECT a.token_hash, a.expires_at, c.expires_at AS credential_expires_at, c.consumed_at
+    FROM setup_authorizations a
+    JOIN setup_credentials c ON c.id = 1 AND c.grant_hash = a.token_hash
+    WHERE a.id = 1 AND a.retry_handle_hash = ?
+  `).get(hash);
+  if (!row) return null;
+  const expiresAtMs = Math.min(Date.parse(row.expires_at), Date.parse(row.credential_expires_at));
+  if (!Number.isFinite(expiresAtMs) || row.consumed_at || expiresAtMs <= Date.now()) {
+    clearSetupRetryHandle(db);
+    return null;
+  }
+  return { grantHash: row.token_hash, expiresAt: new Date(expiresAtMs).toISOString() };
+}
+
+/** Invalidates the retry record without touching the setup grant itself. */
+export function clearSetupRetryHandle(db) {
+  db.prepare('UPDATE setup_authorizations SET retry_handle_hash = NULL WHERE id = 1').run();
 }
 
 function checkGrantRow(row, { requireUnbound = false, expectedStateHash = undefined } = {}) {
@@ -153,6 +199,9 @@ function consumeGrantHash(db, tokenHash) {
   // Both statements are conditional. If a concurrent writer replaced or already
   // consumed the grant, the row counts make this a no-op instead of a false
   // success that could create a second first account.
+  db.prepare(
+    'UPDATE setup_authorizations SET retry_handle_hash = NULL WHERE id = 1 AND token_hash = ?',
+  ).run(tokenHash);
   const deleted = db.prepare('DELETE FROM setup_authorizations WHERE id = 1 AND token_hash = ?').run(tokenHash);
   if (!deleted?.changes) return false;
   const updated = db.prepare(

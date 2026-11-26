@@ -47,6 +47,15 @@ export function shouldClearSetupHash({ setup } = {}) {
 }
 
 /**
+ * An active setup authorization must follow the user across Register/Sign in.
+ * The current mode is presentation only; it never invalidates a server-issued
+ * first-account grant.
+ */
+export function shouldIncludeSetupAuthorization({ setupAuthorization } = {}) {
+  return Boolean(setupAuthorization);
+}
+
+/**
  * Returns the replacement hash with only `setup` removed. `null` means the
  * current hash has no setup credential and must be left completely untouched.
  */

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { shouldIncludeSetupAuthorization } from './authFlow.js';
 
 /**
  * Sign-in / registration screen shown before the workspace loads.
@@ -101,7 +102,9 @@ export default function AuthScreen({
     setError(null);
     setGoogleBusy(true);
     try {
-      const body = isRegister && setupAuthorization ? { setupToken: setupAuthorization } : {};
+      const body = shouldIncludeSetupAuthorization({ setupAuthorization })
+        ? { setupToken: setupAuthorization }
+        : {};
       const response = await fetch(`${apiBase}/api/auth/google/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
